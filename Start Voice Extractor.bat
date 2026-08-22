@@ -11,11 +11,18 @@ set "PYTHONUNBUFFERED=1"
 echo.
 echo  Voice Extractor
 echo  ========================================
-echo  Starting local service...
-echo  Logs will appear in this window.
-echo  Press Ctrl+C to stop.
+echo  Checking dependencies and local models...
+echo  Missing resources will be downloaded automatically.
+echo  CUDA and PyTorch are kept local.
 echo.
-"..\GPT-SoVITS-v2pro-20250604\runtime\python.exe" -u app.py
+if not exist "dist\VoiceExtractor.exe" (
+    echo  ERROR: dist\VoiceExtractor.exe was not found.
+    echo  Build it with scripts\build_launcher.ps1 first.
+    echo.
+    pause
+    exit /b 1
+)
+"dist\VoiceExtractor.exe"
 echo.
 echo  Service stopped. Exit code: %ERRORLEVEL%
 pause

@@ -59,6 +59,19 @@
 
 预构建启动器： [dist/VoiceExtractor.exe](dist/VoiceExtractor.exe)
 
+首次运行 `VoiceExtractor.exe` 时会自动检查本地 Python、音频工具和模型资源：
+
+- 已存在的资源会直接复用，不会重复下载。
+- 缺失的 UVR、声纹、多人检测、歌声检测、FunASR 和 Whisper 资源会自动下载到对应目录。
+- CUDA、PyTorch 和本地 Python runtime 不会由启动器下载；它们需要先随运行环境准备好。
+- 启动器完成检查后才会打开中文网页界面。
+
+仅检查和补齐资源、不启动界面：
+
+```powershell
+.\dist\VoiceExtractor.exe --check-only
+```
+
 ## 资源清单
 
 以下资源需要单独准备，资源文件不包含在源码提交中：
