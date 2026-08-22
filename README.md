@@ -53,7 +53,7 @@ launcher/                      启动器源码
 1. 克隆本仓库：
 
    ```powershell
-   git clone https://github.com/guhechudaisuki/- 提取
+   git clone https://github.com/guhechudaisuki/reference-voice-extractor 提取
    cd 提取
    ```
 
