@@ -45,7 +45,8 @@ GPT-SoVITS*/
 
 # Build output
 build/
-dist/
+dist/*
+!dist/VoiceExtractor.exe
 launcher/bin/
 launcher/obj/
 

@@ -115,6 +115,8 @@ EXE 是轻量启动器，负责定位外部 Python/runtime 并启动 `app.py`；
 
 生成：`dist/VoiceExtractor.exe`。把 `dist/VoiceExtractor.exe` 放在本仓库根目录附近运行，或设置 `VOICE_EXTRACT_PYTHON` 指向 GPT-SoVITS runtime。首次启动前仍需完成模型清单中的下载。
 
+仓库也提供一个预构建的轻量启动器：[dist/VoiceExtractor.exe](dist/VoiceExtractor.exe)。它不包含模型、CUDA 或 PyTorch，运行时仍需准备外部资源。
+
 ## 日志与故障排查
 
 - 服务日志：`output/app.log`
