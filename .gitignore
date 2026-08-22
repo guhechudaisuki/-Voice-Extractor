@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# Local environments and logs
+.venv/
+venv/
+env/
+*.log
+output/app.log
+
+# Runtime, model weights and caches (never commit these)
+models/
+work/
+output/
+runtime/
+omnvoice/
+GPT-SoVITS*/
+**/hf_cache/
+**/modelscope_cache/
+*.pth
+*.pt
+*.ckpt
+*.bin
+*.onnx
+*.safetensors
+*.spec
+
+# Audio/video inputs and generated media
+*.wav
+*.mp3
+*.flac
+*.m4a
+*.aac
+*.ogg
+*.mp4
+*.mkv
+*.avi
+*.zip
+
+# Build output
+build/
+dist/
+launcher/bin/
+launcher/obj/
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.user
+*.suo

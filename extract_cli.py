@@ -1,0 +1,55 @@
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from extractor.pipeline import ExtractionPipeline, PipelineOptions
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="按参考音色提取多个目标文件中的完整讲话句子")
+    parser.add_argument("--reference", "-r", action="append", required=True, help="参考音频，可重复")
+    parser.add_argument("--target", "-t", action="append", required=True, help="待提取音频，可重复")
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=0.70,
+        help="声纹阈值，默认 0.70",
+    )
+    parser.add_argument("--no-overlap", action="store_true", help="关闭多人重叠检测")
+    parser.add_argument("--no-singing", action="store_true", help="关闭唱歌检测")
+    args = parser.parse_args()
+
+    def progress(value: float, message: str) -> None:
+        print(f"[{value * 100:5.1f}%] {message}", flush=True)
+
+    batch = ExtractionPipeline(
+        PipelineOptions(
+            speaker_threshold=args.threshold,
+            use_overlap_detector=not args.no_overlap,
+            use_singing_detector=not args.no_singing,
+        )
+    ).run_many(
+        [Path(item) for item in args.reference],
+        [Path(item) for item in args.target],
+        progress=progress,
+    )
+    accepted_count = sum(len(result.accepted) for result in batch.results)
+    rejected_count = sum(len(result.rejected) for result in batch.results)
+    print(f"批次目录: {batch.output_dir}")
+    print(f"批次压缩包: {batch.archive_path}")
+    print(f"批次清单: {batch.manifest_path}")
+    print(f"批次文本: {batch.transcript_path}")
+    print(f"目标文件: {len(batch.results)} 个; 保留: {accepted_count} 句; 舍弃: {rejected_count} 句")
+    for target, result in zip(args.target, batch.results):
+        print(f"  {Path(target).name}: 保留 {len(result.accepted)} 句; 舍弃 {len(result.rejected)} 句")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
