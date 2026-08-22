@@ -54,7 +54,7 @@
 
 仓库内提供两个入口：
 
-- `启动提取工具.bat`：图形界面入口。
+- `Start Voice Extractor.bat`：图形界面入口。
 - `extract_cli.py`：批处理入口。
 
 预构建启动器： [dist/VoiceExtractor.exe](dist/VoiceExtractor.exe)
