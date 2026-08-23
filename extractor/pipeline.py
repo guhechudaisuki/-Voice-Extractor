@@ -537,6 +537,12 @@ class ExtractionPipeline:
             ):
                 retained_rejected.append(candidate)
                 continue
+            # A rejected dual-model decision is not eligible for recall. Only
+            # the explicit weak tier, which has strong primary/reference
+            # evidence, may enter this block-local recovery pass.
+            if match.tier != "weak":
+                retained_rejected.append(candidate)
+                continue
 
             primary_seed_score = float(match.primary.embedding @ primary_centroid)
             secondary_seed_score = float(match.secondary.embedding @ secondary_centroid)
