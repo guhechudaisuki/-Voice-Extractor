@@ -1133,8 +1133,8 @@ class LocalSpeakerTurnSplitter:
 
         A boundary is accepted only when both embedding models have low
         cross-boundary similarity and at least one model sees a meaningful
-        local drop without the other model contradicting it. Low similarity
-        alone is never enough to split a turn.
+        local drop while the other corroborates part of that drop. Low
+        similarity alone is never enough to split a turn.
         """
 
         if context_seconds < 0.30:

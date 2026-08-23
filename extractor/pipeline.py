@@ -281,6 +281,16 @@ class ExtractionPipeline:
         return output
 
     @staticmethod
+    def _target_coverage(span: TimeSpan, target_spans: list[TimeSpan]) -> float:
+        if span.duration <= 0.0 or not target_spans:
+            return 0.0
+        covered = sum(
+            max(0.0, min(span.end, target.end) - max(span.start, target.start))
+            for target in target_spans
+        )
+        return min(1.0, covered / span.duration)
+
+    @staticmethod
     def _apply_speaker_match(
         candidate: CandidateSentence,
         match,
@@ -346,7 +356,7 @@ class ExtractionPipeline:
         """Select near-target turns and audit every long accepted turn."""
 
         secondary = match.secondary
-        if secondary is None or duration < 1.8:
+        if secondary is None or duration < 2.50:
             return False
         if not match.accepted:
             return (
@@ -358,7 +368,7 @@ class ExtractionPipeline:
             )
         # A whole-turn embedding can hide a second speaker in the middle. The
         # local pass is mandatory for longer accepted turns.
-        return duration >= 1.80
+        return True
 
     def _recover_target_segments(
         self,
@@ -528,6 +538,9 @@ class ExtractionPipeline:
                 not isinstance(candidate_block, int)
                 or candidate_block not in seed_blocks
             ):
+                retained_rejected.append(candidate)
+                continue
+            if float(candidate.diagnostics.get("target_coverage", 0.0)) < 0.60:
                 retained_rejected.append(candidate)
                 continue
             if (
@@ -770,7 +783,9 @@ class ExtractionPipeline:
             # is never emitted as an output segment.
             vad_spans = self._merge_vad_spans(
                 vad_map.get(stem, []),
-                gap=0.45,
+                # A short pause is still inside one utterance. Only a longer
+                # no-speech gap creates a new dialogue block.
+                gap=0.85,
             )
             if not vad_spans:
                 manifest, transcript, archive = self._write_outputs(
@@ -867,14 +882,28 @@ class ExtractionPipeline:
                 split_result = verifier.split_speaker_spans(
                     stem,
                     clean_spans,
-                    minimum_turn_seconds=0.30,
+                    minimum_turn_seconds=0.85,
                     context_seconds=1.20,
                     scan_hop_seconds=0.30,
                     minimum_similarity_drop=0.08,
                     minimum_separation_seconds=0.70,
                     progress=lambda value, message: progress(0.57 + 0.11 * value, message),
                 )
-                progress(0.68, f"换人切分完成：得到 {len(split_result)} 个独立说话回合")
+                target_spans = verifier.locate_target_spans(
+                    stem,
+                    clean_spans,
+                    profile,
+                    window_seconds=1.80,
+                    hop_seconds=0.45,
+                    primary_floor=0.50,
+                    secondary_floor=0.42,
+                    strong_primary=0.62,
+                    strong_secondary=0.54,
+                    minimum_target_seconds=0.85,
+                    bridge_seconds=0.55,
+                    progress=lambda value, message: progress(0.68 + 0.04 * value, message),
+                )
+                progress(0.72, f"换人切分完成：得到 {len(split_result)} 个独立说话回合")
                 target_waveform = load_mono(stem, 16000)
                 effective_threshold = max(
                     self.options.speaker_threshold,
@@ -896,6 +925,10 @@ class ExtractionPipeline:
                         ),
                         -1,
                     )
+                    candidate.diagnostics["target_coverage"] = round(
+                        self._target_coverage(span, target_spans),
+                        5,
+                    )
                     match: SpeakerMatchDecision | None = None
                     if candidate.duration < self.options.min_sentence_seconds:
                         candidate.reject_reason = "说话回合过短"
@@ -912,6 +945,8 @@ class ExtractionPipeline:
                         self._apply_speaker_match(candidate, match, profile, effective_threshold)
                         if not match.accepted:
                             candidate.reject_reason = "声纹匹配不足"
+                        elif target_spans and candidate.diagnostics["target_coverage"] < 0.45:
+                            candidate.reject_reason = "疑似混合说话人，目标声纹不连续"
                     scored_turns.append((span, candidate, match))
                     progress(
                         0.68 + 0.04 * index / max(1, len(split_result)),
