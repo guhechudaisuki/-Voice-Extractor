@@ -125,6 +125,35 @@ def trim_audio_in_place(path: Path, duration: float) -> Path:
     return path
 
 
+def mute_spans(
+    source: Path,
+    destination: Path,
+    spans: Iterable[TimeSpan],
+    fade_seconds: float = 0.02,
+) -> Path:
+    """Silence selected ranges without changing the audio timeline."""
+
+    data, sample_rate = sf.read(str(source), always_2d=True, dtype="float32")
+    total_frames = len(data)
+    fade_frames = max(0, int(round(fade_seconds * sample_rate)))
+    for span in sorted(spans, key=lambda item: (item.start, item.end)):
+        begin = max(0, min(total_frames, int(round(span.start * sample_rate))))
+        end = max(begin, min(total_frames, int(round(span.end * sample_rate))))
+        if end <= begin:
+            continue
+        if fade_frames:
+            left = max(0, begin - fade_frames)
+            if begin > left:
+                data[left:begin] *= np.linspace(1.0, 0.0, begin - left, endpoint=False)[:, None]
+            right = min(total_frames, end + fade_frames)
+            if right > end:
+                data[end:right] *= np.linspace(0.0, 1.0, right - end, endpoint=False)[:, None]
+        data[begin:end] = 0.0
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    sf.write(str(destination), data, sample_rate, subtype="PCM_16")
+    return destination
+
+
 def load_mono(path: Path, sample_rate: int = 16000) -> torch.Tensor:
     waveform, source_rate = torchaudio.load(str(path))
     waveform = waveform.mean(dim=0, keepdim=True)

@@ -18,9 +18,11 @@ import torch
 from .audio import (
     UVR5Separator,
     load_mono,
+    mute_spans,
     normalize_audio,
     pad_for_separator,
     probe_duration,
+    speech_ratio,
     trim_audio_in_place,
     write_clip,
 )
@@ -33,7 +35,7 @@ from .speaker import (
     SpeakerMatchDecision,
     SpeakerMatchProfile,
 )
-from .transcription import FunASRTools, WhisperSegmenter, is_complete_text
+from .transcription import FunASRTools, WhisperSegmenter
 from .types import BatchPipelineResult, CandidateSentence, PipelineResult, TimeSpan
 
 LOGGER = logging.getLogger(__name__)
@@ -108,6 +110,7 @@ class ExtractionPipeline:
             "reference_stems": root / "reference_stems",
             "reference_clips": root / "reference_voice_clips",
             "normalized_target": root / "target_normalized.wav",
+            "singing_removed_target": root / "target_singing_removed.wav",
             "stems": root / "stems",
             "candidate_clips": root / "candidate_clips",
             "output": OUTPUT_ROOT / job_id,
@@ -290,6 +293,97 @@ class ExtractionPipeline:
             for target in target_spans
         )
         return min(1.0, covered / span.duration)
+
+    @staticmethod
+    def _partition_tainted_spans(
+        spans: list[TimeSpan],
+        tainted: list[TimeSpan],
+        *,
+        minimum_overlap_seconds: float,
+        minimum_fraction: float = 0.0,
+    ) -> tuple[list[TimeSpan], list[TimeSpan]]:
+        """Drop a whole silence-delimited utterance if a forbidden event occurs.
+
+        Cutting only the overlap/song frames leaves sentence fragments.  The
+        utterance is therefore atomic at this stage: one confirmed forbidden
+        range rejects the whole item.
+        """
+
+        clean: list[TimeSpan] = []
+        rejected: list[TimeSpan] = []
+        for span in spans:
+            overlap = sum(
+                max(0.0, min(span.end, dirty.end) - max(span.start, dirty.start))
+                for dirty in tainted
+            )
+            fraction = overlap / max(1e-6, span.duration)
+            if overlap >= minimum_overlap_seconds or fraction >= minimum_fraction > 0.0:
+                rejected.append(span)
+            else:
+                clean.append(span)
+        return clean, rejected
+
+    def _merge_short_silence_same_speaker(
+        self,
+        spans: list[TimeSpan],
+        verifier: DualSpeakerVerifier,
+        profile: SpeakerMatchProfile,
+        waveform: torch.Tensor,
+        progress: ProgressCallback,
+        *,
+        maximum_silence_seconds: float = 0.85,
+        primary_same_floor: float = 0.76,
+        secondary_same_floor: float = 0.64,
+    ) -> list[TimeSpan]:
+        """Merge a short silent gap only when both speaker models agree.
+
+        The returned span covers the original gap, so the short silence is
+        retained in exported training audio exactly as requested.
+        """
+
+        spans = sorted(spans, key=lambda item: (item.start, item.end))
+        if len(spans) < 2:
+            return spans
+        parts = [self._waveform_span(waveform, span) for span in spans]
+        progress(0.0, f"短静音声纹核验：ERes2Net 0/{len(parts)}")
+        primary_embeddings = verifier.primary._embeddings_from_waveforms(
+            parts,
+            progress=lambda completed, total: progress(
+                0.50 * completed / max(1, total),
+                f"短静音声纹核验：ERes2Net {completed}/{total}",
+            ),
+        )
+        verifier._ensure_secondary(profile)
+        assert verifier.secondary is not None
+        progress(0.50, f"短静音声纹核验：CAM++ 0/{len(parts)}")
+        secondary_embeddings = verifier.secondary._embeddings_from_waveforms(
+            parts,
+            progress=lambda completed, total: progress(
+                0.50 + 0.50 * completed / max(1, total),
+                f"短静音声纹核验：CAM++ {completed}/{total}",
+            ),
+        )
+
+        output: list[TimeSpan] = [spans[0]]
+        for index in range(1, len(spans)):
+            previous_source = spans[index - 1]
+            current = spans[index]
+            gap = max(0.0, current.start - previous_source.end)
+            primary_similarity = float(primary_embeddings[index - 1] @ primary_embeddings[index])
+            secondary_similarity = float(
+                secondary_embeddings[index - 1] @ secondary_embeddings[index]
+            )
+            same_speaker = (
+                gap <= maximum_silence_seconds
+                and primary_similarity >= primary_same_floor
+                and secondary_similarity >= secondary_same_floor
+            )
+            if same_speaker:
+                output[-1] = TimeSpan(output[-1].start, current.end)
+            else:
+                output.append(current)
+        progress(1.0, f"短静音声纹核验完成：{len(spans)} 段合并为 {len(output)} 段")
+        return output
 
     @staticmethod
     def _apply_speaker_match(
@@ -926,23 +1020,48 @@ class ExtractionPipeline:
         job_id = job_id or time.strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
         paths = self._job_paths(job_id)
         paths["root"].mkdir(parents=True, exist_ok=True)
+        singing_detector: SingingDetector | None = None
         try:
             progress(0.01, "检查本地模型")
             normalized_refs, reference_durations = self._prepare_references(references, paths, progress)
             target_normalized = normalize_audio(target, paths["normalized_target"], sample_rate=44100, stereo=True)
-            target_duration = pad_for_separator(target_normalized)
+            target_duration = probe_duration(target_normalized)
+            target_for_separator = target_normalized
+            pre_singing_spans: list[TimeSpan] = []
+            if self.options.use_singing_detector:
+                singing_detector = SingingDetector("cpu")
+                progress(0.12, "UVR 前检测人类歌声（纯器乐不会删除）")
+                _non_singing, pre_singing_spans = singing_detector.clean_spans(
+                    target_normalized,
+                    [TimeSpan(0.0, target_duration)],
+                    self.options.singing_threshold,
+                    progress=lambda value, message: progress(0.12 + 0.04 * value, message),
+                )
+                if pre_singing_spans:
+                    target_for_separator = mute_spans(
+                        target_normalized,
+                        paths["singing_removed_target"],
+                        pre_singing_spans,
+                    )
+                    progress(
+                        0.16,
+                        f"UVR 前已静音移除 {len(pre_singing_spans)} 个有人演唱区间，时间轴保持不变",
+                    )
+                else:
+                    progress(0.16, "UVR 前未检测到有人演唱；纯音乐保持原样")
+            target_duration = pad_for_separator(target_for_separator)
 
-            progress(0.14, "提取参考与目标人声：准备 UVR 分块")
+            progress(0.16, "提取参考与目标人声：准备 UVR 分块")
             separator = UVR5Separator(self.device)
             separation_items = [
                 (path, paths["reference_stems"] / f"reference_{index:03d}_vocals.wav")
                 for index, path in enumerate(normalized_refs, start=1)
             ]
-            separation_items.append((target_normalized, paths["stems"] / "target_vocals.wav"))
+            separation_items.append((target_for_separator, paths["stems"] / "target_vocals.wav"))
             try:
                 separated = separator.separate_many(
                     separation_items,
-                    progress=lambda value, message: progress(0.14 + 0.24 * value, message),
+                    progress=lambda value, message: progress(0.16 + 0.24 * value, message),
                 )
             except ValueError as exc:
                 if "有效信号" not in str(exc):
@@ -962,23 +1081,18 @@ class ExtractionPipeline:
                 trim_audio_in_place(reference_stem, original_duration)
             trim_audio_in_place(stem, target_duration)
 
-            progress(0.40, "正在检测讲话范围（STT 将在筛选完成后执行）")
-            duration = probe_duration(stem)
+            progress(0.40, "UVR 完成：按每一段静音检测最小讲话片段")
             vad_tools = FunASRTools(self.device)
             vad_map = vad_tools.vad_many(
                 [*reference_stems, stem],
                 progress=lambda value, message: progress(0.40 + 0.08 * value, message),
             )
-            progress(0.48, "VAD 完成：先过滤多人同时说话和歌声")
             reference_clips = self._make_reference_clips(reference_stems, vad_map, paths)
-            # VAD spans are the speech-only source of truth.  A longer silence
-            # starts a new dialogue block for diarization; the silence itself
-            # is never emitted as an output segment.
+            # Every positive silence gap is initially a hard boundary.  Only a
+            # later dual-model same-speaker decision may join the two sides.
             vad_spans = self._merge_vad_spans(
                 vad_map.get(stem, []),
-                # A short pause is still inside one utterance. Only a longer
-                # no-speech gap creates a new dialogue block.
-                gap=0.85,
+                gap=0.0,
             )
             if not vad_spans:
                 manifest, transcript, archive = self._write_outputs(
@@ -1003,75 +1117,97 @@ class ExtractionPipeline:
             accepted_turns: list[CandidateSentence] = []
             rejected: list[CandidateSentence] = []
             overlap_detector = OverlapDetector() if self.options.use_overlap_detector else None
-            singing_detector = None
-            if self.options.use_singing_detector:
-                singing_detector = SingingDetector("cpu")
-
-            clean_spans = vad_spans
-            if overlap_detector is not None:
-                clean_spans, overlap_spans = overlap_detector.clean_spans(
-                    stem,
-                    clean_spans,
-                    self.options.overlap_threshold,
-                    progress=lambda value, message: progress(0.48 + 0.035 * value, message),
-                )
-                rejected.extend(
-                    CandidateSentence(
-                        span.start,
-                        span.end,
-                        "",
-                        reject_reason="检测到多人同时发声",
-                        overlap_score=self.options.overlap_threshold,
-                    )
-                    for span in overlap_spans
-                )
-            if singing_detector is not None:
-                clean_spans, singing_spans = singing_detector.clean_spans(
-                    stem,
-                    clean_spans,
-                    self.options.singing_threshold,
-                    progress=lambda value, message: progress(0.515 + 0.035 * value, message),
-                )
-                rejected.extend(
-                    CandidateSentence(
-                        span.start,
-                        span.end,
-                        "",
-                        reject_reason="检测到唱歌或歌声",
-                        singing_score=self.options.singing_threshold,
-                    )
-                    for span in singing_spans
-                )
-            progress(
-                0.55,
-                f"局部过滤完成：剩余 {len(clean_spans)} 个单人讲话范围，"
-                f"移除多人 {sum(item.reject_reason == '检测到多人同时发声' for item in rejected)} 段、"
-                f"歌声 {sum(item.reject_reason == '检测到唱歌或歌声' for item in rejected)} 段",
-            )
-            if not clean_spans:
-                if singing_detector is not None:
-                    singing_detector.close()
-                manifest, transcript, archive = self._write_outputs(
-                    [], rejected, stem, target.name, paths, progress
-                )
-                progress(1.0, "完成：过滤后没有单人讲话")
-                return PipelineResult(
-                    job_id,
-                    paths["output"],
-                    archive,
-                    [],
-                    rejected,
-                    manifest,
-                    transcript,
-                )
-
             verifier = DualSpeakerVerifier(
                 self.device,
-                status=lambda message: progress(0.56, message),
+                status=lambda message: progress(0.49, message),
             )
             try:
                 profile = verifier.build_profile(reference_clips, self.options.speaker_threshold)
-                progress(0.57, f"参考声纹建立完成，开始切分 {len(clean_spans)} 个单人讲话范围")
+                target_waveform = load_mono(stem, 16000)
+                progress(0.49, f"静音切分得到 {len(vad_spans)} 段，开始核验短静音两侧声纹")
+                speech_blocks = self._merge_short_silence_same_speaker(
+                    vad_spans,
+                    verifier,
+                    profile,
+                    target_waveform,
+                    progress=lambda value, message: progress(0.49 + 0.07 * value, message),
+                )
+
+                clean_spans = speech_blocks
+                if singing_detector is not None:
+                    _post_clean, residual_singing = singing_detector.clean_spans(
+                        stem,
+                        clean_spans,
+                        self.options.singing_threshold,
+                        progress=lambda value, message: progress(0.56 + 0.035 * value, message),
+                    )
+                    # Pre-UVR human singing has already been muted.  Include its
+                    # original ranges here so any VAD edge residue rejects the
+                    # complete utterance instead of exporting a fragment.
+                    singing_evidence = [*pre_singing_spans, *residual_singing]
+                    clean_spans, singing_blocks = self._partition_tainted_spans(
+                        clean_spans,
+                        singing_evidence,
+                        minimum_overlap_seconds=0.20,
+                        minimum_fraction=0.15,
+                    )
+                    rejected.extend(
+                        CandidateSentence(
+                            span.start,
+                            span.end,
+                            "",
+                            reject_reason="检测到有人唱歌",
+                            singing_score=self.options.singing_threshold,
+                        )
+                        for span in singing_blocks
+                    )
+
+                if overlap_detector is not None and clean_spans:
+                    _overlap_clean, overlap_evidence = overlap_detector.clean_spans(
+                        stem,
+                        clean_spans,
+                        self.options.overlap_threshold,
+                        progress=lambda value, message: progress(0.595 + 0.035 * value, message),
+                    )
+                    clean_spans, overlap_blocks = self._partition_tainted_spans(
+                        clean_spans,
+                        overlap_evidence,
+                        minimum_overlap_seconds=0.08,
+                        minimum_fraction=0.04,
+                    )
+                    rejected.extend(
+                        CandidateSentence(
+                            span.start,
+                            span.end,
+                            "",
+                            reject_reason="检测到多人同时发声",
+                            overlap_score=self.options.overlap_threshold,
+                        )
+                        for span in overlap_blocks
+                    )
+
+                progress(
+                    0.63,
+                    f"整段过滤完成：剩余 {len(clean_spans)} 个讲话块；"
+                    f"舍弃歌声 {sum(item.reject_reason == '检测到有人唱歌' for item in rejected)} 段、"
+                    f"多人重叠 {sum(item.reject_reason == '检测到多人同时发声' for item in rejected)} 段",
+                )
+                if not clean_spans:
+                    manifest, transcript, archive = self._write_outputs(
+                        [], rejected, stem, target.name, paths, progress
+                    )
+                    progress(1.0, "完成：过滤后没有单人讲话")
+                    return PipelineResult(
+                        job_id,
+                        paths["output"],
+                        archive,
+                        [],
+                        rejected,
+                        manifest,
+                        transcript,
+                    )
+
+                progress(0.63, f"开始检查 {len(clean_spans)} 个讲话块内部是否换人")
                 split_result = verifier.split_speaker_spans(
                     stem,
                     clean_spans,
@@ -1080,7 +1216,7 @@ class ExtractionPipeline:
                     scan_hop_seconds=0.30,
                     minimum_similarity_drop=0.08,
                     minimum_separation_seconds=0.70,
-                    progress=lambda value, message: progress(0.57 + 0.11 * value, message),
+                    progress=lambda value, message: progress(0.63 + 0.07 * value, message),
                 )
                 target_spans = verifier.locate_target_spans(
                     stem,
@@ -1094,10 +1230,9 @@ class ExtractionPipeline:
                     strong_secondary=0.54,
                     minimum_target_seconds=0.85,
                     bridge_seconds=0.55,
-                    progress=lambda value, message: progress(0.68 + 0.04 * value, message),
+                    progress=lambda value, message: progress(0.70 + 0.03 * value, message),
                 )
-                progress(0.72, f"换人切分完成：得到 {len(split_result)} 个独立说话回合")
-                target_waveform = load_mono(stem, 16000)
+                progress(0.73, f"换人切分完成：得到 {len(split_result)} 个独立说话回合")
                 effective_threshold = max(
                     self.options.speaker_threshold,
                     profile.primary.suggested_threshold,
@@ -1122,8 +1257,21 @@ class ExtractionPipeline:
                         self._target_coverage(span, target_spans),
                         5,
                     )
+                    candidate.diagnostics["speech_ratio"] = round(
+                        speech_ratio(vad_spans, span.start, span.end),
+                        5,
+                    )
+                    candidate.diagnostics["speech_seconds"] = round(
+                        candidate.duration * candidate.diagnostics["speech_ratio"],
+                        5,
+                    )
                     match: SpeakerMatchDecision | None = None
-                    if candidate.duration < self.options.min_sentence_seconds:
+                    if (
+                        candidate.diagnostics["speech_seconds"] < 0.35
+                        or candidate.diagnostics["speech_ratio"] < 0.18
+                    ):
+                        candidate.reject_reason = "有效讲话不足或接近空段"
+                    elif candidate.duration < self.options.min_sentence_seconds:
                         candidate.reject_reason = "说话回合过短"
                     elif candidate.duration > self.options.max_sentence_seconds:
                         candidate.reject_reason = "说话回合过长"
@@ -1142,7 +1290,7 @@ class ExtractionPipeline:
                             candidate.reject_reason = "疑似混合说话人，目标声纹不连续"
                     scored_turns.append((span, candidate, match))
                     progress(
-                        0.68 + 0.04 * index / max(1, len(split_result)),
+                        0.73 + 0.04 * index / max(1, len(split_result)),
                         f"初步匹配目标人物 {index}/{len(split_result)}",
                     )
 
@@ -1155,7 +1303,7 @@ class ExtractionPipeline:
                 recovery_boundaries: list[SpeakerBoundary] = []
                 if recovery_turns:
                     progress(
-                        0.72,
+                        0.77,
                         f"发现 {len(recovery_turns)} 个疑似混合回合，正在局部补切",
                     )
                     assert verifier.secondary is not None
@@ -1171,12 +1319,11 @@ class ExtractionPipeline:
                         primary_candidate_threshold=0.78,
                         minimum_separation_seconds=0.30,
                         progress=lambda value, message: progress(
-                            0.72 + 0.025 * value, message
+                            0.77 + 0.02 * value, message
                         ),
                     )
 
                 recovery_lookup = {id(candidate): index for index, (_span, candidate, _match) in enumerate(recovery_turns, start=1)}
-                recovery_seed_items: list[tuple[CandidateSentence, SpeakerMatchDecision]] = []
                 for span, candidate, match in scored_turns:
                     recovery_index = recovery_lookup.get(id(candidate))
                     if recovery_index is not None and match is not None:
@@ -1199,10 +1346,6 @@ class ExtractionPipeline:
                         if recovered is not None:
                             accepted_candidates, discarded = recovered
                             for recovered_candidate, recovered_match in accepted_candidates:
-                                # Keep the speech-block identity on recovered
-                                # pieces so block-local recall can use them as
-                                # seeds without exporting the original mixed
-                                # turn.
                                 for key in ("speech_block_index", "speaker_turn_index"):
                                     if key in candidate.diagnostics:
                                         recovered_candidate.diagnostics[key] = candidate.diagnostics[key]
@@ -1213,7 +1356,26 @@ class ExtractionPipeline:
                                     ),
                                     5,
                                 )
+                                recovered_candidate.diagnostics["speech_ratio"] = round(
+                                    speech_ratio(
+                                        vad_spans,
+                                        recovered_candidate.start,
+                                        recovered_candidate.end,
+                                    ),
+                                    5,
+                                )
+                                recovered_candidate.diagnostics["speech_seconds"] = round(
+                                    recovered_candidate.duration
+                                    * recovered_candidate.diagnostics["speech_ratio"],
+                                    5,
+                                )
                                 if (
+                                    recovered_candidate.diagnostics["speech_seconds"] < 0.35
+                                    or recovered_candidate.diagnostics["speech_ratio"] < 0.18
+                                ):
+                                    recovered_candidate.reject_reason = "有效讲话不足或接近空段"
+                                    discarded.append(recovered_candidate)
+                                elif (
                                     target_spans
                                     and recovered_candidate.diagnostics["target_coverage"] < 0.60
                                 ):
@@ -1221,7 +1383,6 @@ class ExtractionPipeline:
                                     discarded.append(recovered_candidate)
                                 else:
                                     accepted_turns.append(recovered_candidate)
-                                    recovery_seed_items.append((recovered_candidate, recovered_match))
                             rejected.extend(discarded)
                             continue
                         if match.accepted:
@@ -1234,67 +1395,23 @@ class ExtractionPipeline:
                     else:
                         accepted_turns.append(candidate)
 
-                confirmed_promoted = self._promote_confirmed_recall_candidates(
-                    scored_turns,
-                    accepted_turns,
-                    rejected,
-                )
-                cluster_promoted = self._promote_global_target_cluster(
-                    scored_turns,
-                    accepted_turns,
-                    rejected,
-                    extra_seed_items=recovery_seed_items,
-                )
-                promoted = self._expand_recall_candidates(
-                    scored_turns,
-                    accepted_turns,
-                    rejected,
-                    profile,
-                    extra_seed_items=recovery_seed_items,
-                )
-                if promoted:
-                    progress(
-                        0.76,
-                        f"自适应召回：根据本文件已确认声纹追加 {promoted} 个候选回合",
-                    )
-                if confirmed_promoted:
-                    progress(
-                        0.77,
-                        f"双模型逐窗召回：追加 {confirmed_promoted} 个高置信目标回合",
-                    )
-                if cluster_promoted:
-                    progress(
-                        0.775,
-                        f"全片目标声纹簇召回：追加 {cluster_promoted} 个高置信目标回合",
-                    )
-
                 progress(
-                    0.78,
+                    0.80,
                     f"声纹筛选完成：保留 {len(accepted_turns)} 个目标人物回合，"
                     f"舍弃 {len(rejected)} 个回合",
                 )
             finally:
                 verifier.close()
-                if singing_detector is not None:
-                    singing_detector.close()
 
             accepted: list[CandidateSentence] = []
             if accepted_turns:
-                # Adaptive recall appends candidates after the original turn
-                # pass. Whisper sorts spans by time, so sort the owner list
-                # first to keep STT diagnostics and speaker metadata paired
-                # with the correct audio span.
-                accepted_turns = self._merge_adjacent_target_turns(
-                    accepted_turns,
-                    self.options.min_output_seconds,
-                )
                 accepted_turns.sort(key=lambda item: (item.start, item.end))
-                progress(0.78, f"筛选完成：仅对 {len(accepted_turns)} 个目标人物回合执行 STT")
+                progress(0.80, f"筛选完成：仅对 {len(accepted_turns)} 个目标人物回合执行 STT")
                 segmenter = WhisperSegmenter(self.device)
                 transcribed = segmenter.transcribe_spans(
                     stem,
                     [TimeSpan(candidate.start, candidate.end) for candidate in accepted_turns],
-                    progress=lambda value, message: progress(0.78 + 0.14 * value, message),
+                    progress=lambda value, message: progress(0.80 + 0.13 * value, message),
                 )
                 by_turn: dict[int, list[CandidateSentence]] = {}
                 for sentence in transcribed:
@@ -1306,53 +1423,54 @@ class ExtractionPipeline:
                         turn.reject_reason = "STT 未返回文本"
                         rejected.append(turn)
                         continue
-                    sentences = self._coalesce_short_sentences(
-                        sentences,
-                        self.options.min_output_seconds,
-                    )
                     sentences.sort(key=lambda item: (item.start, item.end))
-                    turn_sentences: list[CandidateSentence] = []
-                    for sentence_index, sentence in enumerate(sentences):
-                        # Whisper word timestamps often begin at the first
-                        # confidently decoded token and end before the final
-                        # phoneme. A single-speaker turn is a safer hard fence
-                        # for training audio than those token-level edges.
-                        if len(sentences) == 1:
-                            sentence.start = turn.start
-                            sentence.end = turn.end
-                        elif sentence_index == 0:
-                            sentence.start = turn.start
-                        elif sentence_index == len(sentences) - 1:
-                            sentence.end = turn.end
-                        if sentence.duration < self.options.min_output_seconds:
-                            turn.reject_reason = "STT 鍒嗗潡杩囩煭"
-                            break
-                        if (
-                            not is_complete_text(sentence.whisper_text)
-                            and not sentence.diagnostics.get("transcription_tail")
-                        ):
-                            turn.reject_reason = "STT 鏂囨湰涓嶅畬鏁?"
-                            break
-                        sentence.text = sentence.whisper_text
-                        sentence.accepted = True
-                        sentence.speaker_score = turn.speaker_score
-                        sentence.window_min_score = turn.window_min_score
-                        sentence.window_p20_score = turn.window_p20_score
-                        sentence.speaker_vote_ratio = turn.speaker_vote_ratio
-                        sentence.window_vote_ratio = turn.window_vote_ratio
-                        sentence.speaker_threshold = turn.speaker_threshold
-                        sentence.overlap_score = turn.overlap_score
-                        sentence.singing_score = turn.singing_score
-                        sentence.speech_score = turn.speech_score
-                        sentence.diagnostics.update(turn.diagnostics)
-                        turn_sentences.append(sentence)
-                    # A turn is atomic for export: if any ASR fragment fails a
-                    # hard gate (short or incomplete text), discard the whole
-                    # turn instead of leaking an accepted prefix.
-                    if turn.reject_reason:
+                    text = ""
+                    languages: list[str] = []
+                    for fragment in sentences:
+                        text = self._join_transcript_text(text, fragment.whisper_text)
+                        if fragment.language and fragment.language != "auto":
+                            languages.append(fragment.language)
+                    text = text.strip()
+                    if not text:
+                        turn.reject_reason = "STT 未返回有效文本"
                         rejected.append(turn)
-                    else:
-                        accepted.extend(turn_sentences)
+                        continue
+                    if turn.duration < self.options.min_output_seconds:
+                        turn.reject_reason = "讲话片段短于训练下限"
+                        rejected.append(turn)
+                        continue
+
+                    language = (
+                        max(set(languages), key=languages.count)
+                        if languages
+                        else "auto"
+                    )
+                    sentence = CandidateSentence(
+                        start=turn.start,
+                        end=turn.end,
+                        whisper_text=text,
+                        language=_language_from_text(text, language),
+                        text=text,
+                        accepted=True,
+                    )
+                    sentence.speaker_score = turn.speaker_score
+                    sentence.window_min_score = turn.window_min_score
+                    sentence.window_p20_score = turn.window_p20_score
+                    sentence.speaker_vote_ratio = turn.speaker_vote_ratio
+                    sentence.window_vote_ratio = turn.window_vote_ratio
+                    sentence.speaker_threshold = turn.speaker_threshold
+                    sentence.overlap_score = turn.overlap_score
+                    sentence.singing_score = turn.singing_score
+                    sentence.speech_score = turn.speech_score
+                    sentence.diagnostics.update(turn.diagnostics)
+                    sentence.diagnostics.update(
+                        {
+                            "stt_fragment_count": len(sentences),
+                            "audio_boundary_source": "silence_and_speaker",
+                            "stt_changed_audio_boundary": False,
+                        }
+                    )
+                    accepted.append(sentence)
                 chinese_candidates = [candidate for candidate in accepted if candidate.language == "zh"]
                 if chinese_candidates:
                     chinese_paths: list[Path] = []
@@ -1382,6 +1500,8 @@ class ExtractionPipeline:
             progress(1.0, f"完成：保留 {len(accepted)} 句，舍弃 {len(rejected)} 句")
             return PipelineResult(job_id, paths["output"], archive, accepted, rejected, manifest, transcript)
         finally:
+            if singing_detector is not None:
+                singing_detector.close()
             if self.options.cleanup_work:
                 shutil.rmtree(paths["root"], ignore_errors=True)
 
