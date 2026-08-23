@@ -255,7 +255,18 @@ class ExtractionPipeline:
         while index + 1 < len(output):
             left, right = output[index], output[index + 1]
             gap = max(0.0, right.start - left.end)
-            if gap <= max_gap and (left.duration < minimum_seconds or right.duration < minimum_seconds):
+            left_index = left.diagnostics.get("speaker_turn_index")
+            right_index = right.diagnostics.get("speaker_turn_index")
+            adjacent_turns = (
+                isinstance(left_index, int)
+                and isinstance(right_index, int)
+                and right_index == left_index + 1
+            )
+            if (
+                gap <= max_gap
+                and adjacent_turns
+                and (left.duration < minimum_seconds or right.duration < minimum_seconds)
+            ):
                 left.end = max(left.end, right.end)
                 left.diagnostics["speaker_turns_merged"] = True
                 left.diagnostics["merged_turn_span"] = [right.start, right.end]
@@ -332,7 +343,7 @@ class ExtractionPipeline:
 
     @staticmethod
     def _needs_boundary_recovery(match: SpeakerMatchDecision, duration: float) -> bool:
-        """Select only near-target or unstable turns for the expensive local pass."""
+        """Select near-target turns and audit every long accepted turn."""
 
         secondary = match.secondary
         if secondary is None or duration < 3.0:
@@ -344,14 +355,9 @@ class ExtractionPipeline:
                 and match.primary.reference_median_score >= 0.40
                 and secondary.reference_median_score >= 0.40
             )
-        if duration < 4.0:
-            return False
-        return (
-            match.primary.window_p20_score < 0.50
-            or secondary.window_p20_score < 0.45
-            or match.primary.window_vote_ratio < 0.50
-            or secondary.window_vote_ratio < 0.50
-        )
+        # A whole-turn embedding can hide a second speaker in the middle. The
+        # local pass is mandatory for longer accepted turns.
+        return duration >= 2.50
 
     def _recover_target_segments(
         self,
@@ -453,14 +459,19 @@ class ExtractionPipeline:
         """Recover target turns that are acoustically close to confirmed seeds.
 
         A fixed lower threshold would admit other speakers globally. Instead,
-        use the already accepted turns from this target file as episode-local
-        seeds and require both verifier embeddings to stay close to that seed
-        centroid. Only candidates rejected for speaker mismatch are eligible;
-        overlap, singing, short-turn and confirmed mixed-speaker decisions stay
-        hard rejects.
+        use accepted turns from the same silence-delimited speech block as
+        local seeds and require both verifier embeddings to stay close to that
+        block centroid. Only candidates rejected for speaker mismatch are
+        eligible; overlap, singing, short-turn and confirmed mixed-speaker
+        decisions stay hard rejects.
         """
 
         accepted_ids = {id(candidate) for candidate in accepted_turns}
+        seed_blocks = {
+            int(candidate.diagnostics["speech_block_index"])
+            for candidate in accepted_turns
+            if "speech_block_index" in candidate.diagnostics
+        }
         seed_items = [
             (candidate, match)
             for _span, candidate, match in scored_turns
@@ -491,12 +502,12 @@ class ExtractionPipeline:
         # evidence from both speaker models below, so this is not a global
         # threshold reduction.
         primary_floor = max(
-            0.58,
-            float(torch.quantile(primary_seed_scores, 0.10)) - 0.24,
+            0.64,
+            float(torch.quantile(primary_seed_scores, 0.10)) - 0.18,
         )
         secondary_floor = max(
-            0.50,
-            float(torch.quantile(secondary_seed_scores, 0.10)) - 0.24,
+            0.58,
+            float(torch.quantile(secondary_seed_scores, 0.10)) - 0.18,
         )
         candidate_by_id = {
             id(candidate): match
@@ -511,6 +522,13 @@ class ExtractionPipeline:
                 retained_rejected.append(candidate)
                 continue
             match = candidate_by_id.get(id(candidate))
+            candidate_block = candidate.diagnostics.get("speech_block_index")
+            if (
+                not isinstance(candidate_block, int)
+                or candidate_block not in seed_blocks
+            ):
+                retained_rejected.append(candidate)
+                continue
             if (
                 match is None
                 or match.secondary is None
@@ -530,20 +548,20 @@ class ExtractionPipeline:
             )
             reference_floor = float(profile.primary.reference_floor)
             reference_evidence = (
-                primary_reference_max >= max(0.46, reference_floor - 0.17)
-                and secondary_reference_max >= max(0.44, reference_floor - 0.19)
+                primary_reference_max >= max(0.52, reference_floor - 0.11)
+                and secondary_reference_max >= max(0.48, reference_floor - 0.13)
             )
             window_evidence = (
-                candidate.window_p20_score >= primary_floor - 0.32
-                and match.secondary.window_p20_score >= secondary_floor - 0.32
-                and candidate.window_vote_ratio >= 0.15
-                and match.secondary.window_vote_ratio >= 0.15
+                candidate.window_p20_score >= primary_floor - 0.20
+                and match.secondary.window_p20_score >= secondary_floor - 0.20
+                and candidate.window_vote_ratio >= 0.35
+                and match.secondary.window_vote_ratio >= 0.35
             )
             direct_evidence = (
-                match.primary.score >= 0.44
-                and match.secondary.score >= 0.42
+                match.primary.score >= 0.54
+                and match.secondary.score >= 0.50
                 and match.paired_reference_median
-                >= max(0.40, reference_floor - 0.20)
+                >= max(0.46, reference_floor - 0.14)
             )
             if (
                 primary_seed_score < primary_floor
@@ -740,7 +758,13 @@ class ExtractionPipeline:
             )
             progress(0.48, "VAD 完成：先过滤多人同时说话和歌声")
             reference_clips = self._make_reference_clips(reference_stems, vad_map, paths)
-            vad_spans = self._merge_vad_spans(vad_map.get(stem, []))
+            # VAD spans are the speech-only source of truth.  A longer silence
+            # starts a new dialogue block for diarization; the silence itself
+            # is never emitted as an output segment.
+            vad_spans = self._merge_vad_spans(
+                vad_map.get(stem, []),
+                gap=0.45,
+            )
             if not vad_spans:
                 manifest, transcript, archive = self._write_outputs(
                     [],
@@ -856,6 +880,15 @@ class ExtractionPipeline:
                     candidate = CandidateSentence(span.start, span.end, "")
                     candidate.speaker_threshold = effective_threshold
                     candidate.diagnostics["speaker_turn_index"] = index - 1
+                    candidate.diagnostics["speech_block_index"] = next(
+                        (
+                            block_index
+                            for block_index, block in enumerate(clean_spans)
+                            if block.start <= span.start + 0.02
+                            and span.end - 0.02 <= block.end
+                        ),
+                        -1,
+                    )
                     match: SpeakerMatchDecision | None = None
                     if candidate.duration < self.options.min_sentence_seconds:
                         candidate.reject_reason = "说话回合过短"

@@ -497,6 +497,28 @@ class DualSpeakerVerifier:
     BALANCED_MIN_DURATION = 3.00
 
     @staticmethod
+    def _window_continuity(
+        primary: SpeakerDecision,
+        secondary: SpeakerDecision,
+        duration: float,
+        threshold: float,
+    ) -> bool:
+        """Reject turns containing a sustained low-evidence speaker window."""
+
+        pairs = list(zip(primary.window_scores, secondary.window_scores))
+        if not pairs or duration < 1.8:
+            return True
+        primary_floor = max(0.32, threshold - 0.35)
+        secondary_floor = max(0.28, threshold - 0.38)
+        low_windows = sum(
+            primary_score < primary_floor and secondary_score < secondary_floor
+            for primary_score, secondary_score in pairs
+        )
+        # One uncertain window can be a breath, overlap residue, or a quiet
+        # phoneme. More than 20% low windows is usually a speaker switch.
+        return low_windows / len(pairs) <= 0.20
+
+    @staticmethod
     def _paired_reference_median(
         primary: SpeakerDecision,
         secondary: SpeakerDecision,
@@ -540,10 +562,12 @@ class DualSpeakerVerifier:
         paired_reference_median: float,
         threshold: float = 0.70,
     ) -> SpeakerMatchTier:
+        if not cls._window_continuity(primary, secondary, duration, threshold):
+            return "rejected"
         short_strong = (
             cls.SHORT_MIN_DURATION <= duration < cls.FULL_MIN_DURATION
-            and primary.score >= 0.70
-            and secondary.score >= 0.68
+            and primary.score >= max(0.70, threshold)
+            and secondary.score >= max(0.68, threshold - 0.02)
             and primary.reference_median_score >= 0.58
             and secondary.reference_median_score >= 0.56
             and paired_reference_median >= 0.58
@@ -555,9 +579,9 @@ class DualSpeakerVerifier:
 
         strong = (
             duration >= cls.FULL_MIN_DURATION
-            and primary.score >= 0.58
-            and secondary.score >= 0.60
-            and paired_reference_median >= 0.50
+            and primary.score >= max(0.58, threshold - 0.10)
+            and secondary.score >= max(0.60, threshold - 0.08)
+            and paired_reference_median >= max(0.50, threshold - 0.20)
             and primary.reference_spread <= 0.15
         )
         if strong:
@@ -565,11 +589,11 @@ class DualSpeakerVerifier:
 
         balanced = (
             duration >= cls.BALANCED_MIN_DURATION
-            and primary.score >= 0.54
-            and secondary.score >= 0.54
-            and primary.reference_median_score >= 0.47
-            and secondary.reference_median_score >= 0.46
-            and paired_reference_median >= 0.48
+            and primary.score >= max(0.54, threshold - 0.14)
+            and secondary.score >= max(0.54, threshold - 0.14)
+            and primary.reference_median_score >= max(0.47, threshold - 0.23)
+            and secondary.reference_median_score >= max(0.46, threshold - 0.24)
+            and paired_reference_median >= max(0.48, threshold - 0.22)
             and primary.reference_spread <= 0.13
         )
         if balanced:
@@ -710,7 +734,9 @@ class DualSpeakerVerifier:
             paired_reference_median,
             threshold,
         )
-        accepted = tier in {"short_strong", "strong", "balanced", "recall"}
+        # Recall is diagnostic-only. Weak candidates must not enter a training
+        # dataset merely because an episode-local centroid happened to agree.
+        accepted = tier in {"short_strong", "strong", "balanced"}
         diagnostics: dict[str, float | str | bool] = {
             "duration": round(float(duration), 5),
             "speaker_tier": tier,

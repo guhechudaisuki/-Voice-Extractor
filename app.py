@@ -54,7 +54,6 @@ def _paths(value) -> list[Path]:
 def run_job(
     references,
     targets,
-    strictness: str,
     use_overlap: bool,
     use_singing: bool,
 ):
@@ -65,9 +64,8 @@ def run_job(
     if not target_paths:
         raise gr.Error("请上传至少一段待提取音频")
 
-    thresholds = {"标准": 0.68, "严格": 0.70, "极严格": 0.72}
     options = PipelineOptions(
-        speaker_threshold=thresholds.get(strictness, 0.70),
+        speaker_threshold=0.68,
         use_overlap_detector=bool(use_overlap),
         use_singing_detector=bool(use_singing),
     )
@@ -181,7 +179,6 @@ with gr.Blocks(title="参考音色句子提取", analytics_enabled=False) as dem
             type="filepath",
         )
     with gr.Row():
-        strictness = gr.Radio(["标准", "严格", "极严格"], value="标准", label="匹配严格度")
         use_overlap = gr.Checkbox(value=True, label="过滤多人同时说话")
         use_singing = gr.Checkbox(value=True, label="过滤唱歌/歌声")
     run_button = gr.Button("开始提取", variant="primary")
@@ -199,7 +196,7 @@ with gr.Blocks(title="参考音色句子提取", analytics_enabled=False) as dem
         transcript = gr.File(label="批次 SRT 文本")
     run_button.click(
         run_job,
-        inputs=[references, targets, strictness, use_overlap, use_singing],
+        inputs=[references, targets, use_overlap, use_singing],
         outputs=[status, live_progress, table, archive, manifest, transcript],
         show_progress="hidden",
     )
