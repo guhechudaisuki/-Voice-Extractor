@@ -22,6 +22,7 @@ SV_CODE = GPT_ROOT / "GPT_SoVITS" / "eres2net"
 SV_MODEL = GPT_ROOT / "GPT_SoVITS" / "pretrained_models" / "sv" / "pretrained_eres2netv2w24s4ep4.ckpt"
 CAMPLUS_MODEL = TOOL_ROOT / "models" / "campplus_voxceleb" / "campplus_voxceleb.bin"
 WAVLM_SV_MODEL = TOOL_ROOT / "models" / "wavlm-base-plus-sv"
+WESPEAKER_MODEL = TOOL_ROOT / "models" / "wespeaker-resnet34-lm" / "onnx" / "model.onnx"
 
 WHISPER_CACHE = WORKSPACE_ROOT / "omnvoice" / "hf_cache" / "models--openai--whisper-large-v3-turbo"
 OVERLAP_MODEL = TOOL_ROOT / "models" / "overlap" / "model.onnx"
@@ -54,6 +55,7 @@ def ensure_local_assets() -> None:
         "WavLM speaker verifier": WAVLM_SV_MODEL / "pytorch_model.bin",
         "WavLM config": WAVLM_SV_MODEL / "config.json",
         "WavLM preprocessor": WAVLM_SV_MODEL / "preprocessor_config.json",
+        "WeSpeaker verifier": WESPEAKER_MODEL,
         "overlap detector": OVERLAP_MODEL,
         "singing detector": PANNS_MODEL,
         "PANNs labels": PANNS_LABELS,

@@ -10,7 +10,7 @@ import torch
 import torch.nn.functional as F
 import torchaudio
 
-from .config import CAMPLUS_MODEL, SV_CODE, SV_MODEL, WAVLM_SV_MODEL
+from .config import CAMPLUS_MODEL, SV_CODE, SV_MODEL, WAVLM_SV_MODEL, WESPEAKER_MODEL
 from .audio import load_mono
 from .types import TimeSpan
 
@@ -99,10 +99,29 @@ class WavLMDecision:
 
 
 @dataclass
+class WeSpeakerProfile:
+    embeddings: torch.Tensor
+    centroid: torch.Tensor
+    reference_scores: list[float]
+    reference_indexes: tuple[int, ...] = ()
+
+
+@dataclass
+class WeSpeakerDecision:
+    score: float
+    reference_max_score: float
+    window_min_score: float
+    window_p20_score: float
+    window_scores: list[float]
+
+
+@dataclass
 class ExclusionSpeakerProfile:
     label: str
     primary: SpeakerProfile
     secondary: CAMPlusProfile
+    reference_paths: list[Path] = field(default_factory=list)
+    quaternary: WeSpeakerProfile | None = None
 
 
 @dataclass(frozen=True)
@@ -657,6 +676,159 @@ class WavLMSpeakerVerifier:
         )
 
 
+class WeSpeakerVerifier:
+    """Deterministic CPU ONNX verifier used for residual speaker ambiguity."""
+
+    SAMPLE_RATE = 16000
+    WINDOW_SECONDS = 3.0
+    HOP_SECONDS = 1.5
+
+    def __init__(self) -> None:
+        import onnxruntime
+
+        # CPU execution is fast for the small ambiguity batch and avoids
+        # provider-dependent CUDA kernel variation between identical runs.
+        self.session = onnxruntime.InferenceSession(
+            str(WESPEAKER_MODEL),
+            providers=["CPUExecutionProvider"],
+        )
+        self.input_name = self.session.get_inputs()[0].name
+        self.output_name = self.session.get_outputs()[0].name
+
+    def close(self) -> None:
+        if hasattr(self, "session"):
+            del self.session
+        gc.collect()
+
+    @classmethod
+    def _windows(cls, waveform: torch.Tensor) -> list[torch.Tensor]:
+        value = waveform.detach().float().cpu().flatten()
+        window = int(round(cls.WINDOW_SECONDS * cls.SAMPLE_RATE))
+        hop = int(round(cls.HOP_SECONDS * cls.SAMPLE_RATE))
+        if value.numel() <= window:
+            return [value]
+        starts = list(range(0, value.numel() - window + 1, hop))
+        last = value.numel() - window
+        if not starts or starts[-1] != last:
+            starts.append(last)
+        return [value[start : start + window] for start in starts]
+
+    @classmethod
+    def _fbank(cls, waveform: torch.Tensor) -> torch.Tensor:
+        features = torchaudio.compliance.kaldi.fbank(
+            (waveform * 32768.0).unsqueeze(0),
+            num_mel_bins=80,
+            frame_length=25.0,
+            frame_shift=10.0,
+            dither=0.0,
+            sample_frequency=float(cls.SAMPLE_RATE),
+            window_type="hamming",
+            use_energy=False,
+        )
+        return features - features.mean(dim=0, keepdim=True)
+
+    def _window_embeddings(
+        self,
+        waveforms: Sequence[torch.Tensor],
+        batch_size: int = 64,
+        progress: Callable[[int, int], None] | None = None,
+    ) -> tuple[torch.Tensor, list[tuple[int, int]]]:
+        features: list[torch.Tensor] = []
+        ranges: list[tuple[int, int]] = []
+        for waveform in waveforms:
+            start = len(features)
+            features.extend(self._fbank(window) for window in self._windows(waveform))
+            ranges.append((start, len(features)))
+        if not features:
+            return torch.empty((0, 0)), ranges
+
+        output: list[torch.Tensor | None] = [None] * len(features)
+        groups: dict[int, list[int]] = {}
+        for index, feature in enumerate(features):
+            groups.setdefault(feature.shape[0], []).append(index)
+        completed = 0
+        for frame_count in sorted(groups):
+            indexes = groups[frame_count]
+            for offset in range(0, len(indexes), max(1, batch_size)):
+                batch_indexes = indexes[offset : offset + max(1, batch_size)]
+                batch = torch.stack([features[index] for index in batch_indexes]).numpy()
+                embeddings = self.session.run(
+                    [self.output_name],
+                    {self.input_name: batch},
+                )[0]
+                values = F.normalize(torch.from_numpy(embeddings).float(), p=2, dim=1)
+                for index, value in zip(batch_indexes, values):
+                    output[index] = value
+                completed += len(values)
+                if progress is not None:
+                    progress(completed, len(features))
+        if any(value is None for value in output):
+            raise RuntimeError("WeSpeaker 批量嵌入结果不完整")
+        return torch.stack([value for value in output if value is not None]), ranges
+
+    def embeddings_from_waveforms(
+        self,
+        waveforms: Sequence[torch.Tensor],
+        batch_size: int = 64,
+        progress: Callable[[int, int], None] | None = None,
+    ) -> torch.Tensor:
+        window_embeddings, ranges = self._window_embeddings(
+            waveforms,
+            batch_size=batch_size,
+            progress=progress,
+        )
+        if not ranges:
+            return torch.empty((0, 0))
+        return torch.stack(
+            [
+                F.normalize(window_embeddings[start:end].mean(dim=0), p=2, dim=0)
+                for start, end in ranges
+            ]
+        )
+
+    def build_profile(
+        self,
+        reference_paths: list[Path],
+        reference_indexes: Sequence[int] | None = None,
+    ) -> WeSpeakerProfile:
+        all_embeddings = self.embeddings_from_waveforms(
+            [load_mono(path, self.SAMPLE_RATE) for path in reference_paths]
+        )
+        if reference_indexes is None:
+            indexes = torch.arange(len(all_embeddings))
+        else:
+            indexes = torch.tensor(list(reference_indexes), dtype=torch.long)
+        if indexes.numel() == 0:
+            raise ValueError("至少需要一段有效参考音频")
+        embeddings = all_embeddings[indexes]
+        centroid = F.normalize(embeddings.mean(dim=0), p=2, dim=0)
+        scores = embeddings @ centroid
+        return WeSpeakerProfile(
+            embeddings=embeddings,
+            centroid=centroid,
+            reference_scores=[round(float(value), 5) for value in scores],
+            reference_indexes=tuple(int(value) for value in indexes.tolist()),
+        )
+
+    def verify_waveform(
+        self,
+        waveform: torch.Tensor,
+        profile: WeSpeakerProfile,
+    ) -> WeSpeakerDecision:
+        window_embeddings, ranges = self._window_embeddings([waveform])
+        start, end = ranges[0]
+        windows = window_embeddings[start:end]
+        whole = F.normalize(windows.mean(dim=0), p=2, dim=0)
+        scores = windows @ profile.centroid
+        return WeSpeakerDecision(
+            score=round(float(whole @ profile.centroid), 5),
+            reference_max_score=round(float((profile.embeddings @ whole).max()), 5),
+            window_min_score=round(float(scores.min()), 5),
+            window_p20_score=round(float(torch.quantile(scores, 0.20)), 5),
+            window_scores=[round(float(value), 5) for value in scores],
+        )
+
+
 class DualSpeakerVerifier:
     """Classify target-speaker turns using ERes2Net and CAM++ consensus."""
 
@@ -812,6 +984,8 @@ class DualSpeakerVerifier:
         self.tertiary: WavLMSpeakerVerifier | None = None
         self.tertiary_profile: WavLMProfile | None = None
         self.tertiary_target_spans: list[TimeSpan] = []
+        self.quaternary: WeSpeakerVerifier | None = None
+        self.quaternary_profile: WeSpeakerProfile | None = None
         # Boundary detection can run before a reference profile is built.  Keep
         # its CAM++ instance separate until ``_ensure_secondary`` can attach a
         # profile, then reuse the same model to avoid loading it twice.
@@ -826,6 +1000,8 @@ class DualSpeakerVerifier:
                 closed.add(id(verifier))
         if self.tertiary is not None:
             self.tertiary.close()
+        if self.quaternary is not None:
+            self.quaternary.close()
 
     def build_profile(self, reference_paths: list[Path], base_threshold: float) -> SpeakerMatchProfile:
         return SpeakerMatchProfile(
@@ -858,6 +1034,7 @@ class DualSpeakerVerifier:
                     label=f"排除角色 {index}",
                     primary=primary,
                     secondary=secondary,
+                    reference_paths=group,
                 )
             )
         return output
@@ -994,6 +1171,141 @@ class DualSpeakerVerifier:
         assert self.tertiary is not None
         return self.tertiary, tertiary_profile
 
+    def quaternary_pair(
+        self, profile: SpeakerMatchProfile
+    ) -> tuple[WeSpeakerVerifier, WeSpeakerProfile]:
+        if self.quaternary is None:
+            self.status("正在加载 WeSpeaker 第四声纹裁决模型")
+            self.quaternary = WeSpeakerVerifier()
+            self.quaternary_profile = self.quaternary.build_profile(
+                profile.reference_paths,
+                reference_indexes=profile.primary.reference_indexes,
+            )
+            self.status("WeSpeaker 第四声纹裁决模型已就绪")
+        assert self.quaternary_profile is not None
+        return self.quaternary, self.quaternary_profile
+
+    def multimodel_exclusion_audit(
+        self,
+        match: SpeakerMatchDecision,
+        target_profile: SpeakerMatchProfile,
+        fourth_embedding: torch.Tensor,
+        fourth_target: WeSpeakerProfile,
+        exclusion_profiles: Sequence[ExclusionSpeakerProfile],
+    ) -> dict[str, float | str | bool] | None:
+        """Veto late recovery when two of three models prefer one exclusion."""
+
+        secondary = match.secondary
+        if (
+            not exclusion_profiles
+            or match.primary.embedding is None
+            or secondary is None
+            or secondary.embedding is None
+        ):
+            return None
+        assert self.quaternary is not None
+        target_secondary = self._ensure_secondary(target_profile)
+        primary_embedding = match.primary.embedding
+        secondary_embedding = secondary.embedding
+        target_scores = {
+            "primary_centroid": float(
+                primary_embedding @ target_profile.primary.centroid
+            ),
+            "primary_direct": float(
+                (target_profile.primary.embeddings @ primary_embedding).max()
+            ),
+            "secondary_centroid": float(
+                secondary_embedding @ target_secondary.centroid
+            ),
+            "secondary_direct": float(
+                (target_secondary.embeddings @ secondary_embedding).max()
+            ),
+            "fourth_centroid": float(fourth_embedding @ fourth_target.centroid),
+            "fourth_direct": float(
+                (fourth_target.embeddings @ fourth_embedding).max()
+            ),
+        }
+        strongest: dict[str, float | str | bool] | None = None
+        strongest_margin = float("inf")
+        all_models_clear = True
+        for exclusion in exclusion_profiles:
+            if exclusion.quaternary is None:
+                exclusion.quaternary = self.quaternary.build_profile(
+                    exclusion.reference_paths
+                )
+            negative_fourth = exclusion.quaternary
+            margins = {
+                "primary_centroid": target_scores["primary_centroid"]
+                - float(primary_embedding @ exclusion.primary.centroid),
+                "primary_direct": target_scores["primary_direct"]
+                - float((exclusion.primary.embeddings @ primary_embedding).max()),
+                "secondary_centroid": target_scores["secondary_centroid"]
+                - float(secondary_embedding @ exclusion.secondary.centroid),
+                "secondary_direct": target_scores["secondary_direct"]
+                - float(
+                    (exclusion.secondary.embeddings @ secondary_embedding).max()
+                ),
+                "fourth_centroid": target_scores["fourth_centroid"]
+                - float(fourth_embedding @ negative_fourth.centroid),
+                "fourth_direct": target_scores["fourth_direct"]
+                - float((negative_fourth.embeddings @ fourth_embedding).max()),
+            }
+            primary_vote = (
+                margins["primary_centroid"] <= 0.02
+                and margins["primary_direct"] <= 0.02
+            )
+            secondary_vote = (
+                margins["secondary_centroid"] <= 0.02
+                and margins["secondary_direct"] <= 0.02
+            )
+            fourth_vote = (
+                margins["fourth_centroid"] <= 0.02
+                and margins["fourth_direct"] <= 0.02
+            )
+            vote_count = sum((primary_vote, secondary_vote, fourth_vote))
+            role_all_models_clear = all(value >= 0.02 for value in margins.values())
+            all_models_clear = all_models_clear and role_all_models_clear
+            diagnostics: dict[str, float | str | bool] = {
+                "excluded_role_rejected": vote_count >= 2,
+                "excluded_all_models_clear": role_all_models_clear,
+                "excluded_role": exclusion.label,
+                "excluded_primary_margin": round(
+                    margins["primary_centroid"], 5
+                ),
+                "excluded_secondary_margin": round(
+                    margins["secondary_centroid"], 5
+                ),
+                "excluded_wespeaker_margin": round(
+                    margins["fourth_centroid"], 5
+                ),
+                "excluded_primary_direct_margin": round(
+                    margins["primary_direct"], 5
+                ),
+                "excluded_secondary_direct_margin": round(
+                    margins["secondary_direct"], 5
+                ),
+                "excluded_wespeaker_direct_margin": round(
+                    margins["fourth_direct"], 5
+                ),
+                "excluded_primary_vote": primary_vote,
+                "excluded_secondary_vote": secondary_vote,
+                "excluded_wespeaker_vote": fourth_vote,
+                "excluded_multimodel_vote_count": vote_count,
+            }
+            if vote_count >= 2:
+                return diagnostics
+            total_margin = (
+                margins["primary_centroid"]
+                + margins["secondary_centroid"]
+                + margins["fourth_centroid"]
+            )
+            if total_margin < strongest_margin:
+                strongest_margin = total_margin
+                strongest = diagnostics
+        if strongest is not None:
+            strongest["excluded_all_models_clear"] = all_models_clear
+        return strongest
+
     def promote_with_tertiary(
         self,
         waveform: torch.Tensor,
@@ -1110,6 +1422,121 @@ class DualSpeakerVerifier:
             tier="tertiary",
             merge_only=False,
             paired_reference_median=match.paired_reference_median,
+            diagnostics=diagnostics,
+        )
+
+    def promote_contrastive_edge_with_tertiary(
+        self,
+        core_waveform: torch.Tensor,
+        residual_waveform: torch.Tensor,
+        profile: SpeakerMatchProfile,
+        core_match: SpeakerMatchDecision,
+        residual_match: SpeakerMatchDecision,
+        core_duration: float,
+        residual_duration: float,
+    ) -> SpeakerMatchDecision | None:
+        """Confirm a target core only when its short edge is clearly another voice."""
+
+        core_secondary = core_match.secondary
+        residual_secondary = residual_match.secondary
+        if (
+            core_secondary is None
+            or residual_secondary is None
+            or residual_match.accepted
+            or not 0.25 <= residual_duration <= 0.90
+            or residual_match.primary.reference_max_score > 0.42
+            or residual_secondary.reference_max_score > 0.35
+        ):
+            return None
+
+        primary_score_margin = (
+            core_match.primary.score - residual_match.primary.score
+        )
+        primary_direct_margin = (
+            core_match.primary.reference_max_score
+            - residual_match.primary.reference_max_score
+        )
+        secondary_score_margin = core_secondary.score - residual_secondary.score
+        secondary_direct_margin = (
+            core_secondary.reference_max_score
+            - residual_secondary.reference_max_score
+        )
+        if min(
+            primary_score_margin,
+            primary_direct_margin,
+            secondary_score_margin,
+            secondary_direct_margin,
+        ) < 0.15:
+            return None
+
+        promoted = self.promote_local_with_tertiary(
+            core_waveform,
+            profile,
+            core_match,
+            core_duration,
+        )
+        if promoted is None:
+            return None
+
+        assert self.tertiary is not None
+        tertiary_profile = self._ensure_tertiary(profile)
+        residual_window = min(0.80, max(0.40, residual_duration))
+        residual_hop = min(0.30, max(0.20, residual_duration / 2.0))
+        residual_tertiary = self.tertiary.verify_waveform(
+            residual_waveform,
+            tertiary_profile,
+            window_seconds=residual_window,
+            hop_seconds=residual_hop,
+        )
+        floor = tertiary_profile.acceptance_floor
+        core_tertiary_score = float(promoted.diagnostics["wavlm_score"])
+        core_tertiary_direct = float(
+            promoted.diagnostics["wavlm_reference_max"]
+        )
+        if (
+            residual_tertiary.reference_max_score > floor - 0.15
+            or core_tertiary_score - residual_tertiary.score < 0.25
+            or core_tertiary_direct - residual_tertiary.reference_max_score < 0.25
+        ):
+            return None
+
+        diagnostics = {
+            **promoted.diagnostics,
+            "contrastive_edge_tertiary_passed": True,
+            "contrastive_primary_score_margin": round(primary_score_margin, 5),
+            "contrastive_primary_direct_margin": round(primary_direct_margin, 5),
+            "contrastive_secondary_score_margin": round(secondary_score_margin, 5),
+            "contrastive_secondary_direct_margin": round(
+                secondary_direct_margin, 5
+            ),
+            "contrastive_residual_eres_score": residual_match.primary.score,
+            "contrastive_residual_eres_reference_max": (
+                residual_match.primary.reference_max_score
+            ),
+            "contrastive_residual_camplus_score": residual_secondary.score,
+            "contrastive_residual_camplus_reference_max": (
+                residual_secondary.reference_max_score
+            ),
+            "contrastive_residual_wavlm_score": residual_tertiary.score,
+            "contrastive_residual_wavlm_reference_max": (
+                residual_tertiary.reference_max_score
+            ),
+            "contrastive_wavlm_score_margin": round(
+                core_tertiary_score - residual_tertiary.score, 5
+            ),
+            "contrastive_wavlm_direct_margin": round(
+                core_tertiary_direct - residual_tertiary.reference_max_score,
+                5,
+            ),
+        }
+        return SpeakerMatchDecision(
+            accepted=True,
+            primary=promoted.primary,
+            match_mode="tertiary",
+            secondary=promoted.secondary,
+            tier="tertiary",
+            merge_only=False,
+            paired_reference_median=promoted.paired_reference_median,
             diagnostics=diagnostics,
         )
 

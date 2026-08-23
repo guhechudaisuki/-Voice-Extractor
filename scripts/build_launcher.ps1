@@ -7,6 +7,11 @@ if (-not (Test-Path $runtime)) { throw "找不到 GPT-SoVITS runtime: $runtime" 
 if ($InstallPyInstaller) { & $runtime -m pip install pyinstaller }
 & $runtime -m pip show pyinstaller *> $null
 if ($LASTEXITCODE -ne 0) { throw '未安装 PyInstaller。运行 .\scripts\build_launcher.ps1 -InstallPyInstaller' }
-& $runtime -m PyInstaller --noconfirm --clean --onefile --name VoiceExtractor (Join-Path $root 'launcher\voice_extractor_launcher.py')
-if ($LASTEXITCODE -ne 0) { throw 'PyInstaller 构建失败' }
-Write-Host "已生成 dist\VoiceExtractor.exe" -ForegroundColor Green
+Push-Location $root
+try {
+    & $runtime -m PyInstaller --noconfirm --clean --onefile --name VoiceExtractor (Join-Path $root 'launcher\voice_extractor_launcher.py')
+    if ($LASTEXITCODE -ne 0) { throw 'PyInstaller 构建失败' }
+} finally {
+    Pop-Location
+}
+Write-Host ("已生成 {0}" -f (Join-Path $root 'dist\VoiceExtractor.exe')) -ForegroundColor Green

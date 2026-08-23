@@ -54,6 +54,13 @@ DIRECT_ASSETS = (
         None,
     ),
     (
+        "WeSpeaker ONNX verifier",
+        "wespeaker",
+        "model.onnx",
+        "https://huggingface.co/onnx-community/wespeaker-voxceleb-resnet34-LM/resolve/6a61a1833ff2583aabeba044f5c8221f00b67ceb/onnx/model.onnx?download=true",
+        "3955447b0499dc9e0a4541a895df08b03c69098eba4e56c02b5603e9f7f4fcbb",
+    ),
+    (
         "overlap detector",
         "overlap",
         "model.onnx",
@@ -331,6 +338,7 @@ def ensure_assets(source_root: Path, python: Path) -> None:
         "eres": gpt_root / "GPT_SoVITS" / "pretrained_models" / "sv",
         "camplus": source_root / "models" / "campplus_voxceleb",
         "wavlm": source_root / "models" / "wavlm-base-plus-sv",
+        "wespeaker": source_root / "models" / "wespeaker-resnet34-lm" / "onnx",
         "overlap": source_root / "models" / "overlap",
         "panns": source_root / "models" / "panns",
     }

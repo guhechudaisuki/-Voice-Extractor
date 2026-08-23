@@ -6,9 +6,21 @@ $ErrorActionPreference = 'Stop'
 $toolRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $gptRoot = Join-Path $WorkspaceRoot 'GPT-SoVITS-v2pro-20250604'
 $python = if ($env:VOICE_EXTRACT_PYTHON) { $env:VOICE_EXTRACT_PYTHON } else { Join-Path $gptRoot 'runtime\python.exe' }
+
+function Test-Asset {
+    param([hashtable]$Asset)
+    if (-not (Test-Path -LiteralPath $Asset.Path -PathType Leaf)) { return $false }
+    if ((Get-Item -LiteralPath $Asset.Path).Length -eq 0) { return $false }
+    if ($Asset.Hash) {
+        return (Get-FileHash -LiteralPath $Asset.Path -Algorithm SHA256).Hash -eq $Asset.Hash
+    }
+    return $true
+}
+
 $checks = @(
     @{ Name='Python runtime'; Path=$python },
     @{ Name='FFmpeg'; Path=(Join-Path $gptRoot 'runtime\ffmpeg.exe') },
+    @{ Name='FFprobe'; Path=(Join-Path $gptRoot 'runtime\ffprobe.exe') },
     @{ Name='UVR5 vocals'; Path=(Join-Path $gptRoot 'tools\uvr5\uvr5_weights\HP2_all_vocals.pth') },
     @{ Name='ERes2NetV2'; Path=(Join-Path $gptRoot 'GPT_SoVITS\pretrained_models\sv\pretrained_eres2netv2w24s4ep4.ckpt') },
     @{ Name='Paraformer'; Path=(Join-Path $gptRoot 'tools\asr\models\speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch\model.pt') },
@@ -18,14 +30,28 @@ $checks = @(
     @{ Name='WavLM SV'; Path=(Join-Path $toolRoot 'models\wavlm-base-plus-sv\pytorch_model.bin') },
     @{ Name='WavLM config'; Path=(Join-Path $toolRoot 'models\wavlm-base-plus-sv\config.json') },
     @{ Name='WavLM preprocessor'; Path=(Join-Path $toolRoot 'models\wavlm-base-plus-sv\preprocessor_config.json') },
+    @{
+        Name='WeSpeaker ONNX'
+        Path=(Join-Path $toolRoot 'models\wespeaker-resnet34-lm\onnx\model.onnx')
+        Hash='3955447B0499DC9E0A4541A895DF08B03C69098EBA4E56C02B5603E9F7F4FCBB'
+    },
     @{ Name='Overlap ONNX'; Path=(Join-Path $toolRoot 'models\overlap\model.onnx') },
     @{ Name='PANNs'; Path=(Join-Path $toolRoot 'models\panns\Cnn10_mAP=0.380.pth') },
     @{ Name='PANNs labels'; Path=(Join-Path $toolRoot 'models\panns\class_labels_indices.csv') }
 )
-$missing = @($checks | Where-Object { -not (Test-Path -LiteralPath $_.Path) })
+$missing = @($checks | Where-Object { -not (Test-Asset $_) })
 foreach ($item in $checks) {
-    if (Test-Path -LiteralPath $item.Path) { Write-Host ("[OK]   {0}: {1}" -f $item.Name,$item.Path) -ForegroundColor Green }
+    if (Test-Asset $item) { Write-Host ("[OK]   {0}: {1}" -f $item.Name,$item.Path) -ForegroundColor Green }
     else { Write-Host ("[MISS] {0}: {1}" -f $item.Name,$item.Path) -ForegroundColor Yellow }
 }
 if ($missing.Count -gt 0) { Write-Error ('Missing {0} asset(s). Run download_assets.ps1 or follow README.' -f $missing.Count) }
+
+$whisperSnapshots = Join-Path $WorkspaceRoot 'omnvoice\hf_cache\models--openai--whisper-large-v3-turbo\snapshots'
+$whisperReady = (Test-Path -LiteralPath $whisperSnapshots -PathType Container) -and
+    (@(Get-ChildItem -LiteralPath $whisperSnapshots -Directory -ErrorAction SilentlyContinue).Count -gt 0)
+if ($whisperReady) {
+    Write-Host ("[OK]   Whisper large-v3-turbo: {0}" -f $whisperSnapshots) -ForegroundColor Green
+} else {
+    Write-Error ("Missing Whisper large-v3-turbo snapshot: {0}" -f $whisperSnapshots)
+}
 Write-Host 'Asset check passed.' -ForegroundColor Green

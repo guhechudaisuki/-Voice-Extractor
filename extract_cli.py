@@ -26,8 +26,8 @@ def main() -> int:
     parser.add_argument(
         "--threshold",
         type=float,
-        default=0.70,
-        help="声纹阈值，默认 0.70",
+        default=0.68,
+        help="声纹阈值，默认 0.68",
     )
     parser.add_argument("--no-overlap", action="store_true", help="关闭多人重叠检测")
     parser.add_argument("--no-singing", action="store_true", help="关闭唱歌检测")
