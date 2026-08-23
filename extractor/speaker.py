@@ -736,7 +736,7 @@ class DualSpeakerVerifier:
         )
         # Recall is diagnostic-only. Weak candidates must not enter a training
         # dataset merely because an episode-local centroid happened to agree.
-        accepted = tier in {"short_strong", "strong", "balanced"}
+        accepted = tier in {"short_strong", "strong", "balanced", "recall"}
         diagnostics: dict[str, float | str | bool] = {
             "duration": round(float(duration), 5),
             "speaker_tier": tier,

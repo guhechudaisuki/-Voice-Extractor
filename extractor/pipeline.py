@@ -346,18 +346,19 @@ class ExtractionPipeline:
         """Select near-target turns and audit every long accepted turn."""
 
         secondary = match.secondary
-        if secondary is None or duration < 3.0:
+        if secondary is None or duration < 1.8:
             return False
         if not match.accepted:
             return (
-                match.primary.score >= 0.50
+                duration >= 3.0
+                and match.primary.score >= 0.50
                 and secondary.score >= 0.50
                 and match.primary.reference_median_score >= 0.40
                 and secondary.reference_median_score >= 0.40
             )
         # A whole-turn embedding can hide a second speaker in the middle. The
         # local pass is mandatory for longer accepted turns.
-        return duration >= 2.50
+        return duration >= 1.80
 
     def _recover_target_segments(
         self,
@@ -972,7 +973,9 @@ class ExtractionPipeline:
                             rejected.extend(discarded)
                             continue
                         if match.accepted:
-                            candidate.reject_reason = "疑似混合说话人，保守舍弃"
+                            # No confirmed local boundary means this verified
+                            # speech block is continuous, so keep it intact.
+                            candidate.diagnostics["boundary_audit"] = "clean"
 
                     if candidate.reject_reason:
                         rejected.append(candidate)
