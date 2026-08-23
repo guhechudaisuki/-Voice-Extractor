@@ -181,7 +181,7 @@ with gr.Blocks(title="参考音色句子提取", analytics_enabled=False) as dem
             type="filepath",
         )
     with gr.Row():
-        strictness = gr.Radio(["标准", "严格", "极严格"], value="严格", label="匹配严格度")
+        strictness = gr.Radio(["标准", "严格", "极严格"], value="标准", label="匹配严格度")
         use_overlap = gr.Checkbox(value=True, label="过滤多人同时说话")
         use_singing = gr.Checkbox(value=True, label="过滤唱歌/歌声")
     run_button = gr.Button("开始提取", variant="primary")

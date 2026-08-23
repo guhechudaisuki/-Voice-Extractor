@@ -44,7 +44,10 @@ class PipelineOptions:
     speaker_threshold: float = 0.70
     overlap_threshold: float = 0.35
     singing_threshold: float = 0.22
-    min_sentence_seconds: float = 1.20
+    # Keep short turns long enough to reach speaker verification.  The final
+    # export gate remains at min_output_seconds, so this is not a quality gate.
+    min_sentence_seconds: float = 0.55
+    min_output_seconds: float = 1.20
     max_sentence_seconds: float = 45.0
     pad_seconds: float = 0.10
     keep_rejected: bool = False
@@ -181,6 +184,90 @@ class ExtractionPipeline:
         start = max(0, int(round(span.start * sample_rate)))
         end = min(waveform.numel(), int(round(span.end * sample_rate)))
         return waveform[start:end]
+
+    @staticmethod
+    def _join_transcript_text(left: str, right: str) -> str:
+        """Join adjacent ASR fragments without inserting spaces in CJK text."""
+
+        left = (left or "").strip()
+        right = (right or "").strip()
+        if not left:
+            return right
+        if not right:
+            return left
+        cjk = r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]"
+        return f"{left}{right}" if re.search(cjk, left[-1:] + right[:1]) else f"{left} {right}"
+
+    @classmethod
+    def _coalesce_short_sentences(
+        cls,
+        sentences: list[CandidateSentence],
+        minimum_seconds: float,
+        max_gap: float = 0.65,
+    ) -> list[CandidateSentence]:
+        """Merge tiny ASR fragments inside one already verified speaker turn."""
+
+        output = list(sorted(sentences, key=lambda item: (item.start, item.end)))
+        index = 0
+        while index < len(output):
+            current = output[index]
+            if current.duration >= minimum_seconds:
+                index += 1
+                continue
+            if index + 1 < len(output):
+                following = output[index + 1]
+                if following.start - current.end <= max_gap:
+                    current.end = max(current.end, following.end)
+                    current.whisper_text = cls._join_transcript_text(
+                        current.whisper_text, following.whisper_text
+                    )
+                    current.text = cls._join_transcript_text(current.text, following.text)
+                    current.diagnostics["stt_short_merged"] = True
+                    current.diagnostics["stt_merged_span"] = [following.start, following.end]
+                    del output[index + 1]
+                    continue
+            if index > 0:
+                previous = output[index - 1]
+                if current.start - previous.end <= max_gap:
+                    previous.end = max(previous.end, current.end)
+                    previous.whisper_text = cls._join_transcript_text(
+                        previous.whisper_text, current.whisper_text
+                    )
+                    previous.text = cls._join_transcript_text(previous.text, current.text)
+                    previous.diagnostics["stt_short_merged"] = True
+                    previous.diagnostics["stt_merged_span"] = [current.start, current.end]
+                    del output[index]
+                    index = max(0, index - 1)
+                    continue
+            index += 1
+        return output
+
+    @staticmethod
+    def _merge_adjacent_target_turns(
+        turns: list[CandidateSentence],
+        minimum_seconds: float,
+        max_gap: float = 0.25,
+    ) -> list[CandidateSentence]:
+        """Rejoin target turns split by an over-sensitive local boundary."""
+
+        output = list(sorted(turns, key=lambda item: (item.start, item.end)))
+        index = 0
+        while index + 1 < len(output):
+            left, right = output[index], output[index + 1]
+            gap = max(0.0, right.start - left.end)
+            if gap <= max_gap and (left.duration < minimum_seconds or right.duration < minimum_seconds):
+                left.end = max(left.end, right.end)
+                left.diagnostics["speaker_turns_merged"] = True
+                left.diagnostics["merged_turn_span"] = [right.start, right.end]
+                # Keep conservative metadata when two verified turns are joined.
+                left.speaker_score = min(left.speaker_score, right.speaker_score)
+                left.window_p20_score = min(left.window_p20_score, right.window_p20_score)
+                left.speaker_vote_ratio = min(left.speaker_vote_ratio, right.speaker_vote_ratio)
+                left.window_vote_ratio = min(left.window_vote_ratio, right.window_vote_ratio)
+                del output[index + 1]
+                continue
+            index += 1
+        return output
 
     @staticmethod
     def _apply_speaker_match(
@@ -404,12 +491,12 @@ class ExtractionPipeline:
         # evidence from both speaker models below, so this is not a global
         # threshold reduction.
         primary_floor = max(
-            0.62,
-            float(torch.quantile(primary_seed_scores, 0.10)) - 0.20,
+            0.58,
+            float(torch.quantile(primary_seed_scores, 0.10)) - 0.24,
         )
         secondary_floor = max(
-            0.56,
-            float(torch.quantile(secondary_seed_scores, 0.10)) - 0.20,
+            0.50,
+            float(torch.quantile(secondary_seed_scores, 0.10)) - 0.24,
         )
         candidate_by_id = {
             id(candidate): match
@@ -747,7 +834,9 @@ class ExtractionPipeline:
                     clean_spans,
                     minimum_turn_seconds=0.30,
                     context_seconds=1.20,
-                    scan_hop_seconds=0.25,
+                    scan_hop_seconds=0.30,
+                    minimum_similarity_drop=0.08,
+                    minimum_separation_seconds=0.70,
                     progress=lambda value, message: progress(0.57 + 0.11 * value, message),
                 )
                 progress(0.68, f"换人切分完成：得到 {len(split_result)} 个独立说话回合")
@@ -875,6 +964,10 @@ class ExtractionPipeline:
                 # pass. Whisper sorts spans by time, so sort the owner list
                 # first to keep STT diagnostics and speaker metadata paired
                 # with the correct audio span.
+                accepted_turns = self._merge_adjacent_target_turns(
+                    accepted_turns,
+                    self.options.min_output_seconds,
+                )
                 accepted_turns.sort(key=lambda item: (item.start, item.end))
                 progress(0.78, f"筛选完成：仅对 {len(accepted_turns)} 个目标人物回合执行 STT")
                 segmenter = WhisperSegmenter(self.device)
@@ -893,7 +986,12 @@ class ExtractionPipeline:
                         turn.reject_reason = "STT 未返回文本"
                         rejected.append(turn)
                         continue
+                    sentences = self._coalesce_short_sentences(
+                        sentences,
+                        self.options.min_output_seconds,
+                    )
                     sentences.sort(key=lambda item: (item.start, item.end))
+                    turn_sentences: list[CandidateSentence] = []
                     for sentence_index, sentence in enumerate(sentences):
                         # Whisper word timestamps often begin at the first
                         # confidently decoded token and end before the final
@@ -906,6 +1004,9 @@ class ExtractionPipeline:
                             sentence.start = turn.start
                         elif sentence_index == len(sentences) - 1:
                             sentence.end = turn.end
+                        if sentence.duration < self.options.min_output_seconds:
+                            turn.reject_reason = "STT 鍒嗗潡杩囩煭"
+                            break
                         sentence.text = sentence.whisper_text
                         sentence.accepted = True
                         sentence.speaker_score = turn.speaker_score
@@ -918,7 +1019,11 @@ class ExtractionPipeline:
                         sentence.singing_score = turn.singing_score
                         sentence.speech_score = turn.speech_score
                         sentence.diagnostics.update(turn.diagnostics)
-                        accepted.append(sentence)
+                        turn_sentences.append(sentence)
+                    if turn.reject_reason == "STT 鍒嗗潡杩囩煭":
+                        rejected.append(turn)
+                    else:
+                        accepted.extend(turn_sentences)
                 chinese_candidates = [candidate for candidate in accepted if candidate.language == "zh"]
                 if chinese_candidates:
                     chinese_paths: list[Path] = []

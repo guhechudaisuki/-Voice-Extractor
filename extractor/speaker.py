@@ -19,6 +19,7 @@ SpeakerMatchTier = Literal[
     "short_strong",
     "strong",
     "balanced",
+    "recall",
     "weak",
     "rejected",
 ]
@@ -491,7 +492,7 @@ class CAMPlusVerifier:
 class DualSpeakerVerifier:
     """Classify target-speaker turns using ERes2Net and CAM++ consensus."""
 
-    SHORT_MIN_DURATION = 1.20
+    SHORT_MIN_DURATION = 0.55
     FULL_MIN_DURATION = 2.20
     BALANCED_MIN_DURATION = 3.00
 
@@ -537,6 +538,7 @@ class DualSpeakerVerifier:
         primary: SpeakerDecision,
         secondary: SpeakerDecision,
         paired_reference_median: float,
+        threshold: float = 0.70,
     ) -> SpeakerMatchTier:
         short_strong = (
             cls.SHORT_MIN_DURATION <= duration < cls.FULL_MIN_DURATION
@@ -572,6 +574,28 @@ class DualSpeakerVerifier:
         )
         if balanced:
             return "balanced"
+
+        # Recall tier: both independent models still need direct evidence from
+        # the reference set, but this accepts natural cross-language/emotional
+        # variation that misses the conservative balanced tier.  It is not a
+        # global threshold drop because the reference medians, spreads and
+        # local window evidence remain mandatory.
+        recall = (
+            duration >= cls.SHORT_MIN_DURATION
+            and primary.score >= max(0.54, threshold - 0.16)
+            and secondary.score >= max(0.46, threshold - 0.24)
+            and paired_reference_median >= max(0.43, threshold - 0.27)
+            and primary.reference_median_score >= 0.42
+            and secondary.reference_median_score >= 0.36
+            and primary.reference_max_score >= 0.50
+            and secondary.reference_max_score >= 0.40
+            and primary.reference_spread <= 0.20
+            and secondary.reference_spread <= 0.22
+            and max(primary.window_p20_score, secondary.window_p20_score) >= 0.34
+            and max(primary.window_vote_ratio, secondary.window_vote_ratio) >= 0.25
+        )
+        if recall:
+            return "recall"
 
         weak = (
             duration >= cls.FULL_MIN_DURATION
@@ -684,8 +708,9 @@ class DualSpeakerVerifier:
             primary,
             secondary,
             paired_reference_median,
+            threshold,
         )
-        accepted = tier in {"short_strong", "strong", "balanced"}
+        accepted = tier in {"short_strong", "strong", "balanced", "recall"}
         diagnostics: dict[str, float | str | bool] = {
             "duration": round(float(duration), 5),
             "speaker_tier": tier,
@@ -1014,10 +1039,15 @@ class LocalSpeakerTurnSplitter:
             primary_similarity <= primary_threshold
             and secondary_similarity <= secondary_threshold
         )
+        # A prosody change can make one embedding dip even when the speaker
+        # has not changed.  Require the second model to corroborate at least
+        # part of the drop instead of accepting any non-negative value.
         corroborated_drop = (
-            primary_drop >= minimum_similarity_drop and secondary_drop >= 0.0
+            primary_drop >= minimum_similarity_drop
+            and secondary_drop >= minimum_similarity_drop * 0.25
         ) or (
-            secondary_drop >= minimum_similarity_drop and primary_drop >= 0.0
+            secondary_drop >= minimum_similarity_drop
+            and primary_drop >= minimum_similarity_drop * 0.25
         )
         return low_cross_similarity and corroborated_drop
 
