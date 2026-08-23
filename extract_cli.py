@@ -16,6 +16,14 @@ def main() -> int:
     parser.add_argument("--reference", "-r", action="append", required=True, help="参考音频，可重复")
     parser.add_argument("--target", "-t", action="append", required=True, help="待提取音频，可重复")
     parser.add_argument(
+        "--exclude-role",
+        action="append",
+        nargs="+",
+        default=[],
+        metavar="AUDIO",
+        help="可选排除角色音频组；同一参数后的文件属于同一人物，可重复使用该参数",
+    )
+    parser.add_argument(
         "--threshold",
         type=float,
         default=0.70,
@@ -37,6 +45,9 @@ def main() -> int:
     ).run_many(
         [Path(item) for item in args.reference],
         [Path(item) for item in args.target],
+        negative_references=[
+            [Path(item) for item in group] for group in args.exclude_role
+        ],
         progress=progress,
     )
     accepted_count = sum(len(result.accepted) for result in batch.results)

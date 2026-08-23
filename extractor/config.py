@@ -21,6 +21,7 @@ PUNC_MODEL = ASR_MODELS / "punc_ct-transformer_zh-cn-common-vocab272727-pytorch"
 SV_CODE = GPT_ROOT / "GPT_SoVITS" / "eres2net"
 SV_MODEL = GPT_ROOT / "GPT_SoVITS" / "pretrained_models" / "sv" / "pretrained_eres2netv2w24s4ep4.ckpt"
 CAMPLUS_MODEL = TOOL_ROOT / "models" / "campplus_voxceleb" / "campplus_voxceleb.bin"
+WAVLM_SV_MODEL = TOOL_ROOT / "models" / "wavlm-base-plus-sv"
 
 WHISPER_CACHE = WORKSPACE_ROOT / "omnvoice" / "hf_cache" / "models--openai--whisper-large-v3-turbo"
 OVERLAP_MODEL = TOOL_ROOT / "models" / "overlap" / "model.onnx"
@@ -50,6 +51,9 @@ def ensure_local_assets() -> None:
         "CT-Punc": PUNC_MODEL / "model.pt",
         "ERes2NetV2": SV_MODEL,
         "CAM++ speaker verifier": CAMPLUS_MODEL,
+        "WavLM speaker verifier": WAVLM_SV_MODEL / "pytorch_model.bin",
+        "WavLM config": WAVLM_SV_MODEL / "config.json",
+        "WavLM preprocessor": WAVLM_SV_MODEL / "preprocessor_config.json",
         "overlap detector": OVERLAP_MODEL,
         "singing detector": PANNS_MODEL,
         "PANNs labels": PANNS_LABELS,

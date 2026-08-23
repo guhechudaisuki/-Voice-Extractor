@@ -15,6 +15,9 @@ $checks = @(
     @{ Name='FSMN-VAD'; Path=(Join-Path $gptRoot 'tools\asr\models\speech_fsmn_vad_zh-cn-16k-common-pytorch\model.pt') },
     @{ Name='CT-Punc'; Path=(Join-Path $gptRoot 'tools\asr\models\punc_ct-transformer_zh-cn-common-vocab272727-pytorch\model.pt') },
     @{ Name='CAM++'; Path=(Join-Path $toolRoot 'models\campplus_voxceleb\campplus_voxceleb.bin') },
+    @{ Name='WavLM SV'; Path=(Join-Path $toolRoot 'models\wavlm-base-plus-sv\pytorch_model.bin') },
+    @{ Name='WavLM config'; Path=(Join-Path $toolRoot 'models\wavlm-base-plus-sv\config.json') },
+    @{ Name='WavLM preprocessor'; Path=(Join-Path $toolRoot 'models\wavlm-base-plus-sv\preprocessor_config.json') },
     @{ Name='Overlap ONNX'; Path=(Join-Path $toolRoot 'models\overlap\model.onnx') },
     @{ Name='PANNs'; Path=(Join-Path $toolRoot 'models\panns\Cnn10_mAP=0.380.pth') },
     @{ Name='PANNs labels'; Path=(Join-Path $toolRoot 'models\panns\class_labels_indices.csv') }

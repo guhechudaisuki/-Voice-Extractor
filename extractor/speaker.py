@@ -10,7 +10,7 @@ import torch
 import torch.nn.functional as F
 import torchaudio
 
-from .config import CAMPLUS_MODEL, SV_CODE, SV_MODEL
+from .config import CAMPLUS_MODEL, SV_CODE, SV_MODEL, WAVLM_SV_MODEL
 from .audio import load_mono
 from .types import TimeSpan
 
@@ -19,6 +19,7 @@ SpeakerMatchTier = Literal[
     "short_strong",
     "strong",
     "balanced",
+    "tertiary",
     "recall",
     "weak",
     "rejected",
@@ -76,6 +77,32 @@ class CAMPlusProfile:
     centroid: torch.Tensor
     reference_scores: list[float]
     reference_indexes: tuple[int, ...] = ()
+
+
+@dataclass
+class WavLMProfile:
+    embeddings: torch.Tensor
+    centroid: torch.Tensor
+    reference_scores: list[float]
+    acceptance_floor: float
+    reference_indexes: tuple[int, ...] = ()
+
+
+@dataclass
+class WavLMDecision:
+    score: float
+    reference_median_score: float
+    reference_max_score: float
+    window_min_score: float
+    window_p20_score: float
+    window_scores: list[float]
+
+
+@dataclass
+class ExclusionSpeakerProfile:
+    label: str
+    primary: SpeakerProfile
+    secondary: CAMPlusProfile
 
 
 @dataclass(frozen=True)
@@ -489,6 +516,147 @@ class CAMPlusVerifier:
         )
 
 
+class WavLMSpeakerVerifier:
+    """WavLM x-vector verifier used only for dual-model disagreements."""
+
+    def __init__(self, device: str = "cuda") -> None:
+        from transformers import AutoFeatureExtractor, WavLMForXVector
+
+        self.device = torch.device(
+            "cuda" if device == "cuda" and torch.cuda.is_available() else "cpu"
+        )
+        self.feature_extractor = AutoFeatureExtractor.from_pretrained(
+            str(WAVLM_SV_MODEL), local_files_only=True
+        )
+        self.model = WavLMForXVector.from_pretrained(
+            str(WAVLM_SV_MODEL), local_files_only=True
+        ).eval().to(self.device)
+
+    def close(self) -> None:
+        if hasattr(self, "model"):
+            del self.model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def _embeddings_from_waveforms(
+        self,
+        waveforms: Sequence[torch.Tensor],
+        batch_size: int = 16,
+        progress: Callable[[int, int], None] | None = None,
+    ) -> torch.Tensor:
+        if not waveforms:
+            return torch.empty((0, 0))
+        prepared: list[torch.Tensor] = []
+        for waveform in waveforms:
+            value = waveform.detach().float().cpu().flatten()
+            if value.numel() < 8000:
+                value = F.pad(value, (0, 8000 - value.numel()))
+            prepared.append(value)
+
+        output: list[torch.Tensor] = []
+        completed = 0
+        for offset in range(0, len(prepared), max(1, batch_size)):
+            batch = prepared[offset : offset + max(1, batch_size)]
+            inputs = self.feature_extractor(
+                [value.numpy() for value in batch],
+                sampling_rate=16000,
+                padding=True,
+                return_tensors="pt",
+            )
+            attention_mask = inputs.get("attention_mask")
+            with torch.inference_mode():
+                embeddings = self.model(
+                    input_values=inputs["input_values"].to(self.device),
+                    attention_mask=(
+                        attention_mask.to(self.device)
+                        if attention_mask is not None
+                        else None
+                    ),
+                ).embeddings
+                embeddings = F.normalize(embeddings.float(), p=2, dim=1).cpu()
+            output.extend(embeddings)
+            completed += len(batch)
+            if progress is not None:
+                progress(completed, len(prepared))
+        return torch.stack(output)
+
+    def _embedding_from_waveform(self, waveform: torch.Tensor) -> torch.Tensor:
+        return self._embeddings_from_waveforms([waveform], batch_size=1)[0]
+
+    def build_profile(
+        self,
+        reference_paths: list[Path],
+        reference_indexes: Sequence[int] | None = None,
+    ) -> WavLMProfile:
+        all_raw = self._embeddings_from_waveforms(
+            [load_mono(path, 16000) for path in reference_paths]
+        )
+        if reference_indexes is None:
+            selected = SpeakerVerifier._reference_core_mask(all_raw, floor=0.72)
+            indexes = torch.arange(len(all_raw))[selected]
+        else:
+            indexes = torch.tensor(list(reference_indexes), dtype=torch.long)
+            if indexes.numel() == 0:
+                raise ValueError("至少需要一段有效参考音频")
+        raw = all_raw[indexes]
+        centroid = F.normalize(raw.mean(dim=0), p=2, dim=0)
+        scores = raw @ centroid
+        low_reference = (
+            float(torch.quantile(scores, 0.10)) if len(scores) > 1 else float(scores[0])
+        )
+        # WavLM x-vector scores are tightly clustered near one for clean
+        # references. Keep a bounded channel/emotion allowance for separated
+        # episode audio; final rescue still requires CAM++ dominance.
+        acceptance_floor = max(0.82, min(0.90, low_reference - 0.10))
+        return WavLMProfile(
+            embeddings=raw,
+            centroid=centroid,
+            reference_scores=[round(float(value), 5) for value in scores],
+            acceptance_floor=round(acceptance_floor, 5),
+            reference_indexes=tuple(int(value) for value in indexes.tolist()),
+        )
+
+    def verify_waveform(
+        self,
+        waveform: torch.Tensor,
+        profile: WavLMProfile,
+        window_seconds: float = 1.8,
+        hop_seconds: float = 0.9,
+    ) -> WavLMDecision:
+        whole = self._embedding_from_waveform(waveform)
+        score = float(whole @ profile.centroid)
+        reference_scores = profile.embeddings @ whole
+
+        window_size = int(window_seconds * 16000)
+        hop = int(hop_seconds * 16000)
+        if waveform.numel() <= window_size:
+            windows = [waveform]
+        else:
+            starts = list(range(0, waveform.numel() - window_size + 1, hop))
+            last = waveform.numel() - window_size
+            if not starts or starts[-1] != last:
+                starts.append(last)
+            windows = []
+            for start in starts:
+                part = waveform[start : start + window_size]
+                rms = torch.sqrt(torch.mean(part.square()) + 1e-12)
+                if float(20 * torch.log10(rms + 1e-12)) > -48.0:
+                    windows.append(part)
+        if not windows:
+            windows = [waveform]
+        window_embeddings = self._embeddings_from_waveforms(windows)
+        window_scores = window_embeddings @ profile.centroid
+        return WavLMDecision(
+            score=round(score, 5),
+            reference_median_score=round(float(reference_scores.median()), 5),
+            reference_max_score=round(float(reference_scores.max()), 5),
+            window_min_score=round(float(window_scores.min()), 5),
+            window_p20_score=round(float(torch.quantile(window_scores, 0.20)), 5),
+            window_scores=[round(float(value), 5) for value in window_scores],
+        )
+
+
 class DualSpeakerVerifier:
     """Classify target-speaker turns using ERes2Net and CAM++ consensus."""
 
@@ -641,6 +809,9 @@ class DualSpeakerVerifier:
         self.primary = SpeakerVerifier(device)
         self.secondary: CAMPlusVerifier | None = None
         self.secondary_profile: CAMPlusProfile | None = None
+        self.tertiary: WavLMSpeakerVerifier | None = None
+        self.tertiary_profile: WavLMProfile | None = None
+        self.tertiary_target_spans: list[TimeSpan] = []
         # Boundary detection can run before a reference profile is built.  Keep
         # its CAM++ instance separate until ``_ensure_secondary`` can attach a
         # profile, then reuse the same model to avoid loading it twice.
@@ -653,6 +824,8 @@ class DualSpeakerVerifier:
             if verifier is not None and id(verifier) not in closed:
                 verifier.close()
                 closed.add(id(verifier))
+        if self.tertiary is not None:
+            self.tertiary.close()
 
     def build_profile(self, reference_paths: list[Path], base_threshold: float) -> SpeakerMatchProfile:
         return SpeakerMatchProfile(
@@ -660,6 +833,131 @@ class DualSpeakerVerifier:
             reference_paths=list(reference_paths),
             base_threshold=base_threshold,
         )
+
+    def build_exclusion_profiles(
+        self,
+        reference_groups: Sequence[Sequence[Path]],
+        target_profile: SpeakerMatchProfile,
+    ) -> list[ExclusionSpeakerProfile]:
+        """Build anonymous per-role profiles used only as negative boundaries."""
+
+        self._ensure_secondary(target_profile)
+        assert self.secondary is not None
+        output: list[ExclusionSpeakerProfile] = []
+        for index, paths in enumerate(reference_groups, start=1):
+            group = [Path(path) for path in paths if path]
+            if not group:
+                continue
+            primary = self.primary.build_profile(group, target_profile.base_threshold)
+            secondary = self.secondary.build_profile(
+                group,
+                reference_indexes=primary.reference_indexes,
+            )
+            output.append(
+                ExclusionSpeakerProfile(
+                    label=f"排除角色 {index}",
+                    primary=primary,
+                    secondary=secondary,
+                )
+            )
+        return output
+
+    def exclusion_audit(
+        self,
+        match: SpeakerMatchDecision,
+        target_profile: SpeakerMatchProfile,
+        exclusion_profiles: Sequence[ExclusionSpeakerProfile],
+        *,
+        tertiary_recovery: bool = False,
+    ) -> dict[str, float | str | bool] | None:
+        """Reject when both speaker models prefer the same excluded role."""
+
+        secondary = match.secondary
+        if (
+            not exclusion_profiles
+            or match.primary.embedding is None
+            or secondary is None
+            or secondary.embedding is None
+        ):
+            return None
+        target_secondary = self._ensure_secondary(target_profile)
+        primary_embedding = match.primary.embedding
+        secondary_embedding = secondary.embedding
+        target_primary_score = float(primary_embedding @ target_profile.primary.centroid)
+        target_secondary_score = float(secondary_embedding @ target_secondary.centroid)
+        target_primary_max = float(
+            (target_profile.primary.embeddings @ primary_embedding).max()
+        )
+        target_secondary_max = float(
+            (target_secondary.embeddings @ secondary_embedding).max()
+        )
+
+        strongest: dict[str, float | str | bool] | None = None
+        strongest_margin = float("inf")
+        for exclusion in exclusion_profiles:
+            negative_primary_score = float(primary_embedding @ exclusion.primary.centroid)
+            negative_secondary_score = float(
+                secondary_embedding @ exclusion.secondary.centroid
+            )
+            negative_primary_max = float(
+                (exclusion.primary.embeddings @ primary_embedding).max()
+            )
+            negative_secondary_max = float(
+                (exclusion.secondary.embeddings @ secondary_embedding).max()
+            )
+            primary_margin = target_primary_score - negative_primary_score
+            secondary_margin = target_secondary_score - negative_secondary_score
+            primary_direct_margin = target_primary_max - negative_primary_max
+            secondary_direct_margin = target_secondary_max - negative_secondary_max
+            primary_negative_vote = (
+                primary_margin <= 0.02 and primary_direct_margin <= 0.02
+            )
+            secondary_negative_vote = (
+                secondary_margin <= 0.02 and secondary_direct_margin <= 0.02
+            )
+            # A WavLM rescue is deliberately used only for dual-model
+            # disagreements.  If one lightweight model still votes for a
+            # supplied exclusion person, the other model must beat that person
+            # by a clear margin in both centroid and direct-reference space.
+            # This keeps genuine cross-model rescues while preventing WavLM
+            # from overturning a near-tie against a known negative voice.
+            tertiary_conflict = (tertiary_recovery or match.tier == "tertiary") and (
+                (
+                    primary_negative_vote
+                    and (
+                        secondary_margin < 0.15
+                        or secondary_direct_margin < 0.15
+                    )
+                )
+                or (
+                    secondary_negative_vote
+                    and (
+                        primary_margin < 0.15
+                        or primary_direct_margin < 0.15
+                    )
+                )
+            )
+            rejected = (
+                primary_negative_vote and secondary_negative_vote
+            ) or tertiary_conflict
+            combined_margin = primary_margin + secondary_margin
+            diagnostics: dict[str, float | str | bool] = {
+                "excluded_role_rejected": rejected,
+                "excluded_role": exclusion.label,
+                "excluded_primary_margin": round(primary_margin, 5),
+                "excluded_secondary_margin": round(secondary_margin, 5),
+                "excluded_primary_direct_margin": round(primary_direct_margin, 5),
+                "excluded_secondary_direct_margin": round(secondary_direct_margin, 5),
+                "excluded_primary_vote": primary_negative_vote,
+                "excluded_secondary_vote": secondary_negative_vote,
+                "excluded_tertiary_conflict": tertiary_conflict,
+            }
+            if rejected:
+                return diagnostics
+            if combined_margin < strongest_margin:
+                strongest_margin = combined_margin
+                strongest = diagnostics
+        return strongest
 
     def _ensure_secondary(self, profile: SpeakerMatchProfile) -> CAMPlusProfile:
         if self.secondary is None:
@@ -676,6 +974,144 @@ class DualSpeakerVerifier:
             self.status("CAM++ 二次声纹模型已就绪")
         assert self.secondary_profile is not None
         return self.secondary_profile
+
+    def _ensure_tertiary(self, profile: SpeakerMatchProfile) -> WavLMProfile:
+        if self.tertiary is None:
+            self.status("检测到双模型歧义：正在加载 WavLM 第三声纹模型")
+            self.tertiary = WavLMSpeakerVerifier(self.device)
+            self.tertiary_profile = self.tertiary.build_profile(
+                profile.reference_paths,
+                reference_indexes=profile.primary.reference_indexes,
+            )
+            self.status("WavLM 第三声纹模型已就绪")
+        assert self.tertiary_profile is not None
+        return self.tertiary_profile
+
+    def _tertiary_pair(
+        self, profile: SpeakerMatchProfile
+    ) -> tuple[WavLMSpeakerVerifier, WavLMProfile]:
+        tertiary_profile = self._ensure_tertiary(profile)
+        assert self.tertiary is not None
+        return self.tertiary, tertiary_profile
+
+    def promote_with_tertiary(
+        self,
+        waveform: torch.Tensor,
+        profile: SpeakerMatchProfile,
+        match: SpeakerMatchDecision,
+        duration: float,
+    ) -> SpeakerMatchDecision | None:
+        """Recover only CAM++-dominant turns independently supported by WavLM."""
+
+        secondary = match.secondary
+        if (
+            secondary is None
+            or match.accepted
+            or match.tier not in {"recall", "rejected"}
+            or not 2.20 <= duration <= 15.0
+            or match.primary.score < 0.40
+            or secondary.score < 0.53
+            or secondary.score - match.primary.score < 0.03
+            or match.primary.reference_max_score < 0.38
+            or secondary.reference_max_score < 0.48
+        ):
+            return None
+        tertiary_profile = self._ensure_tertiary(profile)
+        assert self.tertiary is not None
+        decision = self.tertiary.verify_waveform(waveform, tertiary_profile)
+        floor = tertiary_profile.acceptance_floor
+        if (
+            decision.score < floor
+            or decision.reference_max_score < floor
+            or decision.window_p20_score < floor - 0.08
+        ):
+            return None
+        diagnostics = {
+            **match.diagnostics,
+            "speaker_tier": "tertiary",
+            "wavlm_rescue": True,
+            "wavlm_score": decision.score,
+            "wavlm_reference_median": decision.reference_median_score,
+            "wavlm_reference_max": decision.reference_max_score,
+            "wavlm_window_p20": decision.window_p20_score,
+            "wavlm_acceptance_floor": floor,
+        }
+        return SpeakerMatchDecision(
+            accepted=True,
+            primary=match.primary,
+            match_mode="tertiary",
+            secondary=secondary,
+            tier="tertiary",
+            merge_only=False,
+            paired_reference_median=match.paired_reference_median,
+            diagnostics=diagnostics,
+        )
+
+    def promote_local_with_tertiary(
+        self,
+        waveform: torch.Tensor,
+        profile: SpeakerMatchProfile,
+        match: SpeakerMatchDecision,
+        duration: float,
+    ) -> SpeakerMatchDecision | None:
+        """Confirm a boundary fragment without weakening the global speaker gate.
+
+        Local change detection can split one target utterance into sub-two-second
+        phonetic fragments.  Their ERes2Net/CAM++ whole-clip scores are less
+        stable than a complete sentence, so WavLM may confirm them only when
+        both lightweight models still provide minimum direct support.  Callers
+        must separately apply any supplied exclusion-speaker profiles before
+        using this recovery path.
+        """
+
+        secondary = match.secondary
+        if (
+            secondary is None
+            or match.accepted
+            or not 0.75 <= duration <= 8.0
+            or match.primary.score < 0.48
+            or secondary.score < 0.44
+            or match.primary.reference_max_score < 0.43
+            or secondary.reference_max_score < 0.40
+        ):
+            return None
+        tertiary_profile = self._ensure_tertiary(profile)
+        assert self.tertiary is not None
+        window_seconds = min(1.2, max(0.8, duration))
+        hop_seconds = min(0.45, max(0.25, duration / 2.0))
+        decision = self.tertiary.verify_waveform(
+            waveform,
+            tertiary_profile,
+            window_seconds=window_seconds,
+            hop_seconds=hop_seconds,
+        )
+        floor = tertiary_profile.acceptance_floor
+        if (
+            decision.score < floor
+            or decision.reference_max_score < floor
+            or decision.window_p20_score < floor - 0.05
+        ):
+            return None
+        diagnostics = {
+            **match.diagnostics,
+            "speaker_tier": "tertiary",
+            "wavlm_local_rescue": True,
+            "wavlm_score": decision.score,
+            "wavlm_reference_median": decision.reference_median_score,
+            "wavlm_reference_max": decision.reference_max_score,
+            "wavlm_window_p20": decision.window_p20_score,
+            "wavlm_acceptance_floor": floor,
+        }
+        return SpeakerMatchDecision(
+            accepted=True,
+            primary=match.primary,
+            match_mode="tertiary",
+            secondary=secondary,
+            tier="tertiary",
+            merge_only=False,
+            paired_reference_median=match.paired_reference_median,
+            diagnostics=diagnostics,
+        )
 
     def verify(
         self,
@@ -807,8 +1243,11 @@ class DualSpeakerVerifier:
             self.secondary,
             profile.primary,
             secondary_profile,
+            tertiary_factory=lambda: self._tertiary_pair(profile),
         )
-        return locator.locate(audio_path, spans, progress=progress, **kwargs)
+        located = locator.locate(audio_path, spans, progress=progress, **kwargs)
+        self.tertiary_target_spans = list(locator.tertiary_target_spans)
+        return located
 
     def _boundary_secondary_factory(self) -> CAMPlusVerifier:
         if self.boundary_secondary is None:
@@ -835,11 +1274,17 @@ class TargetSpeakerSpanLocator:
         secondary: CAMPlusVerifier,
         primary_profile: SpeakerProfile,
         secondary_profile: CAMPlusProfile,
+        tertiary_factory: Callable[
+            [], tuple[WavLMSpeakerVerifier, WavLMProfile]
+        ]
+        | None = None,
     ) -> None:
         self.primary = primary
         self.secondary = secondary
         self.primary_profile = primary_profile
         self.secondary_profile = secondary_profile
+        self.tertiary_factory = tertiary_factory
+        self.tertiary_target_spans: list[TimeSpan] = []
 
     @staticmethod
     def _normalize_spans(spans: Sequence[TimeSpan], duration: float) -> list[TimeSpan]:
@@ -879,6 +1324,7 @@ class TargetSpeakerSpanLocator:
         if window_seconds <= 0 or hop_seconds <= 0 or hop_seconds > window_seconds:
             raise ValueError("目标声纹滑窗参数无效")
         progress = progress or (lambda _value, _message: None)
+        self.tertiary_target_spans = []
         waveform = load_mono(audio_path, self.SAMPLE_RATE)
         duration = waveform.numel() / self.SAMPLE_RATE
         normalized = self._normalize_spans(spans, duration)
@@ -909,15 +1355,15 @@ class TargetSpeakerSpanLocator:
         primary_embeddings = self.primary._embeddings_from_waveforms(
             windows,
             progress=lambda completed, total: progress(
-                0.50 * completed / max(1, total),
+                0.45 * completed / max(1, total),
                 f"目标声纹定位：ERes2Net {completed}/{total}",
             ),
         )
-        progress(0.50, f"目标声纹定位：CAM++ 0/{len(windows)}")
+        progress(0.45, f"目标声纹定位：CAM++ 0/{len(windows)}")
         secondary_embeddings = self.secondary._embeddings_from_waveforms(
             windows,
             progress=lambda completed, total: progress(
-                0.50 + 0.50 * completed / max(1, total),
+                0.45 + 0.45 * completed / max(1, total),
                 f"目标声纹定位：CAM++ {completed}/{total}",
             ),
         )
@@ -930,11 +1376,9 @@ class TargetSpeakerSpanLocator:
         secondary_max = secondary_reference.max(dim=1).values
 
         states: list[bool] = []
-        for p_score, s_score, p_max, s_max in zip(
-            primary_scores,
-            secondary_scores,
-            primary_max,
-            secondary_max,
+        ambiguous_indexes: list[int] = []
+        for index, (p_score, s_score, p_max, s_max) in enumerate(
+            zip(primary_scores, secondary_scores, primary_max, secondary_max)
         ):
             p_value = float(p_score)
             s_value = float(s_score)
@@ -949,13 +1393,77 @@ class TargetSpeakerSpanLocator:
             # CAM++ is the main protection against ERes2Net confusing a
             # similar voice; ERes2Net must still provide minimum support.
             strong = s_value >= strong_secondary and p_value >= primary_floor
-            states.append(balanced or strong)
+            standard = balanced or strong
+            states.append(standard)
+            if (
+                not standard
+                and self.tertiary_factory is not None
+                and p_value >= 0.38
+                and s_value >= 0.46
+                and s_value - p_value >= 0.02
+                and s_reference >= 0.44
+            ):
+                ambiguous_indexes.append(index)
+
+        standard_counts: dict[int, int] = {}
+        plan_counts: dict[int, int] = {}
+        for plan_index, (span_index, _start, _end) in enumerate(plans):
+            plan_counts[span_index] = plan_counts.get(span_index, 0) + 1
+            if states[plan_index]:
+                standard_counts[span_index] = standard_counts.get(span_index, 0) + 1
+        # WavLM may repair a genuinely missed island, but it must not fill
+        # holes inside an already well-supported target region. Filling those
+        # holes can bridge another speaker or expand a correct sentence edge.
+        ambiguous_indexes = [
+            index
+            for index in ambiguous_indexes
+            if standard_counts.get(plans[index][0], 0) <= 1
+            and standard_counts.get(plans[index][0], 0)
+            / max(1, plan_counts.get(plans[index][0], 1))
+            <= 0.25
+        ]
+
+        tertiary_indexes: set[int] = set()
+        if ambiguous_indexes and self.tertiary_factory is not None:
+            progress(0.90, f"双模型歧义窗口：WavLM 复核 0/{len(ambiguous_indexes)}")
+            tertiary, tertiary_profile = self.tertiary_factory()
+            tertiary_embeddings = tertiary._embeddings_from_waveforms(
+                [windows[index] for index in ambiguous_indexes],
+                progress=lambda completed, total: progress(
+                    0.90 + 0.10 * completed / max(1, total),
+                    f"双模型歧义窗口：WavLM 复核 {completed}/{total}",
+                ),
+            )
+            tertiary_scores = tertiary_embeddings @ tertiary_profile.centroid
+            tertiary_max = (
+                tertiary_embeddings @ tertiary_profile.embeddings.T
+            ).max(dim=1).values
+            floor = tertiary_profile.acceptance_floor
+            for index, wavlm_score, wavlm_max in zip(
+                ambiguous_indexes, tertiary_scores, tertiary_max
+            ):
+                p_value = float(primary_scores[index])
+                s_value = float(secondary_scores[index])
+                s_reference = float(secondary_max[index])
+                if (
+                    p_value >= 0.40
+                    and s_value >= 0.50
+                    and s_value - p_value >= 0.03
+                    and s_reference >= 0.46
+                    and float(wavlm_score) >= floor - 0.05
+                    and float(wavlm_max) >= floor
+                ):
+                    states[index] = True
+                    tertiary_indexes.add(index)
+        else:
+            progress(1.0, "目标声纹定位：没有需要第三模型复核的窗口")
 
         by_span: dict[int, list[int]] = {}
         for plan_index, (span_index, _start, _end) in enumerate(plans):
             by_span.setdefault(span_index, []).append(plan_index)
 
         target_spans: list[TimeSpan] = []
+        tertiary_target_spans: list[TimeSpan] = []
         half = window_seconds / 2.0
         for span_index, indexes in by_span.items():
             span = normalized[span_index]
@@ -975,6 +1483,28 @@ class TargetSpeakerSpanLocator:
                 else:
                     intervals.append(interval)
             target_spans.extend(item for item in intervals if item.duration >= minimum_target_seconds)
+            tertiary_intervals: list[TimeSpan] = []
+            for plan_index in indexes:
+                if plan_index not in tertiary_indexes:
+                    continue
+                _item_span, start, end = plans[plan_index]
+                center = (start + end) / 2.0
+                interval = TimeSpan(
+                    max(span.start, center - half),
+                    min(span.end, center + half),
+                )
+                if (
+                    tertiary_intervals
+                    and interval.start <= tertiary_intervals[-1].end + bridge_seconds
+                ):
+                    tertiary_intervals[-1] = TimeSpan(
+                        tertiary_intervals[-1].start,
+                        max(tertiary_intervals[-1].end, interval.end),
+                    )
+                else:
+                    tertiary_intervals.append(interval)
+            tertiary_target_spans.extend(tertiary_intervals)
+        self.tertiary_target_spans = tertiary_target_spans
         progress(1.0, f"目标声纹定位完成：找到 {len(target_spans)} 个目标人物回合")
         return target_spans
 

@@ -31,6 +31,7 @@ from .filters import OverlapDetector, SingingDetector
 from .speaker import (
     CAMPlusProfile,
     DualSpeakerVerifier,
+    ExclusionSpeakerProfile,
     LocalSpeakerTurnSplitter,
     SpeakerBoundary,
     SpeakerMatchDecision,
@@ -111,6 +112,9 @@ class ExtractionPipeline:
             "normalized_refs": root / "references_normalized",
             "reference_stems": root / "reference_stems",
             "reference_clips": root / "reference_voice_clips",
+            "negative_refs": root / "negative_references_normalized",
+            "negative_stems": root / "negative_reference_stems",
+            "negative_clips": root / "negative_reference_voice_clips",
             "normalized_target": root / "target_normalized.wav",
             "singing_removed_target": root / "target_singing_removed.wav",
             "stems": root / "stems",
@@ -135,6 +139,36 @@ class ExtractionPipeline:
             progress(0.04 + 0.08 * index / max(1, len(references)), f"规范化参考音频 {index}/{len(references)}")
         return normalized, durations
 
+    def _prepare_negative_references(
+        self,
+        reference_groups: list[list[Path]],
+        paths: dict[str, Path],
+        progress: ProgressCallback,
+    ) -> tuple[list[list[Path]], list[list[float]]]:
+        normalized_groups: list[list[Path]] = []
+        duration_groups: list[list[float]] = []
+        total = sum(len(group) for group in reference_groups)
+        completed = 0
+        for group_index, group in enumerate(reference_groups, start=1):
+            normalized: list[Path] = []
+            durations: list[float] = []
+            group_dir = paths["negative_refs"] / f"role_{group_index:03d}"
+            group_dir.mkdir(parents=True, exist_ok=True)
+            for reference_index, reference in enumerate(group, start=1):
+                destination = group_dir / f"reference_{reference_index:03d}.wav"
+                normalize_audio(reference, destination, sample_rate=44100, stereo=True)
+                durations.append(pad_for_separator(destination))
+                normalized.append(destination)
+                completed += 1
+                progress(
+                    0.12,
+                    f"规范化排除角色 {group_index}：{reference_index}/{len(group)} "
+                    f"（总计 {completed}/{max(1, total)}）",
+                )
+            normalized_groups.append(normalized)
+            duration_groups.append(durations)
+        return normalized_groups, duration_groups
+
     @staticmethod
     def _merge_vad_spans(spans: list[TimeSpan], gap: float = 0.18) -> list[TimeSpan]:
         if not spans:
@@ -154,9 +188,12 @@ class ExtractionPipeline:
         reference_stems: list[Path],
         spans_by_path: dict[Path, list[TimeSpan]],
         paths: dict[str, Path],
+        output_dir: Path | None = None,
+        prefix: str = "reference",
     ) -> list[Path]:
         output: list[Path] = []
-        paths["reference_clips"].mkdir(parents=True, exist_ok=True)
+        output_dir = output_dir or paths["reference_clips"]
+        output_dir.mkdir(parents=True, exist_ok=True)
         for reference_index, stem in enumerate(reference_stems, start=1):
             spans = self._merge_vad_spans(spans_by_path.get(stem, []), gap=0.35)
             clip_index = 0
@@ -169,15 +206,15 @@ class ExtractionPipeline:
                     if clip_end - cursor < 0.8:
                         break
                     clip_index += 1
-                    destination = paths["reference_clips"] / (
-                        f"reference_{reference_index:03d}_{clip_index:03d}.wav"
+                    destination = output_dir / (
+                        f"{prefix}_{reference_index:03d}_{clip_index:03d}.wav"
                     )
                     write_clip(stem, destination, cursor, clip_end, sample_rate=16000)
                     output.append(destination)
                     cursor = clip_end
             if clip_index == 0:
                 # Short references are still useful; the verifier pads them safely.
-                destination = paths["reference_clips"] / f"reference_{reference_index:03d}_001.wav"
+                destination = output_dir / f"{prefix}_{reference_index:03d}_001.wav"
                 write_clip(stem, destination, 0.0, probe_duration(stem), sample_rate=16000)
                 output.append(destination)
         if not output:
@@ -653,7 +690,7 @@ class ExtractionPipeline:
         profile: SpeakerMatchProfile,
         waveform: torch.Tensor,
         threshold: float,
-    ) -> tuple[SpeakerMatchProfile, CAMPlusProfile] | None:
+    ) -> tuple[SpeakerMatchProfile, CAMPlusProfile, float, float] | None:
         """Add only strict, domain-matched target turns as temporary anchors."""
 
         anchors = [
@@ -675,6 +712,8 @@ class ExtractionPipeline:
 
         primary_embeddings: list[torch.Tensor] = []
         secondary_embeddings: list[torch.Tensor] = []
+        primary_original_scores: list[float] = []
+        secondary_original_scores: list[float] = []
         for candidate in anchors:
             match = self._verify_speaker_span(
                 verifier,
@@ -692,6 +731,8 @@ class ExtractionPipeline:
                 continue
             primary_embeddings.append(match.primary.embedding)
             secondary_embeddings.append(match.secondary.embedding)
+            primary_original_scores.append(match.primary.score)
+            secondary_original_scores.append(match.secondary.score)
         if len(primary_embeddings) < 3:
             return None
 
@@ -706,6 +747,22 @@ class ExtractionPipeline:
         )
         primary_centroid = torch.nn.functional.normalize(primary_all.mean(dim=0), dim=0)
         secondary_centroid = torch.nn.functional.normalize(secondary_all.mean(dim=0), dim=0)
+        primary_anchor_gains = (
+            torch.stack(primary_embeddings) @ primary_centroid
+            - torch.tensor(primary_original_scores)
+        )
+        secondary_anchor_gains = (
+            torch.stack(secondary_embeddings) @ secondary_centroid
+            - torch.tensor(secondary_original_scores)
+        )
+        primary_gain_floor = max(
+            0.10,
+            min(0.14, float(torch.quantile(primary_anchor_gains, 0.10))),
+        )
+        secondary_gain_floor = max(
+            0.08,
+            min(0.11, float(torch.quantile(secondary_anchor_gains, 0.10))),
+        )
         original_indexes = list(
             profile.primary.reference_indexes
             or tuple(range(len(profile.primary.embeddings)))
@@ -735,6 +792,8 @@ class ExtractionPipeline:
                 base_threshold=profile.base_threshold,
             ),
             adaptive_secondary,
+            round(primary_gain_floor, 5),
+            round(secondary_gain_floor, 5),
         )
 
     @staticmethod
@@ -763,6 +822,7 @@ class ExtractionPipeline:
         verifier: DualSpeakerVerifier,
         waveform: torch.Tensor,
         profile: SpeakerMatchProfile,
+        exclusion_profiles: list[ExclusionSpeakerProfile],
         threshold: float,
         progress: ProgressCallback,
         recovery_index: int,
@@ -812,9 +872,43 @@ class ExtractionPipeline:
                 match = self._verify_speaker_span(
                     verifier, waveform, part, profile, threshold
                 )
+                original_match_tier = match.tier
                 self._apply_speaker_match(candidate, match, profile, threshold)
+                exclusion = verifier.exclusion_audit(
+                    match,
+                    profile,
+                    exclusion_profiles,
+                )
+                if exclusion is not None:
+                    candidate.diagnostics.update(exclusion)
+                if exclusion and exclusion.get("excluded_role_rejected"):
+                    candidate.reject_reason = (
+                        f"更接近{exclusion['excluded_role']}，已按排除角色删除"
+                    )
                 if not match.accepted:
-                    candidate.reject_reason = "声纹匹配不足"
+                    rescued_match = None
+                    if not candidate.reject_reason and (
+                        match.tier == "recall" or exclusion_profiles
+                    ):
+                        rescued_match = verifier.promote_local_with_tertiary(
+                            self._waveform_span(waveform, part),
+                            profile,
+                            match,
+                            part.duration,
+                        )
+                    if rescued_match is not None:
+                        match = rescued_match
+                        self._apply_speaker_match(
+                            candidate,
+                            match,
+                            profile,
+                            threshold,
+                        )
+                        candidate.diagnostics["local_edge_only"] = (
+                            original_match_tier == "rejected"
+                        )
+                    elif not candidate.reject_reason:
+                        candidate.reject_reason = "声纹匹配不足"
             progress(
                 0.72
                 + 0.055
@@ -830,6 +924,74 @@ class ExtractionPipeline:
             else:
                 assert match is not None
                 accepted.append((candidate, match))
+
+        # Rejoin consecutive locally confirmed target pieces.  They were split
+        # only to audit the change points; exporting each phonetic fragment
+        # separately would recreate the incomplete-sentence problem.
+        merged_accepted: list[tuple[CandidateSentence, SpeakerMatchDecision]] = []
+        cursor = 0
+        while cursor < len(accepted):
+            group = [accepted[cursor]]
+            cursor += 1
+            while (
+                cursor < len(accepted)
+                and accepted[cursor][0].start - group[-1][0].end <= 0.02
+            ):
+                group.append(accepted[cursor])
+                cursor += 1
+            if len(group) == 1:
+                merged_accepted.extend(group)
+                continue
+            joined_span = TimeSpan(group[0][0].start, group[-1][0].end)
+            joined_match = self._verify_speaker_span(
+                verifier,
+                waveform,
+                joined_span,
+                profile,
+                threshold,
+            )
+            joined_exclusion = verifier.exclusion_audit(
+                joined_match,
+                profile,
+                exclusion_profiles,
+            )
+            if (
+                not joined_match.accepted
+                and not (
+                    joined_exclusion
+                    and joined_exclusion.get("excluded_role_rejected")
+                )
+            ):
+                joined_match = (
+                    verifier.promote_local_with_tertiary(
+                        self._waveform_span(waveform, joined_span),
+                        profile,
+                        joined_match,
+                        joined_span.duration,
+                    )
+                    or joined_match
+                )
+            if joined_match.accepted and not (
+                joined_exclusion
+                and joined_exclusion.get("excluded_role_rejected")
+            ):
+                joined = CandidateSentence(joined_span.start, joined_span.end, "")
+                self._apply_speaker_match(joined, joined_match, profile, threshold)
+                joined.diagnostics.update(
+                    {
+                        "local_boundary_recovery": True,
+                        "original_turn_start": span.start,
+                        "original_turn_end": span.end,
+                        "local_target_parts_merged": len(group),
+                        "recovery_boundaries": candidates,
+                    }
+                )
+                if joined_exclusion is not None:
+                    joined.diagnostics.update(joined_exclusion)
+                merged_accepted.append((joined, joined_match))
+            else:
+                merged_accepted.extend(group)
+        accepted = merged_accepted
 
         if not accepted:
             # A confirmed boundary with no independently matching piece is
@@ -1298,11 +1460,19 @@ class ExtractionPipeline:
         self,
         references: Iterable[str | Path],
         target: str | Path,
+        negative_references: Iterable[Iterable[str | Path]] | None = None,
         progress: ProgressCallback | None = None,
         job_id: str | None = None,
     ) -> PipelineResult:
         progress = progress or _noop_progress
         references = [Path(path) for path in references if path]
+        negative_reference_groups = [
+            [Path(path) for path in group if path]
+            for group in (negative_references or [])
+        ]
+        negative_reference_groups = [
+            group for group in negative_reference_groups if group
+        ]
         target = Path(target)
         if not references:
             raise ValueError("请至少提供一段参考音频")
@@ -1315,6 +1485,13 @@ class ExtractionPipeline:
         try:
             progress(0.01, "检查本地模型")
             normalized_refs, reference_durations = self._prepare_references(references, paths, progress)
+            normalized_negative_groups, negative_duration_groups = (
+                self._prepare_negative_references(
+                    negative_reference_groups,
+                    paths,
+                    progress,
+                )
+            )
             target_normalized = normalize_audio(target, paths["normalized_target"], sample_rate=44100, stereo=True)
             target_duration = probe_duration(target_normalized)
             target_for_separator = target_normalized
@@ -1348,6 +1525,17 @@ class ExtractionPipeline:
                 (path, paths["reference_stems"] / f"reference_{index:03d}_vocals.wav")
                 for index, path in enumerate(normalized_refs, start=1)
             ]
+            negative_item_count = 0
+            for group_index, group in enumerate(normalized_negative_groups, start=1):
+                group_dir = paths["negative_stems"] / f"role_{group_index:03d}"
+                for reference_index, path in enumerate(group, start=1):
+                    separation_items.append(
+                        (
+                            path,
+                            group_dir / f"reference_{reference_index:03d}_vocals.wav",
+                        )
+                    )
+                    negative_item_count += 1
             separation_items.append((target_for_separator, paths["stems"] / "target_vocals.wav"))
             try:
                 separated = separator.separate_many(
@@ -1366,19 +1554,47 @@ class ExtractionPipeline:
                 )
                 progress(1.0, "完成：目标音频没有人声")
                 return PipelineResult(job_id, output_dir, archive, [], [], manifest, transcript)
-            reference_stems = separated[:-1]
+            reference_stems = separated[: len(normalized_refs)]
+            negative_flat_stems = separated[
+                len(normalized_refs) : len(normalized_refs) + negative_item_count
+            ]
             stem = separated[-1]
             for reference_stem, original_duration in zip(reference_stems, reference_durations):
                 trim_audio_in_place(reference_stem, original_duration)
+            negative_stem_groups: list[list[Path]] = []
+            negative_cursor = 0
+            for durations in negative_duration_groups:
+                count = len(durations)
+                group_stems = negative_flat_stems[
+                    negative_cursor : negative_cursor + count
+                ]
+                negative_cursor += count
+                for reference_stem, original_duration in zip(group_stems, durations):
+                    trim_audio_in_place(reference_stem, original_duration)
+                negative_stem_groups.append(group_stems)
             trim_audio_in_place(stem, target_duration)
 
             progress(0.40, "UVR 完成：按每一段静音检测最小讲话片段")
             vad_tools = FunASRTools(self.device)
             vad_map = vad_tools.vad_many(
-                [*reference_stems, stem],
+                [
+                    *reference_stems,
+                    *(item for group in negative_stem_groups for item in group),
+                    stem,
+                ],
                 progress=lambda value, message: progress(0.40 + 0.08 * value, message),
             )
             reference_clips = self._make_reference_clips(reference_stems, vad_map, paths)
+            negative_reference_clips = [
+                self._make_reference_clips(
+                    group,
+                    vad_map,
+                    paths,
+                    output_dir=paths["negative_clips"] / f"role_{group_index:03d}",
+                    prefix="negative",
+                )
+                for group_index, group in enumerate(negative_stem_groups, start=1)
+            ]
             # Every positive silence gap is initially a hard boundary.  Only a
             # later dual-model same-speaker decision may join the two sides.
             vad_spans = self._merge_vad_spans(
@@ -1414,6 +1630,16 @@ class ExtractionPipeline:
             )
             try:
                 profile = verifier.build_profile(reference_clips, self.options.speaker_threshold)
+                exclusion_profiles: list[ExclusionSpeakerProfile] = []
+                if negative_reference_clips:
+                    progress(
+                        0.49,
+                        f"建立 {len(negative_reference_clips)} 个排除角色声纹边界",
+                    )
+                    exclusion_profiles = verifier.build_exclusion_profiles(
+                        negative_reference_clips,
+                        profile,
+                    )
                 target_waveform = load_mono(stem, 16000)
                 # Filter each smallest silence-delimited island before any
                 # joining.  Otherwise one overlap elsewhere in a long merged
@@ -1622,6 +1848,7 @@ class ExtractionPipeline:
                     )
 
                 recovery_lookup = {id(candidate): index for index, (_span, candidate, _match) in enumerate(recovery_turns, start=1)}
+                local_exclusion_spans: list[TimeSpan] = []
                 for span, candidate, match in scored_turns:
                     recovery_index = recovery_lookup.get(id(candidate))
                     if recovery_index is not None and match is not None:
@@ -1636,6 +1863,7 @@ class ExtractionPipeline:
                             verifier,
                             target_waveform,
                             profile,
+                            exclusion_profiles,
                             effective_threshold,
                             progress,
                             recovery_index,
@@ -1643,6 +1871,12 @@ class ExtractionPipeline:
                         )
                         if recovered is not None:
                             accepted_candidates, discarded = recovered
+                            local_exclusion_spans.extend(
+                                TimeSpan(item.start, item.end)
+                                for item in discarded
+                                if item.diagnostics.get("excluded_role_rejected")
+                                and item.duration >= 1.60
+                            )
                             for recovered_candidate, recovered_match in accepted_candidates:
                                 for key in ("speech_block_index", "speaker_turn_index"):
                                     if key in candidate.diagnostics:
@@ -1741,12 +1975,58 @@ class ExtractionPipeline:
                 # locator region to a generic speaker turn and snap only nearby
                 # edges to precise local boundaries.
                 raw_locator_bases: list[TimeSpan] = []
+                boundary_suppressed_keys: set[tuple[float, float]] = set()
                 for target_region in target_spans:
                     for turn in split_result:
                         start = max(target_region.start, turn.start)
                         end = min(target_region.end, turn.end)
                         if end - start < self.options.min_sentence_seconds:
                             continue
+                        internal_boundaries = [
+                            boundary
+                            for boundary in recovery_boundaries
+                            if boundary.confidence >= 0.90
+                            and start < boundary.time < end
+                        ]
+                        # Emotional/prosodic changes can create several false
+                        # local speaker boundaries inside one compact target
+                        # region. Add one boundary-suppressed whole candidate;
+                        # the normal fine-grained candidates remain available
+                        # and the whole candidate must pass formal verification.
+                        if len(internal_boundaries) >= 2 and end - start <= 4.0:
+                            whole_start = start
+                            start_edges = [
+                                boundary.time
+                                for boundary in recovery_boundaries
+                                if boundary.confidence >= 0.90
+                                and start - 0.05 <= boundary.time <= start + 0.75
+                            ]
+                            if start_edges:
+                                whole_start = min(start_edges)
+                            whole_end = end
+                            if 0.0 <= turn.end - end <= 1.25:
+                                whole_end = turn.end
+                            else:
+                                end_edges = [
+                                    boundary.time
+                                    for boundary in recovery_boundaries
+                                    if boundary.confidence >= 0.90
+                                    and end - 0.75 <= boundary.time <= end + 0.05
+                                ]
+                                if end_edges:
+                                    whole_end = max(end_edges)
+                            whole = TimeSpan(whole_start, whole_end)
+                            if (
+                                whole.duration >= 2.20
+                                and whole.duration <= min(
+                                    12.0, self.options.max_sentence_seconds
+                                )
+                                and self._target_coverage(whole, target_spans) >= 0.55
+                            ):
+                                raw_locator_bases.append(whole)
+                                boundary_suppressed_keys.add(
+                                    (round(whole.start, 5), round(whole.end, 5))
+                                )
                         nearby_start = [
                             boundary.time
                             for boundary in recovery_boundaries
@@ -1781,25 +2061,116 @@ class ExtractionPipeline:
                     tuple[TimeSpan, SpeakerMatchDecision, float]
                 ] = []
                 for recovery_index, base in enumerate(locator_bases, start=1):
+                    base_key = (round(base.start, 5), round(base.end, 5))
+                    recovered_span = base
+                    edge_expanded = False
+                    # A short locally confirmed target fragment may sit directly
+                    # outside the locator region because its dual-model score was
+                    # diluted by duration.  Absorb only WavLM-confirmed fragments
+                    # from the same original speaker turn, then verify the whole
+                    # expanded sentence again below.
+                    changed = True
+                    while changed:
+                        changed = False
+                        for edge in accepted_turns:
+                            diagnostics = edge.diagnostics
+                            if not diagnostics.get("wavlm_local_rescue"):
+                                continue
+                            original_start = float(
+                                diagnostics.get("original_turn_start", edge.start)
+                            )
+                            original_end = float(
+                                diagnostics.get("original_turn_end", edge.end)
+                            )
+                            same_original_turn = (
+                                original_start <= recovered_span.start + 0.05
+                                and original_end >= recovered_span.end - 0.05
+                            )
+                            if not same_original_turn:
+                                continue
+                            if 0.0 <= recovered_span.start - edge.end <= 0.03:
+                                recovered_span = TimeSpan(edge.start, recovered_span.end)
+                                edge_expanded = True
+                                changed = True
+                                break
+                            if 0.0 <= edge.start - recovered_span.end <= 0.03:
+                                recovered_span = TimeSpan(recovered_span.start, edge.end)
+                                edge_expanded = True
+                                changed = True
+                                break
+
                     if (
-                        base.duration < self.options.min_sentence_seconds
-                        or base.duration > min(20.0, self.options.max_sentence_seconds)
+                        recovered_span.duration < self.options.min_sentence_seconds
+                        or recovered_span.duration
+                        > min(20.0, self.options.max_sentence_seconds)
                     ):
                         continue
-                    coverage = self._target_coverage(base, target_spans)
+                    local_negative_overlap = sum(
+                        max(
+                            0.0,
+                            min(recovered_span.end, negative.end)
+                            - max(recovered_span.start, negative.start),
+                        )
+                        for negative in local_exclusion_spans
+                    )
+                    if local_negative_overlap >= 0.10:
+                        # Never let an averaged whole-turn embedding overwrite a
+                        # local segment that two speaker models assigned to the
+                        # same user-supplied exclusion person.
+                        continue
+                    coverage = self._target_coverage(recovered_span, target_spans)
                     if coverage < 0.55:
                         continue
+                    boundary_suppressed = base_key in boundary_suppressed_keys
                     recovered_match = self._verify_speaker_span(
                         verifier,
                         target_waveform,
-                        base,
+                        recovered_span,
                         profile,
                         effective_threshold,
                     )
                     if not recovered_match.accepted:
-                        locator_rejected.append((base, recovered_match, coverage))
-                        continue
-                    recovered_span = base
+                        tertiary_match = None
+                        tertiary_coverage = self._target_coverage(
+                            recovered_span,
+                            verifier.tertiary_target_spans,
+                        )
+                        secondary = recovered_match.secondary
+                        strong_cam_disagreement = (
+                            secondary is not None
+                            and recovered_match.primary.score >= 0.50
+                            and secondary.score >= 0.60
+                            and secondary.score - recovered_match.primary.score >= 0.05
+                        )
+                        minimum_tertiary_coverage = (
+                            0.55 if boundary_suppressed else 0.80
+                        )
+                        if coverage >= minimum_tertiary_coverage and (
+                            boundary_suppressed
+                            or tertiary_coverage >= 0.35
+                            or strong_cam_disagreement
+                        ):
+                            tertiary_match = verifier.promote_with_tertiary(
+                                self._waveform_span(target_waveform, recovered_span),
+                                profile,
+                                recovered_match,
+                                recovered_span.duration,
+                            )
+                        if tertiary_match is None and edge_expanded:
+                            tertiary_match = verifier.promote_local_with_tertiary(
+                                self._waveform_span(target_waveform, recovered_span),
+                                profile,
+                                recovered_match,
+                                recovered_span.duration,
+                            )
+                        if tertiary_match is None:
+                            if boundary_suppressed:
+                                continue
+                            locator_rejected.append(
+                                (recovered_span, recovered_match, coverage)
+                            )
+                            continue
+                        recovered_match = tertiary_match
                     recovered_candidate = CandidateSentence(
                         recovered_span.start,
                         recovered_span.end,
@@ -1814,6 +2185,18 @@ class ExtractionPipeline:
                     recovered_candidate.diagnostics.update(
                         {
                             "target_locator_recovery": True,
+                            "tertiary_locator_recovery": (
+                                recovered_match.tier == "tertiary"
+                            ),
+                            "boundary_suppressed_recovery": boundary_suppressed,
+                            "locator_edge_expansion": edge_expanded,
+                            "tertiary_target_coverage": round(
+                                self._target_coverage(
+                                    recovered_span,
+                                    verifier.tertiary_target_spans,
+                                ),
+                                5,
+                            ),
                             "target_coverage": round(
                                 self._target_coverage(recovered_span, target_spans),
                                 5,
@@ -1847,6 +2230,25 @@ class ExtractionPipeline:
                         f"目标人物完整句恢复：定位恢复 {locator_recovered} 段",
                     )
 
+                # Rejected-tier WavLM fragments are permitted only as sentence
+                # edge evidence.  A locator-recovered complete target sentence
+                # removes them through overlap; anything left here is an
+                # isolated ambiguous fragment and must never be exported.
+                unconnected_edges = [
+                    candidate
+                    for candidate in accepted_turns
+                    if candidate.diagnostics.get("local_edge_only")
+                ]
+                if unconnected_edges:
+                    accepted_turns = [
+                        candidate
+                        for candidate in accepted_turns
+                        if not candidate.diagnostics.get("local_edge_only")
+                    ]
+                    for candidate in unconnected_edges:
+                        candidate.reject_reason = "局部目标候选未连接到完整句"
+                    rejected.extend(unconnected_edges)
+
                 target_merges = self._merge_verified_target_turns(
                     accepted_turns,
                     rejected,
@@ -1877,7 +2279,12 @@ class ExtractionPipeline:
                     effective_threshold,
                 )
                 if adaptive_profiles is not None:
-                    adaptive_profile, adaptive_secondary = adaptive_profiles
+                    (
+                        adaptive_profile,
+                        adaptive_secondary,
+                        adaptive_primary_gain_floor,
+                        adaptive_secondary_gain_floor,
+                    ) = adaptive_profiles
                     original_secondary = verifier.secondary_profile
                     verifier.secondary_profile = adaptive_secondary
                     try:
@@ -1903,6 +2310,21 @@ class ExtractionPipeline:
                             )
                             if not adaptive_match.accepted:
                                 continue
+                            assert original_match.secondary is not None
+                            assert adaptive_match.secondary is not None
+                            primary_gain = (
+                                adaptive_match.primary.score
+                                - original_match.primary.score
+                            )
+                            secondary_gain = (
+                                adaptive_match.secondary.score
+                                - original_match.secondary.score
+                            )
+                            if (
+                                primary_gain < adaptive_primary_gain_floor
+                                or secondary_gain < adaptive_secondary_gain_floor
+                            ):
+                                continue
                             recovered = CandidateSentence(base.start, base.end, "")
                             self._apply_speaker_match(
                                 recovered,
@@ -1919,6 +2341,14 @@ class ExtractionPipeline:
                                         original_match.secondary.score
                                         if original_match.secondary is not None
                                         else 0.0
+                                    ),
+                                    "adaptive_primary_gain": round(primary_gain, 5),
+                                    "adaptive_secondary_gain": round(secondary_gain, 5),
+                                    "adaptive_primary_gain_floor": (
+                                        adaptive_primary_gain_floor
+                                    ),
+                                    "adaptive_secondary_gain_floor": (
+                                        adaptive_secondary_gain_floor
                                     ),
                                     "target_coverage": round(coverage, 5),
                                     "locator_boundary_count": sum(
@@ -1945,6 +2375,45 @@ class ExtractionPipeline:
                         0.80,
                         f"域内严格声纹复核恢复 {adaptive_recovered} 个目标回合",
                     )
+
+                if exclusion_profiles and accepted_turns:
+                    progress(
+                        0.80,
+                        f"排除角色最终复核：0/{len(accepted_turns)}",
+                    )
+                    retained_turns: list[CandidateSentence] = []
+                    for audit_index, candidate in enumerate(accepted_turns, start=1):
+                        audit_match = self._verify_speaker_span(
+                            verifier,
+                            target_waveform,
+                            TimeSpan(candidate.start, candidate.end),
+                            profile,
+                            effective_threshold,
+                        )
+                        exclusion = verifier.exclusion_audit(
+                            audit_match,
+                            profile,
+                            exclusion_profiles,
+                            tertiary_recovery=(
+                                candidate.diagnostics.get("speaker_tier") == "tertiary"
+                                or bool(candidate.diagnostics.get("wavlm_rescue"))
+                                or bool(candidate.diagnostics.get("wavlm_local_rescue"))
+                            ),
+                        )
+                        if exclusion is not None:
+                            candidate.diagnostics.update(exclusion)
+                        if exclusion and exclusion.get("excluded_role_rejected"):
+                            candidate.reject_reason = (
+                                f"更接近{exclusion['excluded_role']}，已按排除角色删除"
+                            )
+                            rejected.append(candidate)
+                        else:
+                            retained_turns.append(candidate)
+                        progress(
+                            0.80,
+                            f"排除角色最终复核：{audit_index}/{len(accepted_turns)}",
+                        )
+                    accepted_turns = retained_turns
 
                 progress(
                     0.80,
@@ -2069,11 +2538,19 @@ class ExtractionPipeline:
         self,
         references: Iterable[str | Path],
         targets: Iterable[str | Path],
+        negative_references: Iterable[Iterable[str | Path]] | None = None,
         progress: ProgressCallback | None = None,
     ) -> BatchPipelineResult:
         """Process target files sequentially and create one batch download."""
         progress = progress or _noop_progress
         reference_paths = [Path(path) for path in references if path]
+        negative_reference_groups = [
+            [Path(path) for path in group if path]
+            for group in (negative_references or [])
+        ]
+        negative_reference_groups = [
+            group for group in negative_reference_groups if group
+        ]
         target_paths = [Path(path) for path in targets if path]
         if not reference_paths:
             raise ValueError("请至少提供一段参考音频")
@@ -2101,7 +2578,13 @@ class ExtractionPipeline:
                 destination_name = f"{target_index:03d}_{_safe_name(target.stem, 'target')}"
                 destination = batch_dir / destination_name
                 child_job_id = f"{batch_id}_{target_index:03d}"
-                result = self.run(reference_paths, target, progress=report_target, job_id=child_job_id)
+                result = self.run(
+                    reference_paths,
+                    target,
+                    negative_references=negative_reference_groups,
+                    progress=report_target,
+                    job_id=child_job_id,
+                )
                 if destination.exists():
                     shutil.rmtree(destination)
                 shutil.move(str(result.output_dir), str(destination))

@@ -29,6 +29,9 @@ if (-not (Test-Path -LiteralPath $gptRoot)) {
 
 Fetch-File 'https://huggingface.co/lj1995/VoiceConversionWebUI/resolve/main/uvr5_weights/HP2_all_vocals.pth?download=true' (Join-Path $gptRoot 'tools\uvr5\uvr5_weights\HP2_all_vocals.pth')
 Fetch-File 'https://huggingface.co/lj1995/GPT-SoVITS/resolve/main/sv/pretrained_eres2netv2w24s4ep4.ckpt?download=true' (Join-Path $gptRoot 'GPT_SoVITS\pretrained_models\sv\pretrained_eres2netv2w24s4ep4.ckpt')
+Fetch-File 'https://huggingface.co/microsoft/wavlm-base-plus-sv/resolve/feb593a6c23c1cc3d9510425c29b0a14d2b07b1e/config.json?download=true' (Join-Path $toolRoot 'models\wavlm-base-plus-sv\config.json')
+Fetch-File 'https://huggingface.co/microsoft/wavlm-base-plus-sv/resolve/feb593a6c23c1cc3d9510425c29b0a14d2b07b1e/preprocessor_config.json?download=true' (Join-Path $toolRoot 'models\wavlm-base-plus-sv\preprocessor_config.json')
+Fetch-File 'https://huggingface.co/microsoft/wavlm-base-plus-sv/resolve/feb593a6c23c1cc3d9510425c29b0a14d2b07b1e/pytorch_model.bin?download=true' (Join-Path $toolRoot 'models\wavlm-base-plus-sv\pytorch_model.bin')
 Fetch-File 'https://zenodo.org/records/3987831/files/Cnn10_mAP%3D0.380.pth?download=1' (Join-Path $toolRoot 'models\panns\Cnn10_mAP=0.380.pth')
 Fetch-File 'http://storage.googleapis.com/us_audioset/youtube_corpus/v1/csv/class_labels_indices.csv' (Join-Path $toolRoot 'models\panns\class_labels_indices.csv')
 

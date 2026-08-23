@@ -23,6 +23,7 @@ from extractor.pipeline import ExtractionPipeline, PipelineOptions
 
 
 LOG_PATH = ROOT / "output" / "app.log"
+MAX_NEGATIVE_ROLES = 20
 LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
@@ -56,6 +57,7 @@ def run_job(
     targets,
     use_overlap: bool,
     use_singing: bool,
+    negative_role_state,
 ):
     refs = _paths(references)
     target_paths = _paths(targets)
@@ -63,6 +65,12 @@ def run_job(
         raise gr.Error("请上传至少一段参考音频")
     if not target_paths:
         raise gr.Error("请上传至少一段待提取音频")
+    stored_roles = negative_role_state or {}
+    negative_groups = [
+        [Path(path) for path in stored_roles[key] if path]
+        for key in sorted(stored_roles, key=lambda value: int(value))
+        if stored_roles.get(key)
+    ]
 
     options = PipelineOptions(
         speaker_threshold=0.68,
@@ -82,6 +90,7 @@ def run_job(
             outcome["batch"] = ExtractionPipeline(options=options).run_many(
                 refs,
                 target_paths,
+                negative_references=negative_groups,
                 progress=report,
             )
         except Exception as exc:
@@ -162,6 +171,55 @@ def run_job(
     )
 
 
+def _negative_role_flags(current) -> list[bool]:
+    values = list(current or [])[:MAX_NEGATIVE_ROLES]
+    values.extend([False] * (MAX_NEGATIVE_ROLES - len(values)))
+    return [bool(value) for value in values]
+
+
+def add_negative_role(current):
+    active = _negative_role_flags(current)
+    try:
+        index = active.index(False)
+    except ValueError:
+        message = f"最多可添加 {MAX_NEGATIVE_ROLES} 个排除人物。"
+    else:
+        active[index] = True
+        message = f"已添加排除人物 {index + 1}。每个人物可上传多段同一人的讲话。"
+    visibility = [gr.update(visible=value) for value in active]
+    return active, message, *visibility
+
+
+def remove_negative_role(index: int):
+    def remove(active_roles, current):
+        active = _negative_role_flags(active_roles)
+        if 0 <= index < MAX_NEGATIVE_ROLES:
+            active[index] = False
+        values = dict(current or {})
+        values.pop(str(index), None)
+        if any(active):
+            message = f"已删除排除人物 {index + 1}。"
+        else:
+            message = "尚未添加排除人物。"
+        visibility = [gr.update(visible=value) for value in active]
+        return active, values, None, message, *visibility
+
+    return remove
+
+
+def negative_role_updater(index: int):
+    def update(value, current) -> dict[str, list[str]]:
+        values = dict(current or {})
+        paths = [str(path) for path in _paths(value)]
+        if paths:
+            values[str(index)] = paths
+        else:
+            values.pop(str(index), None)
+        return values
+
+    return update
+
+
 with gr.Blocks(title="参考音色句子提取", analytics_enabled=False) as demo:
     gr.Markdown("# 参考音色句子提取")
     gr.Markdown("上传同一人的多段参考讲话和一个或多个目标音频，工具会逐个目标文件处理，只保留匹配音色的完整讲话句子，并输出纯人声和文本。")
@@ -177,6 +235,72 @@ with gr.Blocks(title="参考音色句子提取", analytics_enabled=False) as dem
             file_count="multiple",
             file_types=["audio"],
             type="filepath",
+        )
+    negative_role_active = gr.State([False] * MAX_NEGATIVE_ROLES)
+    negative_role_state = gr.State({})
+    with gr.Accordion("排除人物（可选）", open=False):
+        gr.Markdown(
+            "如果其他主要人物与目标人物音色接近，可以为每个人物建立一组匿名排除参考。"
+            "每组可上传多段同一个人的讲话；不添加也可以正常提取。"
+        )
+        add_negative = gr.Button("添加一个排除人物")
+        negative_role_notice = gr.Markdown("尚未添加排除人物。")
+        negative_role_cards = []
+        negative_role_files = []
+        negative_role_delete_buttons = []
+        for index in range(MAX_NEGATIVE_ROLES):
+            with gr.Column(visible=False, variant="panel") as role_card:
+                with gr.Row():
+                    gr.Markdown(f"### 排除人物 {index + 1}")
+                    delete_role = gr.Button(
+                        "删除此排除人物",
+                        variant="stop",
+                        size="sm",
+                    )
+                role_files = gr.File(
+                    label="该人物的参考音频（同一人物，可多选）",
+                    file_count="multiple",
+                    file_types=["audio"],
+                    type="filepath",
+                )
+            negative_role_cards.append(role_card)
+            negative_role_files.append(role_files)
+            negative_role_delete_buttons.append(delete_role)
+
+        for index, (role_files, delete_role) in enumerate(
+            zip(negative_role_files, negative_role_delete_buttons)
+        ):
+            role_files.change(
+                negative_role_updater(index),
+                inputs=[role_files, negative_role_state],
+                outputs=negative_role_state,
+                queue=False,
+                show_progress="hidden",
+            )
+            delete_role.click(
+                remove_negative_role(index),
+                inputs=[negative_role_active, negative_role_state],
+                outputs=[
+                    negative_role_active,
+                    negative_role_state,
+                    role_files,
+                    negative_role_notice,
+                    *negative_role_cards,
+                ],
+                queue=False,
+                show_progress="hidden",
+            )
+
+        add_negative.click(
+            add_negative_role,
+            inputs=negative_role_active,
+            outputs=[
+                negative_role_active,
+                negative_role_notice,
+                *negative_role_cards,
+            ],
+            queue=False,
+            show_progress="hidden",
         )
     with gr.Row():
         use_overlap = gr.Checkbox(value=True, label="过滤多人同时说话")
@@ -196,7 +320,13 @@ with gr.Blocks(title="参考音色句子提取", analytics_enabled=False) as dem
         transcript = gr.File(label="批次 SRT 文本")
     run_button.click(
         run_job,
-        inputs=[references, targets, use_overlap, use_singing],
+        inputs=[
+            references,
+            targets,
+            use_overlap,
+            use_singing,
+            negative_role_state,
+        ],
         outputs=[status, live_progress, table, archive, manifest, transcript],
         show_progress="hidden",
     )

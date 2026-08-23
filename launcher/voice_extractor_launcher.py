@@ -33,6 +33,27 @@ DIRECT_ASSETS = (
         None,
     ),
     (
+        "WavLM speaker model config",
+        "wavlm",
+        "config.json",
+        "https://huggingface.co/microsoft/wavlm-base-plus-sv/resolve/feb593a6c23c1cc3d9510425c29b0a14d2b07b1e/config.json?download=true",
+        None,
+    ),
+    (
+        "WavLM speaker preprocessor config",
+        "wavlm",
+        "preprocessor_config.json",
+        "https://huggingface.co/microsoft/wavlm-base-plus-sv/resolve/feb593a6c23c1cc3d9510425c29b0a14d2b07b1e/preprocessor_config.json?download=true",
+        None,
+    ),
+    (
+        "WavLM speaker model",
+        "wavlm",
+        "pytorch_model.bin",
+        "https://huggingface.co/microsoft/wavlm-base-plus-sv/resolve/feb593a6c23c1cc3d9510425c29b0a14d2b07b1e/pytorch_model.bin?download=true",
+        None,
+    ),
+    (
         "overlap detector",
         "overlap",
         "model.onnx",
@@ -85,6 +106,7 @@ MODULES = {
     "scipy": "scipy",
     "modelscope": "modelscope",
     "huggingface_hub": "huggingface-hub",
+    "transformers": "transformers==4.43.0",
 }
 
 
@@ -308,6 +330,7 @@ def ensure_assets(source_root: Path, python: Path) -> None:
         "uvr": gpt_root / "tools" / "uvr5" / "uvr5_weights",
         "eres": gpt_root / "GPT_SoVITS" / "pretrained_models" / "sv",
         "camplus": source_root / "models" / "campplus_voxceleb",
+        "wavlm": source_root / "models" / "wavlm-base-plus-sv",
         "overlap": source_root / "models" / "overlap",
         "panns": source_root / "models" / "panns",
     }
