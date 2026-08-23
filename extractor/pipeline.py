@@ -382,7 +382,7 @@ class ExtractionPipeline:
         progress: ProgressCallback,
         recovery_index: int,
         recovery_count: int,
-    ) -> tuple[list[CandidateSentence], list[CandidateSentence]] | None:
+    ) -> tuple[list[tuple[CandidateSentence, SpeakerMatchDecision]], list[CandidateSentence]] | None:
         """Split a suspicious turn at every confirmed boundary and rescore it.
 
         The old recovery pass only kept a target suffix. That leaves an already
@@ -405,7 +405,7 @@ class ExtractionPipeline:
 
         cuts = [span.start, *candidates, span.end]
         parts = [TimeSpan(start, end) for start, end in zip(cuts, cuts[1:])]
-        accepted: list[CandidateSentence] = []
+        accepted: list[tuple[CandidateSentence, SpeakerMatchDecision]] = []
         rejected: list[CandidateSentence] = []
         for part_index, part in enumerate(parts, start=1):
             match: SpeakerMatchDecision | None = None
@@ -443,7 +443,8 @@ class ExtractionPipeline:
             if candidate.reject_reason:
                 rejected.append(candidate)
             else:
-                accepted.append(candidate)
+                assert match is not None
+                accepted.append((candidate, match))
 
         if not accepted:
             # A confirmed boundary with no independently matching piece is
@@ -460,6 +461,180 @@ class ExtractionPipeline:
         return accepted, rejected
 
     @staticmethod
+    def _promote_confirmed_recall_candidates(
+        scored_turns: list[
+            tuple[TimeSpan, CandidateSentence, SpeakerMatchDecision | None]
+        ],
+        accepted_turns: list[CandidateSentence],
+        rejected: list[CandidateSentence],
+    ) -> int:
+        """Promote only recall turns independently confirmed window-by-window.
+
+        This is intentionally separate from adaptive/local-seed recall.  It
+        handles target utterances elsewhere in the episode, but requires the
+        target locator to cover almost the entire turn and both independent
+        speaker models to support every local window.  A similar-sounding
+        whole-turn embedding alone can never pass this gate.
+        """
+
+        match_by_id = {
+            id(candidate): match
+            for _span, candidate, match in scored_turns
+            if match is not None
+        }
+        retained: list[CandidateSentence] = []
+        promoted = 0
+        for candidate in rejected:
+            if candidate.reject_reason != "声纹匹配不足":
+                retained.append(candidate)
+                continue
+            match = match_by_id.get(id(candidate))
+            secondary = match.secondary if match is not None else None
+            if match is None or secondary is None or match.tier != "recall":
+                retained.append(candidate)
+                continue
+
+            coverage = float(candidate.diagnostics.get("target_coverage", 0.0))
+            independent_window_consensus = (
+                candidate.window_vote_ratio >= 0.75
+                and secondary.window_vote_ratio >= 0.75
+                and candidate.window_p20_score >= 0.50
+                and secondary.window_p20_score >= 0.46
+            )
+            direct_reference_evidence = (
+                match.primary.score >= 0.58
+                and secondary.score >= 0.50
+                and match.primary.reference_median_score >= 0.50
+                and secondary.reference_median_score >= 0.44
+                and match.paired_reference_median >= 0.49
+            )
+            if (
+                coverage < 0.90
+                or not independent_window_consensus
+                or not direct_reference_evidence
+            ):
+                retained.append(candidate)
+                continue
+
+            candidate.reject_reason = ""
+            candidate.diagnostics.update(
+                {
+                    "confirmed_recall": True,
+                    "confirmed_recall_coverage_floor": 0.90,
+                    "confirmed_recall_window_vote_floor": 0.75,
+                }
+            )
+            accepted_turns.append(candidate)
+            promoted += 1
+
+        rejected[:] = retained
+        return promoted
+
+    @staticmethod
+    def _promote_global_target_cluster(
+        scored_turns: list[
+            tuple[TimeSpan, CandidateSentence, SpeakerMatchDecision | None]
+        ],
+        accepted_turns: list[CandidateSentence],
+        rejected: list[CandidateSentence],
+        extra_seed_items: Iterable[tuple[CandidateSentence, SpeakerMatchDecision]] = (),
+    ) -> int:
+        """Recover target turns belonging to the episode-wide target cluster.
+
+        Reference recordings can differ from an episode in channel, emotion,
+        and vocal effort.  Strong turns already found inside the episode are a
+        cleaner domain-matched representation.  Both embedding spaces must
+        independently agree with that cluster and the target-window locator
+        must cover nearly the full turn.
+        """
+
+        accepted_ids = {id(candidate) for candidate in accepted_turns}
+        match_by_id = {
+            id(candidate): match
+            for _span, candidate, match in scored_turns
+            if match is not None
+        }
+        seed_items = [
+            (candidate, match)
+            for _span, candidate, match in scored_turns
+            if id(candidate) in accepted_ids
+            and match is not None
+            and match.accepted
+            and match.secondary is not None
+            and match.primary.embedding is not None
+            and match.secondary.embedding is not None
+        ]
+        seed_items.extend(
+            (candidate, match)
+            for candidate, match in extra_seed_items
+            if match.accepted
+            and match.secondary is not None
+            and match.primary.embedding is not None
+            and match.secondary.embedding is not None
+        )
+        if len(seed_items) < 3:
+            return 0
+
+        primary_centroid = torch.nn.functional.normalize(
+            torch.stack([match.primary.embedding for _candidate, match in seed_items]).mean(dim=0),
+            dim=0,
+        )
+        secondary_centroid = torch.nn.functional.normalize(
+            torch.stack([match.secondary.embedding for _candidate, match in seed_items]).mean(dim=0),
+            dim=0,
+        )
+
+        retained: list[CandidateSentence] = []
+        promoted = 0
+        for candidate in rejected:
+            if candidate.reject_reason != "声纹匹配不足":
+                retained.append(candidate)
+                continue
+            match = match_by_id.get(id(candidate))
+            secondary = match.secondary if match is not None else None
+            if (
+                match is None
+                or secondary is None
+                or match.tier != "recall"
+                or match.primary.embedding is None
+                or secondary.embedding is None
+            ):
+                retained.append(candidate)
+                continue
+
+            coverage = float(candidate.diagnostics.get("target_coverage", 0.0))
+            primary_cluster_score = float(match.primary.embedding @ primary_centroid)
+            secondary_cluster_score = float(secondary.embedding @ secondary_centroid)
+            cluster_consensus = (
+                primary_cluster_score >= 0.78
+                and secondary_cluster_score >= 0.72
+            )
+            direct_evidence = (
+                match.primary.score >= 0.58
+                and secondary.score >= 0.47
+                and match.paired_reference_median >= 0.47
+                and match.primary.reference_max_score >= 0.54
+                and secondary.reference_max_score >= 0.44
+            )
+            if coverage < 0.85 or not cluster_consensus or not direct_evidence:
+                retained.append(candidate)
+                continue
+
+            candidate.reject_reason = ""
+            candidate.diagnostics.update(
+                {
+                    "global_target_cluster": True,
+                    "global_target_primary_score": round(primary_cluster_score, 5),
+                    "global_target_secondary_score": round(secondary_cluster_score, 5),
+                }
+            )
+            accepted_turns.append(candidate)
+            promoted += 1
+
+        rejected[:] = retained
+        return promoted
+
+    @staticmethod
     def _expand_recall_candidates(
         scored_turns: list[
             tuple[TimeSpan, CandidateSentence, SpeakerMatchDecision | None]
@@ -467,6 +642,7 @@ class ExtractionPipeline:
         accepted_turns: list[CandidateSentence],
         rejected: list[CandidateSentence],
         profile: SpeakerMatchProfile,
+        extra_seed_items: Iterable[tuple[CandidateSentence, SpeakerMatchDecision]] = (),
     ) -> int:
         """Recover target turns that are acoustically close to confirmed seeds.
 
@@ -479,6 +655,7 @@ class ExtractionPipeline:
         """
 
         accepted_ids = {id(candidate) for candidate in accepted_turns}
+        extra_seed_items = list(extra_seed_items)
         seed_blocks = {
             int(candidate.diagnostics["speech_block_index"])
             for candidate in accepted_turns
@@ -493,6 +670,18 @@ class ExtractionPipeline:
             and match.primary.embedding is not None
             and match.secondary.embedding is not None
         ]
+        seed_items.extend(
+            (candidate, match)
+            for candidate, match in extra_seed_items
+            if match.secondary is not None
+            and match.primary.embedding is not None
+            and match.secondary.embedding is not None
+        )
+        seed_blocks.update(
+            int(candidate.diagnostics["speech_block_index"])
+            for candidate, _match in extra_seed_items
+            if isinstance(candidate.diagnostics.get("speech_block_index"), int)
+        )
         if len(seed_items) < 3:
             return 0
 
@@ -541,7 +730,10 @@ class ExtractionPipeline:
             ):
                 retained_rejected.append(candidate)
                 continue
-            if float(candidate.diagnostics.get("target_coverage", 0.0)) < 0.60:
+            # Coverage comes from the independent sliding-window locator.  A
+            # low-coverage turn can contain another speaker even when its
+            # whole-turn embedding looks close, so keep the recall gate high.
+            if float(candidate.diagnostics.get("target_coverage", 0.0)) < 0.85:
                 retained_rejected.append(candidate)
                 continue
             if (
@@ -575,8 +767,8 @@ class ExtractionPipeline:
             window_evidence = (
                 candidate.window_p20_score >= primary_floor - 0.20
                 and match.secondary.window_p20_score >= secondary_floor - 0.20
-                and candidate.window_vote_ratio >= 0.35
-                and match.secondary.window_vote_ratio >= 0.35
+                and candidate.window_vote_ratio >= 0.50
+                and match.secondary.window_vote_ratio >= 0.50
             )
             direct_evidence = (
                 match.primary.score >= 0.54
@@ -984,6 +1176,7 @@ class ExtractionPipeline:
                     )
 
                 recovery_lookup = {id(candidate): index for index, (_span, candidate, _match) in enumerate(recovery_turns, start=1)}
+                recovery_seed_items: list[tuple[CandidateSentence, SpeakerMatchDecision]] = []
                 for span, candidate, match in scored_turns:
                     recovery_index = recovery_lookup.get(id(candidate))
                     if recovery_index is not None and match is not None:
@@ -1005,7 +1198,14 @@ class ExtractionPipeline:
                         )
                         if recovered is not None:
                             accepted_candidates, discarded = recovered
-                            for recovered_candidate in accepted_candidates:
+                            for recovered_candidate, recovered_match in accepted_candidates:
+                                # Keep the speech-block identity on recovered
+                                # pieces so block-local recall can use them as
+                                # seeds without exporting the original mixed
+                                # turn.
+                                for key in ("speech_block_index", "speaker_turn_index"):
+                                    if key in candidate.diagnostics:
+                                        recovered_candidate.diagnostics[key] = candidate.diagnostics[key]
                                 recovered_candidate.diagnostics["target_coverage"] = round(
                                     self._target_coverage(
                                         TimeSpan(recovered_candidate.start, recovered_candidate.end),
@@ -1021,6 +1221,7 @@ class ExtractionPipeline:
                                     discarded.append(recovered_candidate)
                                 else:
                                     accepted_turns.append(recovered_candidate)
+                                    recovery_seed_items.append((recovered_candidate, recovered_match))
                             rejected.extend(discarded)
                             continue
                         if match.accepted:
@@ -1033,16 +1234,38 @@ class ExtractionPipeline:
                     else:
                         accepted_turns.append(candidate)
 
+                confirmed_promoted = self._promote_confirmed_recall_candidates(
+                    scored_turns,
+                    accepted_turns,
+                    rejected,
+                )
+                cluster_promoted = self._promote_global_target_cluster(
+                    scored_turns,
+                    accepted_turns,
+                    rejected,
+                    extra_seed_items=recovery_seed_items,
+                )
                 promoted = self._expand_recall_candidates(
                     scored_turns,
                     accepted_turns,
                     rejected,
                     profile,
+                    extra_seed_items=recovery_seed_items,
                 )
                 if promoted:
                     progress(
                         0.76,
                         f"自适应召回：根据本文件已确认声纹追加 {promoted} 个候选回合",
+                    )
+                if confirmed_promoted:
+                    progress(
+                        0.77,
+                        f"双模型逐窗召回：追加 {confirmed_promoted} 个高置信目标回合",
+                    )
+                if cluster_promoted:
+                    progress(
+                        0.775,
+                        f"全片目标声纹簇召回：追加 {cluster_promoted} 个高置信目标回合",
                     )
 
                 progress(
@@ -1123,7 +1346,10 @@ class ExtractionPipeline:
                         sentence.speech_score = turn.speech_score
                         sentence.diagnostics.update(turn.diagnostics)
                         turn_sentences.append(sentence)
-                    if turn.reject_reason == "STT 鍒嗗潡杩囩煭":
+                    # A turn is atomic for export: if any ASR fragment fails a
+                    # hard gate (short or incomplete text), discard the whole
+                    # turn instead of leaking an accepted prefix.
+                    if turn.reject_reason:
                         rejected.append(turn)
                     else:
                         accepted.extend(turn_sentences)
