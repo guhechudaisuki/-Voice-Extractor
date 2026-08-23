@@ -666,12 +666,16 @@ class ExtractionPipeline:
         srt_path.write_text("\n".join(srt_parts), encoding="utf-8")
 
         archive_path = OUTPUT_ROOT / f"{output_dir.name}.zip"
-        if archive_path.exists():
-            archive_path.unlink()
-        with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-            for file in output_dir.rglob("*"):
+        # Never expose a partially written archive to Explorer or the GUI.
+        # Windows may try to open the path as soon as it appears, so build the
+        # ZIP beside the final path and publish it only after ZipFile closes.
+        partial_archive = archive_path.with_name(archive_path.name + ".part")
+        partial_archive.unlink(missing_ok=True)
+        with zipfile.ZipFile(partial_archive, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for file in sorted(output_dir.rglob("*")):
                 if file.is_file():
                     archive.write(file, file.relative_to(output_dir))
+        partial_archive.replace(archive_path)
         return manifest, srt_path, archive_path
 
     def run(
