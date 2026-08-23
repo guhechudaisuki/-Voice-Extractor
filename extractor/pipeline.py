@@ -41,7 +41,7 @@ LOGGER = logging.getLogger(__name__)
 
 @dataclass
 class PipelineOptions:
-    speaker_threshold: float = 0.70
+    speaker_threshold: float = 0.68
     overlap_threshold: float = 0.35
     singing_threshold: float = 0.22
     # Keep short turns long enough to reach speaker verification.  The final
