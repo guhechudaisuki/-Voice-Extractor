@@ -33,7 +33,7 @@ from .speaker import (
     SpeakerMatchDecision,
     SpeakerMatchProfile,
 )
-from .transcription import FunASRTools, WhisperSegmenter
+from .transcription import FunASRTools, WhisperSegmenter, is_complete_text
 from .types import BatchPipelineResult, CandidateSentence, PipelineResult, TimeSpan
 
 LOGGER = logging.getLogger(__name__)
@@ -265,7 +265,8 @@ class ExtractionPipeline:
             if (
                 gap <= max_gap
                 and adjacent_turns
-                and (left.duration < minimum_seconds or right.duration < minimum_seconds)
+                and left.diagnostics.get("speech_block_index")
+                == right.diagnostics.get("speech_block_index")
             ):
                 left.end = max(left.end, right.end)
                 left.diagnostics["speaker_turns_merged"] = True
@@ -554,7 +555,7 @@ class ExtractionPipeline:
             # A rejected dual-model decision is not eligible for recall. Only
             # the explicit weak tier, which has strong primary/reference
             # evidence, may enter this block-local recovery pass.
-            if match.tier != "weak":
+            if match.tier not in {"weak", "recall"}:
                 retained_rejected.append(candidate)
                 continue
 
@@ -945,7 +946,7 @@ class ExtractionPipeline:
                         self._apply_speaker_match(candidate, match, profile, effective_threshold)
                         if not match.accepted:
                             candidate.reject_reason = "声纹匹配不足"
-                        elif target_spans and candidate.diagnostics["target_coverage"] < 0.45:
+                        elif target_spans and candidate.diagnostics["target_coverage"] < 0.60:
                             candidate.reject_reason = "疑似混合说话人，目标声纹不连续"
                     scored_turns.append((span, candidate, match))
                     progress(
@@ -1004,7 +1005,22 @@ class ExtractionPipeline:
                         )
                         if recovered is not None:
                             accepted_candidates, discarded = recovered
-                            accepted_turns.extend(accepted_candidates)
+                            for recovered_candidate in accepted_candidates:
+                                recovered_candidate.diagnostics["target_coverage"] = round(
+                                    self._target_coverage(
+                                        TimeSpan(recovered_candidate.start, recovered_candidate.end),
+                                        target_spans,
+                                    ),
+                                    5,
+                                )
+                                if (
+                                    target_spans
+                                    and recovered_candidate.diagnostics["target_coverage"] < 0.60
+                                ):
+                                    recovered_candidate.reject_reason = "疑似混合说话人，目标声纹不连续"
+                                    discarded.append(recovered_candidate)
+                                else:
+                                    accepted_turns.append(recovered_candidate)
                             rejected.extend(discarded)
                             continue
                         if match.accepted:
@@ -1087,6 +1103,12 @@ class ExtractionPipeline:
                             sentence.end = turn.end
                         if sentence.duration < self.options.min_output_seconds:
                             turn.reject_reason = "STT 鍒嗗潡杩囩煭"
+                            break
+                        if (
+                            not is_complete_text(sentence.whisper_text)
+                            and not sentence.diagnostics.get("transcription_tail")
+                        ):
+                            turn.reject_reason = "STT 鏂囨湰涓嶅畬鏁?"
                             break
                         sentence.text = sentence.whisper_text
                         sentence.accepted = True
