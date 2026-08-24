@@ -1660,10 +1660,10 @@ class ExtractionPipeline:
     ) -> int:
         """Join short-silence fragments only around a formally accepted core.
 
-        Edge fragments never become output by themselves.  They may only repair
-        a clipped edge when they are adjacent to a strict target turn,
-        both speaker models regard the neighboring audio as the same voice, and
-        the complete joined sentence passes formal verification again.
+        Edge fragments never become output by themselves. They may repair a
+        clipped edge next to a strict target turn, or form a short-seed group
+        when no strict core exists. In both cases the two models must agree and
+        the complete joined sentence must pass formal verification again.
         """
 
         pending_short = [
@@ -4418,7 +4418,7 @@ class ExtractionPipeline:
                     # Do not collapse corroborated boundaries around a short
                     # reply into one change point. The downstream whole-span
                     # gate is stricter than this discovery pass.
-                    minimum_separation_seconds=0.30,
+                    minimum_separation_seconds=0.25,
                     progress=lambda value, message: progress(0.63 + 0.07 * value, message),
                 )
                 target_spans = verifier.locate_target_spans(

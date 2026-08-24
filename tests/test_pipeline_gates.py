@@ -266,9 +266,9 @@ class MultiscaleBoundaryTests(unittest.TestCase):
 
     def test_boundary_at_minimum_separation_is_not_collapsed(self) -> None:
         first = SpeakerBoundary(2.00, 0.20, 0.10, 0.80, 0.20, 0.20)
-        second = SpeakerBoundary(2.30, 0.18, 0.08, 0.82, 0.20, 0.20)
+        second = SpeakerBoundary(2.25, 0.18, 0.08, 0.82, 0.20, 0.20)
         collapsed = LocalSpeakerTurnSplitter._collapse_candidates(
-            [first, second], minimum_separation_seconds=0.30
+            [first, second], minimum_separation_seconds=0.25
         )
         self.assertEqual(len(collapsed), 2)
 
