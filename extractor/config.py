@@ -23,6 +23,8 @@ SV_MODEL = GPT_ROOT / "GPT_SoVITS" / "pretrained_models" / "sv" / "pretrained_er
 CAMPLUS_MODEL = TOOL_ROOT / "models" / "campplus_voxceleb" / "campplus_voxceleb.bin"
 WAVLM_SV_MODEL = TOOL_ROOT / "models" / "wavlm-base-plus-sv"
 WESPEAKER_MODEL = TOOL_ROOT / "models" / "wespeaker-resnet34-lm" / "onnx" / "model.onnx"
+ANIME_CHAR_MODEL = TOOL_ROOT / "models" / "anime-speaker-char" / "anime_speaker_char_ecapa.onnx"
+ANIME_VA_MODEL = TOOL_ROOT / "models" / "anime-speaker-va" / "anime_speaker_va_ecapa.onnx"
 
 WHISPER_CACHE = WORKSPACE_ROOT / "omnvoice" / "hf_cache" / "models--openai--whisper-large-v3-turbo"
 OVERLAP_MODEL = TOOL_ROOT / "models" / "overlap" / "model.onnx"

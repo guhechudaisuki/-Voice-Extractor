@@ -58,6 +58,8 @@ def run_job(
     use_overlap: bool,
     use_singing: bool,
     negative_role_state,
+    speaker_threshold: float = 0.68,
+    silence_split_seconds: float = 0.85,
 ):
     refs = _paths(references)
     target_paths = _paths(targets)
@@ -72,8 +74,19 @@ def run_job(
         if stored_roles.get(key)
     ]
 
+    try:
+        speaker_threshold = float(speaker_threshold)
+        silence_split_seconds = float(silence_split_seconds)
+    except (TypeError, ValueError) as exc:
+        raise gr.Error("声纹阈值和静音切分阈值必须是数字") from exc
+    if not 0.50 <= speaker_threshold <= 0.90:
+        raise gr.Error("声纹阈值应在 0.50 到 0.90 之间")
+    if not 0.10 <= silence_split_seconds <= 3.00:
+        raise gr.Error("静音切分阈值应在 0.10 到 3.00 秒之间")
+
     options = PipelineOptions(
-        speaker_threshold=0.68,
+        speaker_threshold=speaker_threshold,
+        silence_split_seconds=silence_split_seconds,
         use_overlap_detector=bool(use_overlap),
         use_singing_detector=bool(use_singing),
     )
@@ -305,6 +318,20 @@ with gr.Blocks(title="参考音色句子提取", analytics_enabled=False) as dem
     with gr.Row():
         use_overlap = gr.Checkbox(value=True, label="过滤多人同时说话")
         use_singing = gr.Checkbox(value=True, label="过滤唱歌/歌声")
+        speaker_threshold = gr.Number(
+            value=0.68,
+            label="声纹阈值",
+            minimum=0.50,
+            maximum=0.90,
+            step=0.01,
+        )
+        silence_split_seconds = gr.Number(
+            value=0.85,
+            label="静音切分阈值（秒）",
+            minimum=0.10,
+            maximum=3.00,
+            step=0.05,
+        )
     run_button = gr.Button("开始提取", variant="primary")
     live_progress = gr.Number(value=0, label="总体进度（0-100%）", interactive=False)
     status = gr.Textbox(label="任务状态", lines=5)
@@ -326,6 +353,8 @@ with gr.Blocks(title="参考音色句子提取", analytics_enabled=False) as dem
             use_overlap,
             use_singing,
             negative_role_state,
+            speaker_threshold,
+            silence_split_seconds,
         ],
         outputs=[status, live_progress, table, archive, manifest, transcript],
         show_progress="hidden",

@@ -7,6 +7,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from extractor.pipeline import ExtractionPipeline
+from extractor.speaker import LocalSpeakerTurnSplitter, SpeakerBoundary
 from extractor.types import CandidateSentence
 
 
@@ -57,6 +58,110 @@ class FinalMultimodelExclusionTests(unittest.TestCase):
         value = candidate(coverage=0.70, tier="recall")
         exclusion = {"excluded_primary_vote": True, "excluded_secondary_vote": False}
         self.assertFalse(ExtractionPipeline._needs_final_multimodel_exclusion(value, exclusion))
+
+    def test_boundary_risk_opens_third_model_audit_for_strong_turn(self) -> None:
+        value = candidate(coverage=1.0, tier="strong")
+        value.diagnostics["locator_boundary_count"] = 3
+        exclusion = {"excluded_primary_vote": False, "excluded_secondary_vote": False}
+        self.assertFalse(
+            ExtractionPipeline._needs_final_multimodel_exclusion(value, exclusion)
+        )
+        self.assertTrue(
+            ExtractionPipeline._needs_final_multimodel_exclusion(
+                value,
+                {**exclusion, "excluded_wespeaker_vote": True},
+            )
+        )
+        self.assertTrue(
+            ExtractionPipeline._needs_final_multimodel_exclusion(
+                value,
+                {**exclusion, "excluded_wespeaker_vote": True},
+                require_third_model=True,
+            )
+        )
+
+    def test_third_vote_alone_is_not_a_veto_on_clean_turn(self) -> None:
+        value = candidate(coverage=1.0, tier="strong")
+        exclusion = {
+            "excluded_primary_vote": False,
+            "excluded_secondary_vote": False,
+            "excluded_wespeaker_vote": True,
+        }
+        self.assertFalse(
+            ExtractionPipeline._needs_final_multimodel_exclusion(
+                value, exclusion, require_third_model=True
+            )
+        )
+
+
+class AnimeRecoveryGateTests(unittest.TestCase):
+    def test_anime_recovery_requires_episode_consensus(self) -> None:
+        diagnostics = {
+            "multi_model_base_consensus": False,
+            "multi_model_common_anchor_count": 0,
+            "multi_model_wespeaker_support": False,
+            "multi_model_continuity_ratio": 1.0,
+        }
+        self.assertFalse(ExtractionPipeline._anime_recovery_base_gate(diagnostics))
+
+    def test_anime_recovery_rejects_direct_exclusion_conflict(self) -> None:
+        diagnostics = {
+            "multi_model_base_consensus": True,
+            "multi_model_common_anchor_count": 2,
+            "multi_model_wespeaker_support": True,
+            "multi_model_continuity_ratio": 0.85,
+            "excluded_primary_direct_margin": -0.01,
+            "excluded_secondary_direct_margin": 0.12,
+        }
+        self.assertFalse(ExtractionPipeline._anime_recovery_base_gate(diagnostics))
+
+    def test_anime_recovery_accepts_independent_clean_evidence(self) -> None:
+        diagnostics = {
+            "multi_model_base_consensus": True,
+            "multi_model_common_anchor_count": 2,
+            "multi_model_wespeaker_support": True,
+            "multi_model_continuity_ratio": 0.75,
+            "excluded_primary_direct_margin": 0.04,
+            "excluded_secondary_direct_margin": 0.08,
+        }
+        self.assertTrue(ExtractionPipeline._anime_recovery_base_gate(diagnostics))
+
+
+class MultiscaleBoundaryTests(unittest.TestCase):
+    def test_only_cross_scale_boundary_survives(self) -> None:
+        observed = [
+            (
+                0.70,
+                SpeakerBoundary(
+                    10.00, 0.42, 0.18, 0.80, 0.10, 0.08
+                ),
+            ),
+            (
+                0.90,
+                SpeakerBoundary(
+                    10.22, 0.31, 0.04, 0.95, 0.20, 0.15
+                ),
+            ),
+            (
+                0.70,
+                SpeakerBoundary(
+                    20.00, 0.20, 0.03, 1.00, 0.30, 0.20
+                ),
+            ),
+        ]
+        boundaries = LocalSpeakerTurnSplitter._cluster_multiscale_boundaries(
+            observed,
+            cluster_seconds=0.40,
+            minimum_context_votes=2,
+        )
+        self.assertEqual(len(boundaries), 1)
+        self.assertEqual(boundaries[0].scale_votes, 2)
+        self.assertEqual(boundaries[0].scale_contexts, (0.7, 0.9))
+        self.assertTrue(ExtractionPipeline._is_structural_boundary(boundaries[0]))
+
+    def test_single_scale_boundary_is_not_structural(self) -> None:
+        boundary = SpeakerBoundary(10.0, 0.22, 0.18, 0.8, 0.2, 0.1)
+        self.assertFalse(ExtractionPipeline._is_structural_boundary(boundary))
 
 
 if __name__ == "__main__":

@@ -140,8 +140,13 @@ class SpeakerBoundary:
     confidence: float
     primary_drop: float = 0.0
     secondary_drop: float = 0.0
+    # A boundary returned by the multi-scale audit carries the number of
+    # independent context sizes that observed it.  Ordinary one-pass callers
+    # keep the default value of one.
+    scale_votes: int = 1
+    scale_contexts: tuple[float, ...] = ()
 
-    def to_dict(self) -> dict[str, float | None]:
+    def to_dict(self) -> dict[str, object]:
         return {
             "time": round(float(self.time), 5),
             "primary_similarity": round(float(self.primary_similarity), 5),
@@ -153,6 +158,8 @@ class SpeakerBoundary:
             "confidence": round(float(self.confidence), 5),
             "primary_drop": round(float(self.primary_drop), 5),
             "secondary_drop": round(float(self.secondary_drop), 5),
+            "scale_votes": int(self.scale_votes),
+            "scale_contexts": [round(float(value), 3) for value in self.scale_contexts],
         }
 
 
@@ -340,7 +347,10 @@ class SpeakerVerifier:
         if not windows:
             windows = [waveform]
 
-        window_embeddings = self._embeddings_from_waveforms(windows)
+        if len(windows) == 1 and windows[0].numel() == waveform.numel():
+            window_embeddings = whole.unsqueeze(0)
+        else:
+            window_embeddings = self._embeddings_from_waveforms(windows)
         window_scores = [float(value) for value in window_embeddings @ profile.centroid]
         window_tensor = torch.tensor(window_scores)
         minimum = float(window_tensor.min())
@@ -507,7 +517,10 @@ class CAMPlusVerifier:
         if not windows:
             windows = [waveform]
 
-        window_embeddings = self._embeddings_from_waveforms(windows)
+        if len(windows) == 1 and windows[0].numel() == waveform.numel():
+            window_embeddings = whole.unsqueeze(0)
+        else:
+            window_embeddings = self._embeddings_from_waveforms(windows)
         window_scores = [float(value) for value in window_embeddings @ profile.centroid]
         window_tensor = torch.tensor(window_scores)
         minimum = float(window_tensor.min())
@@ -2249,6 +2262,154 @@ class LocalSpeakerTurnSplitter:
                 )
         output = self._collapse_candidates(confirmed, minimum_separation_seconds)
         progress(1.0, f"说话人边界检测完成：确认 {len(output)} 个换人点")
+        return output
+
+    @staticmethod
+    def _cluster_multiscale_boundaries(
+        detections: Sequence[tuple[float, SpeakerBoundary]],
+        *,
+        cluster_seconds: float,
+        minimum_context_votes: int,
+    ) -> list[SpeakerBoundary]:
+        """Collapse nearby observations and retain only cross-scale changes.
+
+        A single context can mistake an accent, breath, or short phoneme for a
+        change of speaker.  Distinct context sizes are treated as independent
+        observations; repeated hits from one scale do not increase confidence.
+        """
+
+        if not detections:
+            return []
+        ordered = sorted(detections, key=lambda item: item[1].time)
+        groups: list[list[tuple[float, SpeakerBoundary]]] = [[ordered[0]]]
+        for context, boundary in ordered[1:]:
+            if boundary.time - groups[-1][-1][1].time <= cluster_seconds:
+                groups[-1].append((context, boundary))
+            else:
+                groups.append([(context, boundary)])
+
+        output: list[SpeakerBoundary] = []
+        for group in groups:
+            contexts = sorted({round(float(context), 3) for context, _ in group})
+            if len(contexts) < minimum_context_votes:
+                continue
+            representative = min(
+                (boundary for _context, boundary in group),
+                key=lambda item: (
+                    item.primary_similarity + (item.secondary_similarity or 1.0),
+                    -item.confidence,
+                ),
+            )
+            output.append(
+                SpeakerBoundary(
+                    time=representative.time,
+                    primary_similarity=representative.primary_similarity,
+                    secondary_similarity=representative.secondary_similarity,
+                    confidence=max(item.confidence for _context, item in group),
+                    primary_drop=representative.primary_drop,
+                    secondary_drop=representative.secondary_drop,
+                    scale_votes=len(contexts),
+                    scale_contexts=tuple(contexts),
+                )
+            )
+        return output
+
+    def detect_multiscale_speaker_boundaries(
+        self,
+        audio_path: Path,
+        spans: Sequence[TimeSpan],
+        *,
+        contexts: Sequence[float] = (0.70, 0.90, 1.10),
+        cluster_seconds: float = 0.40,
+        minimum_context_votes: int = 2,
+        scan_hop_seconds: float = 0.10,
+        primary_threshold: float = 0.68,
+        secondary_threshold: float = 0.52,
+        primary_candidate_threshold: float = 0.78,
+        minimum_similarity_drop: float = 0.06,
+        minimum_separation_seconds: float = 0.20,
+        progress: Callable[[float, str], None] | None = None,
+    ) -> list[SpeakerBoundary]:
+        """Find speaker changes that survive multiple context sizes.
+
+        The method is deliberately an audit, not a new speaker clustering
+        model.  A boundary must be observed by at least two distinct context
+        sizes before callers may split or veto a candidate around it.
+        """
+
+        if not contexts:
+            return []
+        if cluster_seconds < 0.0:
+            raise ValueError("多尺度边界聚类窗口不能小于 0 秒")
+        if minimum_context_votes < 1:
+            raise ValueError("多尺度边界至少需要一个上下文尺度")
+        progress = progress or (lambda _value, _message: None)
+        unique_contexts = tuple(sorted({float(value) for value in contexts}))
+        detections: list[tuple[float, SpeakerBoundary]] = []
+        # A short-context pass is an inexpensive screen.  Longer contexts are
+        # only evaluated for spans where that screen found a possible change;
+        # this keeps the default full-episode path close to the old runtime
+        # while retaining cross-scale confirmation on genuinely suspicious
+        # turns.
+        screening_context = unique_contexts[len(unique_contexts) // 2]
+        screen_boundaries = self.detect_speaker_boundaries(
+            audio_path,
+            spans,
+            context_seconds=screening_context,
+            scan_hop_seconds=scan_hop_seconds,
+            primary_threshold=primary_threshold,
+            secondary_threshold=secondary_threshold,
+            primary_candidate_threshold=primary_candidate_threshold,
+            minimum_similarity_drop=minimum_similarity_drop,
+            minimum_separation_seconds=minimum_separation_seconds,
+            progress=lambda value, message: progress(
+                0.45 * value,
+                f"多尺度换人审计 {screening_context:.2f}s：{message}",
+            ),
+        )
+        detections.extend(
+            (screening_context, boundary) for boundary in screen_boundaries
+        )
+        if not screen_boundaries:
+            progress(1.0, "多尺度换人审计完成：筛查未发现候选边界")
+            return []
+        suspicious_spans = [
+            span
+            for span in spans
+            if any(span.start < boundary.time < span.end for boundary in screen_boundaries)
+        ]
+        remaining_contexts = [
+            context for context in unique_contexts if context != screening_context
+        ]
+        for index, context in enumerate(remaining_contexts, start=1):
+            progress(
+                0.45 + 0.55 * (index - 1) / max(1, len(remaining_contexts)),
+                f"多尺度换人审计：上下文 {context:.2f}s",
+            )
+            boundaries = self.detect_speaker_boundaries(
+                audio_path,
+                suspicious_spans,
+                context_seconds=context,
+                scan_hop_seconds=scan_hop_seconds,
+                primary_threshold=primary_threshold,
+                secondary_threshold=secondary_threshold,
+                primary_candidate_threshold=primary_candidate_threshold,
+                minimum_similarity_drop=minimum_similarity_drop,
+                minimum_separation_seconds=minimum_separation_seconds,
+                progress=lambda value, message, context=context: progress(
+                    0.45
+                    + 0.55 * ((index - 1) + value)
+                    / max(1, len(remaining_contexts)),
+                    f"多尺度换人审计 {context:.2f}s：{message}",
+                ),
+            )
+            detections.extend((context, boundary) for boundary in boundaries)
+        output = self._cluster_multiscale_boundaries(
+            detections,
+            cluster_seconds=cluster_seconds,
+            minimum_context_votes=minimum_context_votes,
+        )
+        progress(1.0, f"多尺度换人审计完成：确认 {len(output)} 个稳定边界")
         return output
 
     def analyze(
