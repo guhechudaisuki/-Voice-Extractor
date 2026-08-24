@@ -105,6 +105,36 @@ class ExtractionPipeline:
         self.options = options or PipelineOptions()
         self.device = device if device == "cuda" and torch.cuda.is_available() else "cpu"
 
+    @staticmethod
+    def _needs_final_multimodel_exclusion(
+        candidate: CandidateSentence,
+        exclusion: dict[str, float | str | bool] | None,
+        *,
+        require_third_model: bool = False,
+    ) -> bool:
+        """Gate the expensive third-model veto to low-coverage recovery turns.
+
+        A single exclusion-model vote is useful evidence on recovered edges but
+        is not sufficient to delete an ordinary target sentence.  The third
+        model is considered only when the target locator already reports a
+        weak/empty target region; this preserves stable full-coverage turns
+        while giving mixed recovery candidates an independent veto.
+        """
+
+        if not exclusion:
+            return False
+        if require_third_model and not exclusion.get("excluded_wespeaker_vote"):
+            return False
+        primary_vote = bool(exclusion.get("excluded_primary_vote"))
+        secondary_vote = bool(exclusion.get("excluded_secondary_vote"))
+        if not (primary_vote or secondary_vote):
+            return False
+        coverage = float(candidate.diagnostics.get("target_coverage", 1.0))
+        tier = str(candidate.diagnostics.get("speaker_tier", ""))
+        if coverage <= 0.05 and primary_vote:
+            return True
+        return tier == "recall" and coverage < 0.60
+
     def _job_paths(self, job_id: str) -> dict[str, Path]:
         root = WORK_ROOT / job_id
         return {
@@ -3282,6 +3312,8 @@ class ExtractionPipeline:
                         f"排除角色最终复核：0/{len(accepted_turns)}",
                     )
                     retained_turns: list[CandidateSentence] = []
+                    fourth_verifier = None
+                    fourth_profile = None
                     for audit_index, candidate in enumerate(accepted_turns, start=1):
                         audit_match = self._verify_speaker_span(
                             verifier,
@@ -3302,6 +3334,37 @@ class ExtractionPipeline:
                         )
                         if exclusion is not None:
                             candidate.diagnostics.update(exclusion)
+                        if (
+                            exclusion
+                            and not exclusion.get("excluded_role_rejected")
+                            and self._needs_final_multimodel_exclusion(candidate, exclusion)
+                        ):
+                            if fourth_verifier is None or fourth_profile is None:
+                                fourth_verifier, fourth_profile = verifier.quaternary_pair(profile)
+                            candidate_waveform = self._waveform_span(
+                                target_waveform,
+                                TimeSpan(candidate.start, candidate.end),
+                            )
+                            fourth_embedding = fourth_verifier.embeddings_from_waveforms(
+                                [candidate_waveform]
+                            )[0]
+                            multimodel_exclusion = verifier.multimodel_exclusion_audit(
+                                audit_match,
+                                profile,
+                                fourth_embedding,
+                                fourth_profile,
+                                exclusion_profiles,
+                            )
+                            candidate.diagnostics["final_multimodel_exclusion_checked"] = True
+                            if multimodel_exclusion is not None:
+                                candidate.diagnostics.update(multimodel_exclusion)
+                            if self._needs_final_multimodel_exclusion(
+                                candidate,
+                                multimodel_exclusion,
+                                require_third_model=True,
+                            ):
+                                exclusion = multimodel_exclusion
+                                candidate.diagnostics["final_multimodel_exclusion_veto"] = True
                         if exclusion and exclusion.get("excluded_role_rejected"):
                             candidate.reject_reason = (
                                 f"更接近{exclusion['excluded_role']}，已按排除角色删除"
