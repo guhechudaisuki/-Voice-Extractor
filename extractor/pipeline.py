@@ -2610,8 +2610,14 @@ class ExtractionPipeline:
             candidate.diagnostics["multi_model_decisive_boundary"] = (
                 decisive_boundary
             )
+            low_coverage_boundary = bool(
+                boundaries
+                and float(candidate.diagnostics.get("target_coverage", 1.0) or 0.0)
+                < 0.85
+            )
             if boundaries and (
-                not candidate.diagnostics.get("multi_model_edge_tolerant")
+                low_coverage_boundary
+                or not candidate.diagnostics.get("multi_model_edge_tolerant")
                 or decisive_boundary
             ):
                 candidate.reject_reason = "多模型复核确认内部换人"
