@@ -340,10 +340,7 @@ class SpeakerVerifier:
         if not windows:
             windows = [waveform]
 
-        if len(windows) == 1 and windows[0].numel() == waveform.numel():
-            window_embeddings = whole.unsqueeze(0)
-        else:
-            window_embeddings = self._embeddings_from_waveforms(windows)
+        window_embeddings = self._embeddings_from_waveforms(windows)
         window_scores = [float(value) for value in window_embeddings @ profile.centroid]
         window_tensor = torch.tensor(window_scores)
         minimum = float(window_tensor.min())
@@ -510,10 +507,7 @@ class CAMPlusVerifier:
         if not windows:
             windows = [waveform]
 
-        if len(windows) == 1 and windows[0].numel() == waveform.numel():
-            window_embeddings = whole.unsqueeze(0)
-        else:
-            window_embeddings = self._embeddings_from_waveforms(windows)
+        window_embeddings = self._embeddings_from_waveforms(windows)
         window_scores = [float(value) for value in window_embeddings @ profile.centroid]
         window_tensor = torch.tensor(window_scores)
         minimum = float(window_tensor.min())
