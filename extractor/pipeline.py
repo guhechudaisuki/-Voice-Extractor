@@ -1551,12 +1551,16 @@ class ExtractionPipeline:
             left = [
                 candidate
                 for candidate in possible_edges
-                if 0.0 <= accepted.start - candidate.end <= 0.85
+                if 0.0
+                <= accepted.start - candidate.end
+                <= self.options.silence_split_seconds
             ]
             right = [
                 candidate
                 for candidate in possible_edges
-                if 0.0 <= candidate.start - accepted.end <= 0.85
+                if 0.0
+                <= candidate.start - accepted.end
+                <= self.options.silence_split_seconds
             ]
             if left:
                 candidate = max(left, key=lambda item: item.end)
@@ -4081,7 +4085,13 @@ class ExtractionPipeline:
                 split_result = verifier.split_speaker_spans(
                     stem,
                     clean_spans,
-                    minimum_turn_seconds=0.85,
+                    # Preserve short local sides as edge evidence. The old
+                    # 0.85s floor folded a short reply back into the previous
+                    # speaker, making a mixed sentence look like one target
+                    # turn. These sides remain non-exportable until a joined
+                    # whole-span verification succeeds.
+                    minimum_turn_seconds=0.30,
+                    minimum_edge_seconds=0.20,
                     context_seconds=1.20,
                     scan_hop_seconds=0.30,
                     minimum_similarity_drop=0.08,

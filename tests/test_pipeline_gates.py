@@ -9,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from extractor.pipeline import ExtractionPipeline
 from extractor.speaker import LocalSpeakerTurnSplitter, SpeakerBoundary
-from extractor.types import CandidateSentence
+from extractor.types import CandidateSentence, TimeSpan
 
 
 def candidate(*, coverage: float, tier: str) -> CandidateSentence:
@@ -227,6 +227,38 @@ class MultiscaleBoundaryTests(unittest.TestCase):
     def test_single_scale_boundary_is_not_structural(self) -> None:
         boundary = SpeakerBoundary(10.0, 0.22, 0.18, 0.8, 0.2, 0.1)
         self.assertFalse(ExtractionPipeline._is_structural_boundary(boundary))
+
+    def test_short_local_side_is_kept_as_edge_evidence(self) -> None:
+        spans = LocalSpeakerTurnSplitter._split_span_with_edge_evidence(
+            TimeSpan(0.0, 3.0),
+            [0.25, 2.50],
+            minimum_turn_seconds=0.30,
+            minimum_edge_seconds=0.20,
+        )
+        self.assertEqual(
+            spans,
+            [
+                TimeSpan(0.0, 0.25),
+                TimeSpan(0.25, 2.50),
+                TimeSpan(2.50, 3.0),
+            ],
+        )
+
+    def test_short_internal_side_is_not_dropped(self) -> None:
+        spans = LocalSpeakerTurnSplitter._split_span_with_edge_evidence(
+            TimeSpan(0.0, 4.0),
+            [1.50, 1.72],
+            minimum_turn_seconds=0.30,
+            minimum_edge_seconds=0.20,
+        )
+        self.assertEqual(
+            spans,
+            [
+                TimeSpan(0.0, 1.50),
+                TimeSpan(1.50, 1.72),
+                TimeSpan(1.72, 4.0),
+            ],
+        )
 
 
 class LocalRecoveryGateTests(unittest.TestCase):

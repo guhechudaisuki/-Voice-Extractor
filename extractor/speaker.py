@@ -2418,13 +2418,34 @@ class LocalSpeakerTurnSplitter:
         spans: Sequence[TimeSpan],
         *,
         minimum_turn_seconds: float = 0.30,
+        minimum_edge_seconds: float | None = None,
         progress: Callable[[float, str], None] | None = None,
         **boundary_kwargs: float,
     ) -> SpeakerSplitResult:
-        """Return split spans and boundary diagnostics in one result."""
+        """Return split spans and boundary diagnostics in one result.
+
+        ``minimum_turn_seconds`` controls how close a proposed boundary may be
+        to the edge of a normal turn. Shorter sides can remain as evidence for
+        a later complete-span identity check instead of being folded into the
+        neighboring speaker.
+        """
 
         if minimum_turn_seconds < 0.0:
             raise ValueError("最短说话回合不能小于 0 秒")
+        if minimum_edge_seconds is None:
+            minimum_edge_seconds = min(
+                minimum_turn_seconds,
+                max(
+                    0.15,
+                    min(0.30, minimum_turn_seconds * 0.45),
+                ),
+            )
+        if minimum_edge_seconds < 0.0:
+            raise ValueError("minimum_edge_seconds must be non-negative")
+        if minimum_edge_seconds > minimum_turn_seconds:
+            raise ValueError(
+                "minimum_edge_seconds cannot exceed minimum_turn_seconds"
+            )
         waveform = load_mono(audio_path, self.SAMPLE_RATE)
         duration = waveform.numel() / self.SAMPLE_RATE
         normalized = self._normalize_spans(spans, duration)
@@ -2439,23 +2460,57 @@ class LocalSpeakerTurnSplitter:
             cuts = [
                 boundary.time
                 for boundary in boundaries
-                if span.start + minimum_turn_seconds <= boundary.time <= span.end - minimum_turn_seconds
+                if span.start + minimum_edge_seconds <= boundary.time
+                <= span.end - minimum_edge_seconds
             ]
-            cursor = span.start
-            span_turns: list[TimeSpan] = []
-            for cut in cuts:
-                if cut - cursor >= minimum_turn_seconds:
-                    span_turns.append(TimeSpan(cursor, cut))
-                cursor = cut
-            if span.end - cursor >= minimum_turn_seconds:
-                span_turns.append(TimeSpan(cursor, span.end))
-            elif span_turns:
-                previous = span_turns[-1]
-                span_turns[-1] = TimeSpan(previous.start, span.end)
-            elif span.duration >= minimum_turn_seconds:
-                span_turns.append(span)
-            turns.extend(span_turns)
+            turns.extend(
+                self._split_span_with_edge_evidence(
+                    span,
+                    cuts,
+                    minimum_turn_seconds,
+                    minimum_edge_seconds,
+                )
+            )
         return SpeakerSplitResult(tuple(turns), tuple(boundaries))
+
+    @staticmethod
+    def _split_span_with_edge_evidence(
+        span: TimeSpan,
+        cuts: Sequence[float],
+        minimum_turn_seconds: float,
+        minimum_edge_seconds: float,
+    ) -> list[TimeSpan]:
+        """Split a VAD island without folding short speaker sides together.
+
+        Sides below ``minimum_edge_seconds`` are omitted rather than attached
+        to the adjacent side. Sides at or above that floor remain candidates,
+        but the pipeline still requires a complete-span identity check before
+        exporting anything.
+        """
+
+        ordered_cuts = sorted(
+            {
+                float(cut)
+                for cut in cuts
+                if span.start + minimum_edge_seconds <= float(cut)
+                <= span.end - minimum_edge_seconds
+            }
+        )
+        cursor = span.start
+        output: list[TimeSpan] = []
+        for cut in ordered_cuts:
+            side = TimeSpan(cursor, cut)
+            if side.duration >= minimum_edge_seconds:
+                output.append(side)
+            cursor = cut
+        tail = TimeSpan(cursor, span.end)
+        if tail.duration >= minimum_edge_seconds:
+            output.append(tail)
+        elif not output and span.duration >= minimum_edge_seconds:
+            # No usable boundary side was produced; retain the original island
+            # so the normal target-speaker gate can make the decision.
+            output.append(span)
+        return output
 
     def split_speaker_spans(
         self,
@@ -2463,6 +2518,7 @@ class LocalSpeakerTurnSplitter:
         spans: Sequence[TimeSpan],
         *,
         minimum_turn_seconds: float = 0.30,
+        minimum_edge_seconds: float | None = None,
         progress: Callable[[float, str], None] | None = None,
         **boundary_kwargs: float,
     ) -> list[TimeSpan]:
@@ -2473,6 +2529,7 @@ class LocalSpeakerTurnSplitter:
                 audio_path,
                 spans,
                 minimum_turn_seconds=minimum_turn_seconds,
+                minimum_edge_seconds=minimum_edge_seconds,
                 progress=progress,
                 **boundary_kwargs,
             ).spans
