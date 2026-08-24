@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -226,6 +227,96 @@ class MultiscaleBoundaryTests(unittest.TestCase):
     def test_single_scale_boundary_is_not_structural(self) -> None:
         boundary = SpeakerBoundary(10.0, 0.22, 0.18, 0.8, 0.2, 0.1)
         self.assertFalse(ExtractionPipeline._is_structural_boundary(boundary))
+
+
+class LocalRecoveryGateTests(unittest.TestCase):
+    @staticmethod
+    def _match(
+        *,
+        tier: str,
+        primary: float,
+        secondary: float,
+        primary_reference: float = 0.55,
+        secondary_reference: float = 0.52,
+        paired: float = 0.50,
+    ):
+        return SimpleNamespace(
+            tier=tier,
+            paired_reference_median=paired,
+            primary=SimpleNamespace(
+                score=primary,
+                reference_max_score=primary_reference,
+                window_p20_score=0.50,
+                window_vote_ratio=0.50,
+            ),
+            secondary=SimpleNamespace(
+                score=secondary,
+                reference_max_score=secondary_reference,
+                window_p20_score=0.50,
+                window_vote_ratio=0.50,
+            ),
+        )
+
+    def test_short_recovery_side_needs_both_models(self) -> None:
+        match = self._match(tier="recall", primary=0.585, secondary=0.595)
+        self.assertTrue(
+            ExtractionPipeline._target_side_recovery_support(match, 1.60, 0.684)
+        )
+        weak_secondary = self._match(tier="recall", primary=0.62, secondary=0.44)
+        self.assertFalse(
+            ExtractionPipeline._target_side_recovery_support(
+                weak_secondary, 1.60, 0.684
+            )
+        )
+
+    def test_complete_or_rejected_tiers_are_not_short_side_support(self) -> None:
+        strong = self._match(tier="strong", primary=0.70, secondary=0.65)
+        self.assertFalse(
+            ExtractionPipeline._target_side_recovery_support(strong, 1.60, 0.684)
+        )
+        rejected = self._match(tier="rejected", primary=0.60, secondary=0.60)
+        self.assertFalse(
+            ExtractionPipeline._target_side_recovery_support(rejected, 1.60, 0.684)
+        )
+
+    def test_subsentence_edge_requires_two_model_direct_evidence(self) -> None:
+        edge = self._match(
+            tier="rejected",
+            primary=0.56,
+            secondary=0.53,
+            primary_reference=0.50,
+            secondary_reference=0.45,
+            paired=0.48,
+        )
+        self.assertTrue(
+            ExtractionPipeline._short_edge_recovery_support(edge, 0.35, 0.684)
+        )
+        weak_secondary = self._match(
+            tier="rejected",
+            primary=0.60,
+            secondary=0.42,
+            primary_reference=0.55,
+            secondary_reference=0.35,
+            paired=0.43,
+        )
+        self.assertFalse(
+            ExtractionPipeline._short_edge_recovery_support(
+                weak_secondary, 0.35, 0.684
+            )
+        )
+
+    def test_subsentence_edge_cannot_be_exported_by_duration_alone(self) -> None:
+        edge = self._match(
+            tier="short_strong",
+            primary=0.90,
+            secondary=0.90,
+            primary_reference=0.90,
+            secondary_reference=0.90,
+            paired=0.90,
+        )
+        self.assertFalse(
+            ExtractionPipeline._short_edge_recovery_support(edge, 0.15, 0.684)
+        )
 
 
 if __name__ == "__main__":
