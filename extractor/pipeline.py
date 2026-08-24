@@ -179,6 +179,84 @@ class ExtractionPipeline:
         )
 
     @staticmethod
+    def _is_reliable_boundary_record(record: object) -> bool:
+        """Apply the same boundary rule to serialized recovery diagnostics."""
+
+        if not isinstance(record, dict):
+            return False
+        try:
+            scale_votes = int(record.get("scale_votes", 1) or 1)
+            primary = float(record.get("primary_similarity", 1.0))
+            secondary_value = record.get("secondary_similarity")
+            secondary = (
+                float(secondary_value)
+                if secondary_value is not None
+                else 1.0
+            )
+            confidence = float(record.get("confidence", 0.0))
+            primary_drop = float(record.get("primary_drop", 0.0))
+            secondary_drop = float(record.get("secondary_drop", 0.0))
+        except (TypeError, ValueError):
+            return False
+        if scale_votes >= 2 or (primary <= 0.15 and secondary <= 0.05):
+            return True
+        # Older one-scale diagnostics do not carry scale_votes.  Preserve
+        # only a corroborated high-confidence cut; a low score from one model
+        # alone must not split an otherwise continuous utterance.
+        return bool(
+            confidence >= 0.80
+            and primary <= 0.48
+            and secondary <= 0.18
+            and primary_drop >= 0.06
+            and secondary_drop >= 0.02
+        )
+
+    @classmethod
+    def _candidate_boundary_times(
+        cls,
+        candidate: CandidateSentence,
+    ) -> list[float]:
+        """Collect reliable serialized cuts that fall inside one candidate.
+
+        Recovery diagnostics have been written by both the old one-pass
+        boundary detector and the newer multi-scale detector.  Normalizing
+        them here keeps later recovery code from treating a low-confidence
+        diagnostic as a hard cut, while still allowing old cached jobs to be
+        audited with the current rules.
+        """
+
+        diagnostics = candidate.diagnostics
+        values: list[float] = []
+        for key in (
+            "recovery_boundary_details",
+            "multi_model_internal_boundaries",
+            "multi_model_anchor_boundaries",
+        ):
+            records = diagnostics.get(key, [])
+            if not isinstance(records, (list, tuple)):
+                continue
+            for record in records:
+                if not cls._is_reliable_boundary_record(record):
+                    continue
+                try:
+                    values.append(float(record["time"]))
+                except (KeyError, TypeError, ValueError):
+                    continue
+        # A few early diagnostics stored only numeric recovery times.
+        records = diagnostics.get("recovery_boundaries", [])
+        if isinstance(records, (list, tuple)):
+            for record in records:
+                if isinstance(record, (int, float)):
+                    values.append(float(record))
+        return sorted(
+            {
+                round(value, 5)
+                for value in values
+                if candidate.start + 0.35 <= value <= candidate.end - 0.35
+            }
+        )
+
+    @staticmethod
     def _anime_recovery_base_gate(diagnostics: dict[str, object]) -> bool:
         """Require independent episode evidence before anime-score recovery."""
 
@@ -1790,7 +1868,10 @@ class ExtractionPipeline:
         # into the same anchor-consensus path instead of lowering the global
         # speaker threshold for the mixed turn.
         recovery_pieces: list[CandidateSentence] = []
-        recovery_sources: dict[tuple[float, float], tuple[CandidateSentence, list[float]]] = {}
+        recovery_sources: dict[
+            tuple[float, float], tuple[CandidateSentence, list[float]]
+        ] = {}
+        low_coverage_parent_ids: set[int] = set()
         for parent in list(rejected):
             if parent.reject_reason not in {
                 "声纹匹配不足",
@@ -1798,20 +1879,30 @@ class ExtractionPipeline:
                 "疑似混合说话人，保守舍弃",
             }:
                 continue
-            details = parent.diagnostics.get("recovery_boundary_details", [])
+            coverage = float(parent.diagnostics.get("target_coverage", 1.0) or 0.0)
+            is_split_piece = bool(parent.diagnostics.get("recovery_subsegment"))
+            stable_times = self._candidate_boundary_times(parent)
+            continuity_ratio = float(
+                parent.diagnostics.get("multi_model_continuity_ratio", 1.0) or 1.0
+            )
+            mixed_evidence = bool(
+                stable_times
+                or int(
+                    parent.diagnostics.get(
+                        "multi_model_internal_boundary_count", 0
+                    )
+                    or 0
+                )
+                > 0
+                or continuity_ratio < 0.70
+            )
+            if coverage < 0.85 and mixed_evidence and not is_split_piece:
+                low_coverage_parent_ids.add(id(parent))
             source_start = float(
                 parent.diagnostics.get("original_turn_start", parent.start)
             )
             source_end = float(
                 parent.diagnostics.get("original_turn_end", parent.end)
-            )
-            stable_times = sorted(
-                {
-                    round(float(item["time"]), 5)
-                    for item in details
-                    if int(item.get("scale_votes", 1) or 1) >= 2
-                    and source_start + 0.05 < float(item["time"]) < source_end - 0.05
-                }
             )
             if stable_times:
                 recovery_sources[(round(source_start, 5), round(source_end, 5))] = (
@@ -1841,6 +1932,10 @@ class ExtractionPipeline:
                         "recovery_parent_end": source_end,
                         "recovery_subsegment_index": part_index,
                         "recovery_subsegment_count": len(points) - 1,
+                        "recovery_parent_target_coverage": round(
+                            float(parent.diagnostics.get("target_coverage", 0.0) or 0.0),
+                            5,
+                        ),
                         "target_coverage": round(
                             self._target_coverage(part, target_spans), 5
                         ),
@@ -1898,6 +1993,12 @@ class ExtractionPipeline:
             <= candidate.duration
             <= min(15.0, self.options.max_sentence_seconds)
             and id(candidate) in matches
+            and id(candidate) not in low_coverage_parent_ids
+            and (
+                not candidate.diagnostics.get("recovery_subsegment")
+                or float(candidate.diagnostics.get("target_coverage", 0.0) or 0.0)
+                >= 0.60
+            )
         ]
         if not raw_anchors:
             return 0

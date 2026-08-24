@@ -128,6 +128,70 @@ class AnimeRecoveryGateTests(unittest.TestCase):
 
 
 class MultiscaleBoundaryTests(unittest.TestCase):
+    def test_serialized_boundary_requires_cross_model_or_legacy_corroboration(self) -> None:
+        self.assertTrue(
+            ExtractionPipeline._is_reliable_boundary_record(
+                {
+                    "time": 10.0,
+                    "scale_votes": 2,
+                    "primary_similarity": 0.44,
+                    "secondary_similarity": 0.10,
+                }
+            )
+        )
+        self.assertFalse(
+            ExtractionPipeline._is_reliable_boundary_record(
+                {
+                    "time": 10.0,
+                    "scale_votes": 1,
+                    "confidence": 0.62,
+                    "primary_similarity": 0.42,
+                    "secondary_similarity": 0.20,
+                    "primary_drop": 0.04,
+                    "secondary_drop": 0.01,
+                }
+            )
+        )
+        self.assertTrue(
+            ExtractionPipeline._is_reliable_boundary_record(
+                {
+                    "time": 10.0,
+                    "confidence": 0.84,
+                    "primary_similarity": 0.43,
+                    "secondary_similarity": 0.12,
+                    "primary_drop": 0.08,
+                    "secondary_drop": 0.04,
+                }
+            )
+        )
+
+    def test_candidate_boundary_times_ignore_edge_and_weak_records(self) -> None:
+        value = CandidateSentence(1.0, 5.0, "")
+        value.diagnostics["multi_model_anchor_boundaries"] = [
+            {
+                "time": 1.20,
+                "scale_votes": 2,
+                "primary_similarity": 0.40,
+                "secondary_similarity": 0.10,
+            },
+            {
+                "time": 3.00,
+                "scale_votes": 2,
+                "primary_similarity": 0.40,
+                "secondary_similarity": 0.10,
+            },
+            {
+                "time": 4.80,
+                "scale_votes": 2,
+                "primary_similarity": 0.40,
+                "secondary_similarity": 0.10,
+            },
+        ]
+        self.assertEqual(
+            ExtractionPipeline._candidate_boundary_times(value),
+            [3.0],
+        )
+
     def test_only_cross_scale_boundary_survives(self) -> None:
         observed = [
             (
