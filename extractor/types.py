@@ -35,6 +35,7 @@ class CandidateSentence:
     reject_reason: str = ""
     audio_file: str = ""
     text_file: str = ""
+    video_file: str = ""
     diagnostics: dict[str, Any] = field(default_factory=dict)
 
     @property

@@ -25,6 +25,8 @@ from .audio import (
     speech_ratio,
     trim_audio_in_place,
     write_clip,
+    has_video_stream,
+    write_video_clip,
 )
 from .config import OUTPUT_ROOT, WORK_ROOT, ensure_local_assets
 from .filters import OverlapDetector, SingingDetector
@@ -47,9 +49,15 @@ LOGGER = logging.getLogger(__name__)
 @dataclass
 class PipelineOptions:
     speaker_threshold: float = 0.68
-    # Silence gaps up to this duration may be retained inside one verified
-    # speaker turn. Longer gaps remain hard sentence boundaries.
+    # Silence gaps in [silence_min_seconds, silence_split_seconds] remain
+    # separate until the two-side speaker check explicitly joins them. Gaps
+    # below the lower bound are treated as one continuous speech island; gaps
+    # above the upper bound are hard sentence boundaries.
+    silence_min_seconds: float = 0.20
     silence_split_seconds: float = 0.85
+    # Public name used by the UI and manifests. ``silence_split_seconds`` is
+    # retained as the internal/backward-compatible upper-bound name.
+    silence_max_seconds: float | None = None
     overlap_threshold: float = 0.35
     singing_threshold: float = 0.22
     # Keep short turns long enough to reach speaker verification.  The final
@@ -61,7 +69,23 @@ class PipelineOptions:
     keep_rejected: bool = False
     use_singing_detector: bool = True
     use_overlap_detector: bool = True
+    # Export every cleaned silence-delimited sentence instead of applying the
+    # target-speaker gate. This is an explicit manual-review mode.
+    export_all_sentences: bool = False
+    # When the source is a video, also export matching original-media clips.
+    export_video_clips: bool = False
     cleanup_work: bool = False
+
+    def __post_init__(self) -> None:
+        if self.silence_max_seconds is None:
+            self.silence_max_seconds = float(self.silence_split_seconds)
+        else:
+            self.silence_split_seconds = float(self.silence_max_seconds)
+        self.silence_min_seconds = float(self.silence_min_seconds)
+        if self.silence_min_seconds < 0.0:
+            raise ValueError("静音下限不能小于 0 秒")
+        if self.silence_split_seconds < self.silence_min_seconds:
+            raise ValueError("静音下限不能大于静音上限")
 
 
 ProgressCallback = Callable[[float, str], None]
@@ -581,14 +605,54 @@ class ExtractionPipeline:
             return False
         primary = match.primary
         secondary = match.secondary
+        if duration < 0.75:
+            local_window_score = min(
+                primary.window_p20_score,
+                secondary.window_p20_score,
+            )
+            local_window_vote = min(
+                primary.window_vote_ratio,
+                secondary.window_vote_ratio,
+            )
+        else:
+            local_window_score = max(
+                primary.window_p20_score,
+                secondary.window_p20_score,
+            )
+            local_window_vote = max(
+                primary.window_vote_ratio,
+                secondary.window_vote_ratio,
+            )
         return (
             primary.score >= max(0.52, threshold - 0.16)
             and secondary.score >= max(0.48, threshold - 0.20)
             and primary.reference_max_score >= 0.48
             and secondary.reference_max_score >= 0.40
             and match.paired_reference_median >= 0.44
-            and max(primary.window_p20_score, secondary.window_p20_score) >= 0.34
-            and max(primary.window_vote_ratio, secondary.window_vote_ratio) >= 0.25
+            and local_window_score >= 0.34
+            and local_window_vote >= 0.25
+        )
+
+    @staticmethod
+    def _short_edge_can_join(
+        candidate: CandidateSentence,
+        complete_edge_seconds: float,
+    ) -> bool:
+        """Require explicit evidence before joining a short rejected side."""
+
+        if candidate.duration < complete_edge_seconds:
+            return bool(candidate.diagnostics.get("short_edge_evidence"))
+        return bool(
+            candidate.diagnostics.get("short_edge_evidence")
+            or candidate.diagnostics.get("speaker_tier") == "recall"
+            or (
+                float(candidate.diagnostics.get("eres_score", 0.0)) >= 0.50
+                and float(candidate.diagnostics.get("camplus_score", 0.0)) >= 0.50
+                and float(
+                    candidate.diagnostics.get("paired_reference_median", 0.0)
+                )
+                >= 0.40
+            )
         )
 
     def _verify_short_edge_candidate(
@@ -1394,39 +1458,92 @@ class ExtractionPipeline:
             if target_spans and coverage < 0.55:
                 continue
 
+            # Audit both missing sides independently.  The previous code chose
+            # either the head or tail, so a candidate clipped on both ends
+            # could never recover the second valid side.
+            edge_results: list[tuple[str, TimeSpan, float]] = []
+            edge_details: list[dict[str, object]] = []
             if candidate.start > source.start + 0.05:
-                edge_span = TimeSpan(source.start, candidate.start)
-            else:
-                edge_span = TimeSpan(candidate.end, source.end)
-            edge_match = self._verify_speaker_span(
-                verifier,
-                waveform,
-                edge_span,
-                profile,
-                threshold,
-            )
-            edge_coverage = self._target_coverage(edge_span, target_spans)
-            if not (
-                edge_coverage >= 0.70
-                or self._target_side_recovery_support(
-                    edge_match,
-                    edge_span.duration,
-                    threshold,
+                edge_results.append(
+                    ("head", TimeSpan(source.start, candidate.start), 0.0)
                 )
-            ):
-                continue
-            edge_exclusion = verifier.exclusion_audit(
-                edge_match,
-                profile,
-                exclusion_profiles,
-            )
-            if edge_exclusion and edge_exclusion.get("excluded_role_rejected"):
+            if source.end > candidate.end + 0.05:
+                edge_results.append(
+                    ("tail", TimeSpan(candidate.end, source.end), 0.0)
+                )
+            if not edge_results:
                 continue
 
+            supported_edges: list[tuple[str, TimeSpan, float]] = []
+            for edge_kind, edge_span, _ in edge_results:
+                edge_match = self._verify_speaker_span(
+                    verifier,
+                    waveform,
+                    edge_span,
+                    profile,
+                    threshold,
+                )
+                edge_coverage = self._target_coverage(edge_span, target_spans)
+                # Locator coverage is only a hint. It cannot promote an edge
+                # whose independent speaker identity check failed.
+                edge_supported = (
+                    edge_match.accepted
+                    or self._target_side_recovery_support(
+                        edge_match,
+                        edge_span.duration,
+                        threshold,
+                    )
+                    or self._short_edge_recovery_support(
+                        edge_match,
+                        edge_span.duration,
+                        threshold,
+                    )
+                )
+                edge_exclusion = verifier.exclusion_audit(
+                    edge_match,
+                    profile,
+                    exclusion_profiles,
+                )
+                if edge_exclusion and edge_exclusion.get("excluded_role_rejected"):
+                    edge_supported = False
+                edge_details.append(
+                    {
+                        "edge": edge_kind,
+                        "start": edge_span.start,
+                        "end": edge_span.end,
+                        "duration": round(edge_span.duration, 5),
+                        "target_coverage": round(edge_coverage, 5),
+                        "supported": edge_supported,
+                        "excluded": bool(
+                            edge_exclusion
+                            and edge_exclusion.get("excluded_role_rejected")
+                        ),
+                    }
+                )
+                if edge_supported:
+                    supported_edges.append(
+                        (edge_kind, edge_span, edge_coverage)
+                    )
+            if not supported_edges:
+                continue
+
+            expanded_start = min(
+                [candidate.start]
+                + [edge.start for _kind, edge, _coverage in supported_edges]
+            )
+            expanded_end = max(
+                [candidate.end]
+                + [edge.end for _kind, edge, _coverage in supported_edges]
+            )
+            expanded_span = TimeSpan(expanded_start, expanded_end)
+            expanded_extension = expanded_span.duration - candidate.duration
+            if not 0.05 <= expanded_extension <= maximum_extension:
+                continue
+            expanded_coverage = self._target_coverage(expanded_span, target_spans)
             match = self._verify_speaker_span(
                 verifier,
                 waveform,
-                source,
+                expanded_span,
                 profile,
                 threshold,
             )
@@ -1440,7 +1557,7 @@ class ExtractionPipeline:
             if exclusion and exclusion.get("excluded_role_rejected"):
                 continue
 
-            expanded = CandidateSentence(source.start, source.end, "")
+            expanded = CandidateSentence(expanded_span.start, expanded_span.end, "")
             expanded.diagnostics.update(candidate.diagnostics)
             self._apply_speaker_match(expanded, match, profile, threshold)
             expanded.diagnostics.update(
@@ -1448,11 +1565,21 @@ class ExtractionPipeline:
                     "same_turn_edge_recovery": True,
                     "same_turn_source_start": source.start,
                     "same_turn_source_end": source.end,
-                    "same_turn_extension_seconds": round(extension, 5),
-                    "same_turn_edge_start": edge_span.start,
-                    "same_turn_edge_end": edge_span.end,
-                    "same_turn_edge_coverage": round(edge_coverage, 5),
-                    "target_coverage": round(coverage, 5),
+                    "same_turn_extension_seconds": round(expanded_extension, 5),
+                    "same_turn_edge_sides": [
+                        kind for kind, _edge, _edge_coverage in supported_edges
+                    ],
+                    "same_turn_edge_details": edge_details,
+                    "same_turn_edge_start": min(
+                        edge.start for _kind, edge, _coverage in supported_edges
+                    ),
+                    "same_turn_edge_end": max(
+                        edge.end for _kind, edge, _coverage in supported_edges
+                    ),
+                    "same_turn_edge_coverage": round(
+                        max(coverage, expanded_coverage), 5
+                    ),
+                    "target_coverage": round(expanded_coverage, 5),
                 }
             )
             if exclusion is not None:
@@ -1527,18 +1654,9 @@ class ExtractionPipeline:
             candidate
             for candidate in rejected
             if candidate.reject_reason in {"声纹匹配不足", "说话回合过短"}
-            and (
-                bool(candidate.diagnostics.get("short_edge_evidence"))
-                or candidate.diagnostics.get("speaker_tier") == "recall"
-                or (
-                    candidate.duration >= 1.20
-                    and float(candidate.diagnostics.get("eres_score", 0.0)) >= 0.50
-                    and float(candidate.diagnostics.get("camplus_score", 0.0)) >= 0.50
-                    and float(
-                        candidate.diagnostics.get("paired_reference_median", 0.0)
-                    )
-                    >= 0.40
-                )
+            and self._short_edge_can_join(
+                candidate,
+                max(1.20, self.options.min_output_seconds),
             )
             and not any(
                 min(candidate.end, accepted.end) - max(candidate.start, accepted.start)
@@ -3683,13 +3801,23 @@ class ExtractionPipeline:
         progress: ProgressCallback,
         *,
         create_archive: bool = True,
+        source_media: Path | None = None,
     ) -> tuple[Path, Path, Path]:
         output_dir = paths["output"]
         output_dir.mkdir(parents=True, exist_ok=True)
         audio_dir = output_dir / "audio"
         text_dir = output_dir / "text"
+        video_dir = output_dir / "video"
         audio_dir.mkdir(exist_ok=True)
         text_dir.mkdir(exist_ok=True)
+        video_source = None
+        if self.options.export_video_clips and source_media is not None:
+            try:
+                if has_video_stream(source_media):
+                    video_source = source_media
+                    video_dir.mkdir(exist_ok=True)
+            except (OSError, RuntimeError) as exc:
+                LOGGER.warning("视频流检测失败，跳过视频片段：%s", exc)
         for index, candidate in enumerate(accepted, start=1):
             stem_name = f"{index:04d}_{_safe_name(candidate.text or candidate.whisper_text)}"
             audio_path = audio_dir / f"{stem_name}.wav"
@@ -3705,6 +3833,10 @@ class ExtractionPipeline:
             text_path.write_text(candidate.text or candidate.whisper_text, encoding="utf-8")
             candidate.audio_file = str(audio_path.relative_to(output_dir))
             candidate.text_file = str(text_path.relative_to(output_dir))
+            if video_source is not None:
+                video_path = video_dir / f"{stem_name}.mp4"
+                write_video_clip(video_source, video_path, candidate.start, candidate.end)
+                candidate.video_file = str(video_path.relative_to(output_dir))
             progress(0.94 + 0.05 * index / max(1, len(accepted)), f"导出句子 {index}/{len(accepted)}")
 
         if self.options.keep_rejected and rejected:
@@ -3741,6 +3873,7 @@ class ExtractionPipeline:
         fields = [
             "audio_file",
             "text_file",
+            "video_file",
             "text",
             "language",
             "start",
@@ -3930,11 +4063,20 @@ class ExtractionPipeline:
                 )
                 for group_index, group in enumerate(negative_stem_groups, start=1)
             ]
-            # Every positive silence gap is initially a hard boundary.  Only a
-            # later dual-model same-speaker decision may join the two sides.
+            # The lower bound has a distinct meaning from the upper bound:
+            # sub-threshold VAD gaps are treated as detector jitter inside one
+            # speech island; only gaps in [min, max] remain eligible for the
+            # later dual-model same-speaker join. Gaps above max stay hard
+            # sentence boundaries.
             vad_spans = self._merge_vad_spans(
                 vad_map.get(stem, []),
-                gap=0.0,
+                gap=max(
+                    0.0,
+                    min(
+                        self.options.silence_min_seconds,
+                        self.options.silence_split_seconds,
+                    ),
+                ),
             )
             if not vad_spans:
                 manifest, transcript, archive = self._write_outputs(
@@ -4058,6 +4200,106 @@ class ExtractionPipeline:
                         paths["output"],
                         archive,
                         [],
+                        rejected,
+                        manifest,
+                        transcript,
+                    )
+
+                if self.options.export_all_sentences:
+                    # Manual-review mode deliberately stops before any target
+                    # speaker decision.  The audio has already passed the
+                    # human-singing and overlap filters above; each remaining
+                    # lower-bound-aware silence island is transcribed and
+                    # exported so the user can select the identity by ear.
+                    progress(
+                        0.64,
+                        f"全句模式：按静音切分保留 {len(clean_atomic_spans)} 段，跳过目标声纹筛选",
+                    )
+                    all_candidates = [
+                        CandidateSentence(
+                            span.start,
+                            span.end,
+                            "",
+                            diagnostics={
+                                "all_sentence_export": True,
+                                "speaker_gate_bypassed": True,
+                                "audio_boundary_source": "silence",
+                                "speech_ratio": round(
+                                    speech_ratio(vad_spans, span.start, span.end),
+                                    5,
+                                ),
+                            },
+                        )
+                        for span in clean_atomic_spans
+                    ]
+                    segmenter = WhisperSegmenter(self.device)
+                    transcribed = segmenter.transcribe_spans(
+                        stem,
+                        [TimeSpan(item.start, item.end) for item in all_candidates],
+                        progress=lambda value, message: progress(
+                            0.64 + 0.20 * value, message
+                        ),
+                    )
+                    by_span: dict[int, list[CandidateSentence]] = {}
+                    for fragment in transcribed:
+                        span_index = int(
+                            fragment.diagnostics.get("transcription_span_index", -1)
+                        )
+                        by_span.setdefault(span_index, []).append(fragment)
+                    accepted_all: list[CandidateSentence] = []
+                    for index, candidate in enumerate(all_candidates):
+                        fragments = sorted(
+                            by_span.get(index, []),
+                            key=lambda item: (item.start, item.end),
+                        )
+                        text = ""
+                        languages: list[str] = []
+                        for fragment in fragments:
+                            text = self._join_transcript_text(
+                                text, fragment.whisper_text
+                            )
+                            if fragment.language and fragment.language != "auto":
+                                languages.append(fragment.language)
+                        text = text.strip()
+                        if not text:
+                            candidate.reject_reason = "STT 未返回有效文本"
+                            rejected.append(candidate)
+                            continue
+                        candidate.whisper_text = text
+                        candidate.text = text
+                        candidate.language = _language_from_text(
+                            text,
+                            max(set(languages), key=languages.count)
+                            if languages
+                            else "auto",
+                        )
+                        candidate.accepted = True
+                        candidate.diagnostics.update(
+                            {
+                                "stt_fragment_count": len(fragments),
+                                "stt_multi_fragment_merged": len(fragments) > 1,
+                            }
+                        )
+                        accepted_all.append(candidate)
+                    manifest, transcript, archive = self._write_outputs(
+                        accepted_all,
+                        rejected,
+                        stem,
+                        target.name,
+                        paths,
+                        progress,
+                        create_archive=create_archive,
+                        source_media=target,
+                    )
+                    progress(
+                        1.0,
+                        f"全句模式完成：输出 {len(accepted_all)} 段，STT 无文本 {len(rejected)} 段",
+                    )
+                    return PipelineResult(
+                        job_id,
+                        paths["output"],
+                        archive,
+                        accepted_all,
                         rejected,
                         manifest,
                         transcript,
@@ -5202,6 +5444,7 @@ class ExtractionPipeline:
                 paths,
                 progress,
                 create_archive=create_archive,
+                source_media=target,
             )
             progress(1.0, f"完成：保留 {len(accepted)} 句，舍弃 {len(rejected)} 句")
             return PipelineResult(job_id, paths["output"], archive, accepted, rejected, manifest, transcript)
@@ -5275,6 +5518,8 @@ class ExtractionPipeline:
                         sentence.audio_file = str(Path(destination_name) / sentence.audio_file)
                     if sentence.text_file:
                         sentence.text_file = str(Path(destination_name) / sentence.text_file)
+                    if sentence.video_file:
+                        sentence.video_file = str(Path(destination_name) / sentence.video_file)
                 result.output_dir = destination
                 result.manifest_path = destination / old_manifest_rel
                 result.transcript_path = destination / old_transcript_rel
@@ -5332,6 +5577,7 @@ class ExtractionPipeline:
                 "target",
                 "audio_file",
                 "text_file",
+                "video_file",
                 "text",
                 "language",
                 "start",

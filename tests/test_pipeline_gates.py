@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from extractor.pipeline import ExtractionPipeline
+from extractor.pipeline import ExtractionPipeline, PipelineOptions
 from extractor.speaker import LocalSpeakerTurnSplitter, SpeakerBoundary
 from extractor.types import CandidateSentence, TimeSpan
 
@@ -129,6 +129,20 @@ class AnimeRecoveryGateTests(unittest.TestCase):
 
 
 class MultiscaleBoundaryTests(unittest.TestCase):
+    def test_silence_lower_bound_merges_detector_jitter(self) -> None:
+        spans = [
+            TimeSpan(0.00, 1.00),
+            TimeSpan(1.12, 2.00),
+            TimeSpan(2.50, 3.00),
+        ]
+        merged = ExtractionPipeline._merge_vad_spans(spans, gap=0.20)
+        self.assertEqual(merged, [TimeSpan(0.00, 2.00), TimeSpan(2.50, 3.00)])
+
+    def test_pipeline_options_keep_public_silence_upper_bound(self) -> None:
+        options = PipelineOptions(silence_min_seconds=0.25, silence_max_seconds=0.90)
+        self.assertEqual(options.silence_split_seconds, 0.90)
+        self.assertEqual(options.silence_max_seconds, 0.90)
+
     def test_serialized_boundary_requires_cross_model_or_legacy_corroboration(self) -> None:
         self.assertTrue(
             ExtractionPipeline._is_reliable_boundary_record(

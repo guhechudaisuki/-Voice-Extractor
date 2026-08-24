@@ -52,6 +52,25 @@ def probe_duration(path: Path) -> float:
     return float(data["format"]["duration"])
 
 
+def has_video_stream(path: Path) -> bool:
+    """Return whether a media file contains a video stream."""
+    result = _run(
+        [
+            str(FFPROBE),
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=index",
+            "-of",
+            "csv=p=0",
+            str(path),
+        ]
+    )
+    return bool(result.stdout.strip())
+
+
 def normalize_audio(source: Path, destination: Path, sample_rate: int = 44100, stereo: bool = True) -> Path:
     destination.parent.mkdir(parents=True, exist_ok=True)
     channels = "2" if stereo else "1"
@@ -214,6 +233,54 @@ def write_clip(
             clip = np.clip(finite, -1.0, 1.0)
     destination.parent.mkdir(parents=True, exist_ok=True)
     sf.write(str(destination), clip, sr, subtype="PCM_16")
+    return destination
+
+
+def write_video_clip(
+    source: Path,
+    destination: Path,
+    start: float,
+    end: float,
+) -> Path:
+    """Render an accurately bounded preview clip from a source video.
+
+    The bundled FFmpeg build does not guarantee libx264, so use its portable
+    MPEG-4 encoder. Seeking is placed after ``-i`` and the clip is re-encoded
+    to avoid keyframe-aligned boundaries from ``-c copy``.
+    """
+    duration = max(0.01, end - start)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    _run(
+        [
+            str(FFMPEG),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(source),
+            "-ss",
+            f"{max(0.0, start):.3f}",
+            "-t",
+            f"{duration:.3f}",
+            "-map",
+            "0:v:0?",
+            "-map",
+            "0:a:0?",
+            "-sn",
+            "-dn",
+            "-c:v",
+            "mpeg4",
+            "-q:v",
+            "3",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-shortest",
+            str(destination),
+        ]
+    )
     return destination
 
 
