@@ -386,7 +386,12 @@ class ExtractionPipeline:
                 min(gap_end, dirty.end) - max(gap_start, dirty.start) > 0.01
                 for dirty in blocked
             )
-            if span.start <= previous.end + gap and not crosses_blocked:
+            distance = span.start - previous.end
+            # A zero/negative distance is already contiguous. For a positive
+            # gap, the lower-bound interval stays separate at the exact
+            # threshold; only a gap strictly below ``gap`` is detector jitter.
+            joins_by_gap = distance <= 0.0 or distance < max(0.0, gap - 1e-6)
+            if joins_by_gap and not crosses_blocked:
                 merged[-1] = TimeSpan(previous.start, max(previous.end, span.end))
             else:
                 merged.append(span)
@@ -654,6 +659,43 @@ class ExtractionPipeline:
                 >= 0.40
             )
         )
+
+    @staticmethod
+    def _short_seed_groups(
+        candidates: Iterable[CandidateSentence],
+        maximum_gap: float,
+        minimum_duration: float,
+    ) -> list[list[CandidateSentence]]:
+        """Group adjacent independently supported short islands.
+
+        These groups are only seeds. The caller still has to pass the joined
+        span through the complete dual-model speaker and exclusion gates before
+        it can become an output sentence.
+        """
+
+        ordered = sorted(candidates, key=lambda item: (item.start, item.end))
+        groups: list[list[CandidateSentence]] = []
+        current: list[CandidateSentence] = []
+
+        def flush() -> None:
+            if (
+                len(current) >= 2
+                and current[-1].end - current[0].start >= minimum_duration
+            ):
+                groups.append(list(current))
+
+        for candidate in ordered:
+            if not current:
+                current = [candidate]
+                continue
+            gap = candidate.start - current[-1].end
+            if gap <= maximum_gap:
+                current.append(candidate)
+            else:
+                flush()
+                current = [candidate]
+        flush()
+        return groups
 
     def _verify_short_edge_candidate(
         self,
@@ -1624,7 +1666,14 @@ class ExtractionPipeline:
         the complete joined sentence passes formal verification again.
         """
 
-        if not accepted_turns:
+        pending_short = [
+            candidate
+            for candidate in rejected
+            if candidate.reject_reason == "说话回合过短"
+            and candidate.diagnostics.get("short_edge_pending")
+            and candidate.duration >= 0.20
+        ]
+        if not accepted_turns and len(pending_short) < 2:
             return 0
         accepted_ids = {id(candidate) for candidate in accepted_turns}
         # Do not run speaker models for every tiny VAD island in an episode.
@@ -1632,13 +1681,18 @@ class ExtractionPipeline:
         # turn, so score those pending edges on demand here.
         pending_edges = [
             candidate
-            for candidate in rejected
-            if candidate.reject_reason == "说话回合过短"
-            and candidate.diagnostics.get("short_edge_pending")
-            and any(
-                0.0 <= candidate.start - accepted.end <= self.options.silence_split_seconds
-                or 0.0 <= accepted.start - candidate.end <= self.options.silence_split_seconds
-                for accepted in accepted_turns
+            for candidate in pending_short
+            if any(
+                other is not candidate
+                and (
+                    0.0
+                    <= candidate.start - other.end
+                    <= self.options.silence_split_seconds
+                    or 0.0
+                    <= other.start - candidate.end
+                    <= self.options.silence_split_seconds
+                )
+                for other in [*accepted_turns, *pending_short]
             )
         ]
         for candidate in pending_edges:
@@ -1687,6 +1741,18 @@ class ExtractionPipeline:
                 candidate = min(right, key=lambda item: item.start)
                 edge_by_id[id(candidate)] = candidate
         recall_edges = list(edge_by_id.values())
+        recall_ids = {id(candidate) for candidate in recall_edges}
+        short_only_edges = [
+            candidate
+            for candidate in possible_edges
+            if id(candidate) not in recall_ids
+        ]
+        for group in self._short_seed_groups(
+            short_only_edges,
+            self.options.silence_split_seconds,
+            max(1.20, self.options.min_output_seconds),
+        ):
+            recall_edges.extend(group)
         pool = sorted(
             [*accepted_turns, *recall_edges],
             key=lambda item: (item.start, item.end),
@@ -1717,7 +1783,13 @@ class ExtractionPipeline:
             strict_members = [
                 candidate for candidate in members if id(candidate) in accepted_ids
             ]
-            if not strict_members:
+            short_seed_members = [
+                candidate
+                for candidate in members
+                if candidate.diagnostics.get("short_edge_evidence")
+            ]
+            short_only = not strict_members
+            if short_only and len(short_seed_members) < 2:
                 continue
             if len(members) == 1:
                 output.append(strict_members[0])
@@ -1726,10 +1798,15 @@ class ExtractionPipeline:
             coverage = self._target_coverage(merged_span, target_spans)
             if (
                 merged_span.duration > min(20.0, self.options.max_sentence_seconds)
-                or coverage < 0.30
+                or (coverage < 0.30 and not short_only)
+                or (
+                    short_only
+                    and merged_span.duration < max(1.20, self.options.min_output_seconds)
+                )
             ):
-                output.extend(strict_members)
-                used_accepted_ids.update(id(candidate) for candidate in strict_members)
+                if strict_members:
+                    output.extend(strict_members)
+                    used_accepted_ids.update(id(candidate) for candidate in strict_members)
                 continue
             match = self._verify_speaker_span(
                 verifier,
@@ -1759,6 +1836,7 @@ class ExtractionPipeline:
                     "post_target_silence_merge": True,
                     "merged_strict_target_count": len(strict_members),
                     "merged_recall_edge_count": len(members) - len(strict_members),
+                    "short_seed_merge": short_only,
                     "target_coverage": round(coverage, 5),
                     "speech_ratio": round(
                         speech_ratio(vad_spans, merged_span.start, merged_span.end),
@@ -4337,7 +4415,10 @@ class ExtractionPipeline:
                     context_seconds=1.20,
                     scan_hop_seconds=0.30,
                     minimum_similarity_drop=0.08,
-                    minimum_separation_seconds=0.70,
+                    # Do not collapse corroborated boundaries around a short
+                    # reply into one change point. The downstream whole-span
+                    # gate is stricter than this discovery pass.
+                    minimum_separation_seconds=0.30,
                     progress=lambda value, message: progress(0.63 + 0.07 * value, message),
                 )
                 target_spans = verifier.locate_target_spans(

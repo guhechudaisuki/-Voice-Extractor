@@ -138,6 +138,32 @@ class MultiscaleBoundaryTests(unittest.TestCase):
         merged = ExtractionPipeline._merge_vad_spans(spans, gap=0.20)
         self.assertEqual(merged, [TimeSpan(0.00, 2.00), TimeSpan(2.50, 3.00)])
 
+    def test_silence_lower_bound_exact_value_stays_separate(self) -> None:
+        spans = [TimeSpan(0.00, 1.00), TimeSpan(1.20, 2.00)]
+        self.assertEqual(
+            ExtractionPipeline._merge_vad_spans(spans, gap=0.20),
+            spans,
+        )
+
+    def test_short_seed_groups_need_a_complete_joined_duration(self) -> None:
+        first = CandidateSentence(0.0, 0.45, "")
+        second = CandidateSentence(0.60, 1.15, "")
+        first.diagnostics["short_edge_evidence"] = True
+        second.diagnostics["short_edge_evidence"] = True
+        self.assertEqual(
+            ExtractionPipeline._short_seed_groups(
+                [first, second], maximum_gap=0.85, minimum_duration=1.20
+            ),
+            [],
+        )
+        third = CandidateSentence(1.30, 1.85, "")
+        third.diagnostics["short_edge_evidence"] = True
+        groups = ExtractionPipeline._short_seed_groups(
+            [first, second, third], maximum_gap=0.85, minimum_duration=1.20
+        )
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(len(groups[0]), 3)
+
     def test_pipeline_options_keep_public_silence_upper_bound(self) -> None:
         options = PipelineOptions(silence_min_seconds=0.25, silence_max_seconds=0.90)
         self.assertEqual(options.silence_split_seconds, 0.90)
@@ -237,6 +263,14 @@ class MultiscaleBoundaryTests(unittest.TestCase):
         self.assertEqual(boundaries[0].scale_votes, 2)
         self.assertEqual(boundaries[0].scale_contexts, (0.7, 0.9))
         self.assertTrue(ExtractionPipeline._is_structural_boundary(boundaries[0]))
+
+    def test_boundary_at_minimum_separation_is_not_collapsed(self) -> None:
+        first = SpeakerBoundary(2.00, 0.20, 0.10, 0.80, 0.20, 0.20)
+        second = SpeakerBoundary(2.30, 0.18, 0.08, 0.82, 0.20, 0.20)
+        collapsed = LocalSpeakerTurnSplitter._collapse_candidates(
+            [first, second], minimum_separation_seconds=0.30
+        )
+        self.assertEqual(len(collapsed), 2)
 
     def test_single_scale_boundary_is_not_structural(self) -> None:
         boundary = SpeakerBoundary(10.0, 0.22, 0.18, 0.8, 0.2, 0.1)

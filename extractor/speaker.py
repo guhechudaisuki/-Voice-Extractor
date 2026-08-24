@@ -2056,7 +2056,13 @@ class LocalSpeakerTurnSplitter:
             return []
         groups: list[list[SpeakerBoundary]] = [[candidates[0]]]
         for candidate in candidates[1:]:
-            if candidate.time - groups[-1][-1].time <= minimum_separation_seconds:
+            # Keep a boundary exactly at the configured separation. This
+            # avoids swallowing a short reply when two corroborated change
+            # points happen to land on the same sampling interval.
+            if (
+                candidate.time - groups[-1][-1].time
+                < max(0.0, minimum_separation_seconds - 1e-6)
+            ):
                 groups[-1].append(candidate)
             else:
                 groups.append([candidate])
