@@ -17,8 +17,10 @@ from desktop_bootstrap import (
     BootstrapContext,
     CUDA_OFFICIAL_URL,
     PYTORCH_OFFICIAL_URL,
+    finalize_inspected_context,
     install_python_runtime,
     inspect_installation,
+    load_cached_context,
     prepare_context,
     suggested_install_root,
 )
@@ -62,8 +64,16 @@ class VoiceExtractorDesktop:
         self.targets: list[str] = []
         self.negative_roles: list[list[str]] = []
 
-        self.install_root_var = tk.StringVar(value=str(suggested_install_root()))
-        self.python_var = tk.StringVar(value="等待完整扫描……")
+        initial_install_root = suggested_install_root()
+        try:
+            cached_context = load_cached_context(initial_install_root)
+        except Exception:
+            cached_context = None
+
+        self.install_root_var = tk.StringVar(value=str(initial_install_root))
+        self.python_var = tk.StringVar(
+            value=str(cached_context.python) if cached_context else "等待完整扫描……"
+        )
         self.setup_summary_var = tk.StringVar(value="正在扫描本地环境……")
         self.setup_status_var = tk.StringVar(value="准备检查")
         self.main_status_var = tk.StringVar(value="等待任务")
@@ -83,7 +93,10 @@ class VoiceExtractorDesktop:
         self._build_main_page()
         self.main_page.pack_forget()
         self._append_setup_log("Voice Extractor 原生桌面版")
-        self.root.after(150, self._start_scan)
+        if cached_context is not None:
+            self._show_main(cached_context, from_cache=True)
+        else:
+            self.root.after(150, self._start_scan)
         self.root.after(100, self._poll_events)
 
     def _configure_style(self) -> None:
@@ -619,6 +632,9 @@ class VoiceExtractorDesktop:
         if not result.get("scan_complete"):
             self._start_scan()
             return
+        if result.get("ready"):
+            self._start_finalize_inspection()
+            return
         if result.get("python_install_required"):
             self._start_python_install()
             return
@@ -680,6 +696,59 @@ class VoiceExtractorDesktop:
                 self.events.put(("boot_error", str(exc)))
 
         threading.Thread(target=worker, name="desktop-bootstrap", daemon=True).start()
+
+    def _start_finalize_inspection(self) -> None:
+        if self.boot_running:
+            return
+        result = self.last_scan_result
+        if not result.get("ready"):
+            return
+        self.boot_running = True
+        self.install_button.configure(state="disabled")
+        self.rescan_button.configure(state="disabled")
+        self.runtime_help_button.configure(state="disabled")
+        self.setup_status_var.set("全部依赖已满足，正在保存永久缓存……")
+        install_root = Path(self.install_root_var.get()).expanduser()
+
+        def reporter(value: float, message: str) -> None:
+            self.events.put(("boot_progress", (value, message)))
+
+        def worker() -> None:
+            try:
+                context = finalize_inspected_context(
+                    install_root,
+                    result,
+                    reporter,
+                )
+                self.events.put(("boot_complete", context))
+            except Exception as exc:
+                self.events.put(("boot_error", str(exc)))
+
+        threading.Thread(
+            target=worker,
+            name="desktop-cache-finalize",
+            daemon=True,
+        ).start()
+
+    def _prompt_install_missing(self) -> None:
+        result = self.last_scan_result
+        if not result.get("scan_complete") or result.get("ready"):
+            return
+        missing = [
+            getattr(item, "label", str(item))
+            for item in result.get("missing", [])
+        ]
+        missing.extend(str(value) for value in result.get("supplementary_missing", []))
+        detail = "、".join(missing) if missing else "部分运行依赖"
+        size = int(result.get("missing_mb", 0))
+        message = f"检测到缺失依赖：{detail}。"
+        if size:
+            message += f"\n预计下载约 {size / 1024:.2f} GB。"
+        message += "\n\n是否现在安装缺失项？"
+        if messagebox.askyesno("安装缺失依赖", message):
+            self._continue_setup()
+        else:
+            self.setup_status_var.set("已取消安装；可稍后点击“安装缺失项”")
 
     def _show_runtime_requirement_dialog(self) -> None:
         result = self.last_scan_result
@@ -778,14 +847,24 @@ class VoiceExtractorDesktop:
         dialog.geometry(f"+{max(0, x)}+{max(0, y)}")
         dialog.grab_set()
 
-    def _show_main(self, context: BootstrapContext) -> None:
+    def _show_main(
+        self,
+        context: BootstrapContext,
+        from_cache: bool = False,
+    ) -> None:
         self.context = context
         self.output_root_var.set(str(context.layout.output))
         self.setup_page.pack_forget()
         self.main_page.pack(fill="both", expand=True)
-        self.main_status_var.set("本地模型与运行环境已就绪")
+        self.main_status_var.set(
+            "已读取永久依赖缓存，直接启动"
+            if from_cache
+            else "本地模型与运行环境已就绪"
+        )
         self._append_job_log(f"安装目录：{context.layout.root}")
         self._append_job_log(f"本地 Python：{context.python}")
+        if from_cache:
+            self._append_job_log("已跳过重复依赖检查并直接进入主界面")
 
     def _add_paths(self, values: list[str], listbox: tk.Listbox, filetypes) -> None:
         selected = filedialog.askopenfilenames(filetypes=filetypes)
@@ -1199,13 +1278,15 @@ class VoiceExtractorDesktop:
                         self.runtime_help_button.configure(state="normal")
                         self.root.after(150, self._show_runtime_requirement_dialog)
                     elif result.get("ready"):
-                        self.setup_status_var.set("扫描完成：全部资源可用，请决定是否开始使用")
-                        self.install_button.configure(text="开始使用", state="normal")
+                        self.setup_status_var.set("扫描完成：全部依赖满足，正在直接进入主界面")
+                        self.install_button.configure(text="正在进入", state="disabled")
                         self.runtime_help_button.configure(state="disabled")
+                        self.root.after(50, self._start_finalize_inspection)
                     else:
-                        self.setup_status_var.set("扫描完成：请决定是否安装全部缺失项")
+                        self.setup_status_var.set("扫描完成：发现缺失依赖")
                         self.install_button.configure(text="安装缺失项", state="normal")
                         self.runtime_help_button.configure(state="disabled")
+                        self.root.after(150, self._prompt_install_missing)
                 elif event_type == "scan_error":
                     self.scan_running = False
                     self.rescan_button.configure(state="normal")
@@ -1229,7 +1310,9 @@ class VoiceExtractorDesktop:
                 elif event_type == "boot_error":
                     self.boot_running = False
                     self.rescan_button.configure(state="normal")
-                    if self.last_scan_result.get("python_install_required"):
+                    if self.last_scan_result.get("ready"):
+                        self.install_button.configure(text="重试进入", state="normal")
+                    elif self.last_scan_result.get("python_install_required"):
                         self.install_button.configure(text="自动安装 Python", state="normal")
                     elif self.last_scan_result.get("runtime_ready"):
                         self.install_button.configure(text="安装缺失项", state="normal")

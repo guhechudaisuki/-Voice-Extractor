@@ -16,8 +16,9 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 
-APP_VERSION = "2026.08.25-desktop-2"
+APP_VERSION = "2026.08.25-desktop-3"
 APP_NAME = "Voice Extractor"
+CACHE_SCHEMA_VERSION = 1
 GLOBAL_SETTINGS = (
     Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
     / "VoiceExtractor"
@@ -388,12 +389,25 @@ def save_settings(
     layout: InstallLayout,
     python: Path,
     assets: dict[str, Path],
+    *,
+    gpt_root: Path | None = None,
+    ffmpeg: Path | None = None,
+    ffprobe: Path | None = None,
+    uvr_code: Path | None = None,
+    sv_code: Path | None = None,
 ) -> None:
     payload = {
         "version": APP_VERSION,
+        "cache_schema": CACHE_SCHEMA_VERSION,
+        "complete": True,
         "install_root": str(layout.root),
         "python": str(python),
         "assets": {key: str(path) for key, path in assets.items()},
+        "gpt_root": str(gpt_root) if gpt_root else "",
+        "ffmpeg": str(ffmpeg) if ffmpeg else "",
+        "ffprobe": str(ffprobe) if ffprobe else "",
+        "uvr_code": str(uvr_code) if uvr_code else "",
+        "sv_code": str(sv_code) if sv_code else "",
     }
     layout.settings_path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2),
@@ -404,6 +418,8 @@ def save_settings(
         json.dumps(
             {
                 "version": APP_VERSION,
+                "cache_schema": CACHE_SCHEMA_VERSION,
+                "complete": True,
                 "install_root": str(layout.root),
                 "python": str(python),
             },
@@ -923,6 +939,25 @@ def _component_ready(spec: ComponentSpec, path: Path) -> bool:
     return _valid_file(path / spec.check_file)
 
 
+def _component_quick_ready(spec: ComponentSpec, path: Path) -> bool:
+    """Cheap cache guard; never hashes weights or imports model libraries."""
+
+    if spec.kind == "whisper":
+        snapshots = path / "models--openai--whisper-large-v3-turbo" / "snapshots"
+        return any(
+            snapshot.is_dir()
+            and (snapshot / "config.json").is_file()
+            and (
+                (snapshot / "model.safetensors").is_file()
+                or (snapshot / "pytorch_model.bin").is_file()
+            )
+            for snapshot in snapshots.glob("*")
+        )
+    if spec.kind == "direct":
+        return all((path / item.filename).is_file() for item in spec.files)
+    return (path / spec.check_file).is_file()
+
+
 def _normalise_component_candidate(spec: ComponentSpec, value: Path) -> Path:
     value = value.expanduser()
     if spec.kind == "whisper":
@@ -1395,6 +1430,168 @@ def inspect_local_tools(
     }
 
 
+def load_cached_context(
+    install_root: Path | None = None,
+) -> BootstrapContext | None:
+    """Restore a successful installation without repeating dependency scans."""
+
+    root = (install_root or suggested_install_root()).expanduser().resolve()
+    layout = InstallLayout(root)
+    settings = _read_json(layout.settings_path)
+    if not settings or settings.get("complete") is False:
+        return None
+    schema = settings.get("cache_schema")
+    if schema not in (None, CACHE_SCHEMA_VERSION):
+        return None
+
+    python_text = str(settings.get("python") or "").strip()
+    if not python_text:
+        return None
+    python = Path(python_text).expanduser()
+    if not python.is_file():
+        return None
+
+    stored_assets = settings.get("assets")
+    if not isinstance(stored_assets, dict):
+        return None
+    assets: dict[str, Path] = {}
+    for spec in COMPONENTS:
+        value = str(stored_assets.get(spec.key) or "").strip()
+        if not value:
+            return None
+        path = Path(value).expanduser()
+        if not _component_quick_ready(spec, path):
+            return None
+        assets[spec.key] = path
+
+    source_root = bundle_source_root()
+    if not (source_root / "desktop_worker.py").is_file():
+        return None
+    gpt_text = str(settings.get("gpt_root") or "").strip()
+    gpt_root = Path(gpt_text).expanduser() if gpt_text else infer_gpt_root(python)
+    if gpt_root is not None and not gpt_root.is_dir():
+        gpt_root = infer_gpt_root(python)
+
+    def cached_file(name: str, fallbacks: Iterable[Path]) -> Path | None:
+        value = str(settings.get(name) or "").strip()
+        candidates = ([Path(value).expanduser()] if value else []) + list(fallbacks)
+        return next((path for path in candidates if path.is_file()), None)
+
+    bundled_tools = source_root / "tools"
+    gpt_runtime = gpt_root / "runtime" if gpt_root else None
+    ffmpeg = cached_file(
+        "ffmpeg",
+        (
+            layout.tools / "ffmpeg.exe",
+            *((gpt_runtime / "ffmpeg.exe",) if gpt_runtime else ()),
+            bundled_tools / "ffmpeg.exe",
+        ),
+    )
+    ffprobe = cached_file(
+        "ffprobe",
+        (
+            layout.tools / "ffprobe.exe",
+            *((gpt_runtime / "ffprobe.exe",) if gpt_runtime else ()),
+            bundled_tools / "ffprobe.exe",
+        ),
+    )
+
+    def cached_directory(name: str, fallbacks: Iterable[Path]) -> Path | None:
+        value = str(settings.get(name) or "").strip()
+        candidates = ([Path(value).expanduser()] if value else []) + list(fallbacks)
+        return next((path for path in candidates if path.is_dir()), None)
+
+    uvr_fallbacks = [source_root / "dependencies" / "uvr5"]
+    sv_fallbacks = [source_root / "dependencies" / "eres2net"]
+    if gpt_root:
+        uvr_fallbacks.append(gpt_root / "tools" / "uvr5")
+        sv_fallbacks.append(gpt_root / "GPT_SoVITS" / "eres2net")
+    uvr_code = cached_directory("uvr_code", uvr_fallbacks)
+    sv_code = cached_directory("sv_code", sv_fallbacks)
+    if ffmpeg is None or ffprobe is None or uvr_code is None or sv_code is None:
+        return None
+
+    layout.prepare()
+    if schema is None or settings.get("complete") is not True:
+        try:
+            save_settings(
+                layout,
+                python,
+                assets,
+                gpt_root=gpt_root,
+                ffmpeg=ffmpeg,
+                ffprobe=ffprobe,
+                uvr_code=uvr_code,
+                sv_code=sv_code,
+            )
+        except OSError:
+            pass
+    return BootstrapContext(
+        source_root=source_root,
+        layout=layout,
+        python=python,
+        assets=assets,
+        uvr_code=uvr_code,
+        sv_code=sv_code,
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        extra_python_paths=[layout.packages],
+    )
+
+
+def finalize_inspected_context(
+    install_root: Path,
+    inspection: dict[str, object],
+    reporter: Reporter,
+) -> BootstrapContext:
+    """Persist an already successful full scan without running it a second time."""
+
+    if not inspection.get("ready"):
+        raise RuntimeError("当前完整扫描尚未满足全部依赖")
+    python_value = inspection.get("python")
+    assets_value = inspection.get("assets")
+    if not python_value or not isinstance(assets_value, dict):
+        raise RuntimeError("完整扫描结果缺少 Python 或模型路径")
+
+    source_root = bundle_source_root()
+    layout = InstallLayout(install_root.expanduser().resolve())
+    layout.prepare()
+    reporter(0.15, "正在保存首次完整检查结果")
+    install_executable(layout)
+    python = Path(str(python_value))
+    assets = {str(key): Path(str(path)) for key, path in assets_value.items()}
+    gpt_value = inspection.get("gpt_root")
+    gpt_root = Path(str(gpt_value)) if gpt_value else infer_gpt_root(python)
+    ffmpeg, ffprobe, uvr_code, sv_code = ensure_local_tools(
+        layout,
+        source_root,
+        gpt_root,
+        reporter,
+    )
+    save_settings(
+        layout,
+        python,
+        assets,
+        gpt_root=gpt_root,
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        uvr_code=uvr_code,
+        sv_code=sv_code,
+    )
+    reporter(1.0, "永久依赖缓存已保存，正在进入主界面")
+    return BootstrapContext(
+        source_root=source_root,
+        layout=layout,
+        python=python,
+        assets=assets,
+        uvr_code=uvr_code,
+        sv_code=sv_code,
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        extra_python_paths=[layout.packages],
+    )
+
+
 def inspect_nvidia_environment() -> dict[str, object]:
     result: dict[str, object] = {
         "driver_available": False,
@@ -1508,7 +1705,16 @@ def prepare_context(
         gpt_root,
         reporter,
     )
-    save_settings(layout, python, assets)
+    save_settings(
+        layout,
+        python,
+        assets,
+        gpt_root=gpt_root,
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        uvr_code=uvr_code,
+        sv_code=sv_code,
+    )
     reporter(1.0, "安装与资源检查完成")
     return BootstrapContext(
         source_root=source_root,

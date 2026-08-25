@@ -22,11 +22,13 @@ Windows 桌面安装程序可从 [GitHub Releases](https://github.com/guhechudai
 1. 启动 `VoiceExtractor.exe`。
 2. 首次启动时只需选择安装目录，不需要填写或选择 `python.exe`。
 3. 程序会完整检查环境变量、`PATH`、Windows `py.exe`、注册表、Conda/venv、常见 Python 安装目录和 GPT-SoVITS runtime，并实际验证 PyTorch、torchaudio 与 CUDA。
-4. 同一次扫描还会检查全部模型、Hugging Face/ModelScope 常见缓存、FFmpeg、UVR 和 ERes2Net 后端。扫描全部结束后才会让用户决定下一步。
+4. 同一次扫描还会检查全部模型、Hugging Face/ModelScope 常见缓存、FFmpeg、UVR 和 ERes2Net 后端。
 5. 如果完全没有 Python，可在结果弹窗中确认自动安装官方 Python 3.9.13；不要求用户填写路径。
 6. 如果 CUDA/PyTorch 未就绪，弹窗可直接打开 PyTorch 或 CUDA 官网，也可以停止安装。本工具不会擅自下载或替换 CUDA/PyTorch。
-7. 已存在的资源只读复用，不移动、不修改、不重复下载；缺失模型和普通 Python 依赖只安装到所选工具目录。
-8. 环境准备完成后进入中文桌面界面，添加参考音频、待提取文件和可选排除人物，确认保存位置后开始提取。
+7. 第一次完整检查若全部满足，会自动保存永久依赖缓存并直接进入主界面，不再询问。
+8. 只有发现缺失依赖时才询问是否安装。已存在的资源只读复用，不移动、不修改、不重复下载。
+9. 后续启动直接读取永久缓存并进入主界面，不再导入 PyTorch 或重新扫描模型；只有缓存对应文件被删除或移动时才重新完整检查。
+10. 进入中文桌面界面后，添加参考音频、待提取文件和可选排除人物，确认保存位置后开始提取。
 
 安装目录结构：
 
