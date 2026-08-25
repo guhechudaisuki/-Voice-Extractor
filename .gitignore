@@ -19,6 +19,11 @@ models/
 work/
 output/
 runtime/
+logs/
+tools/
+python_packages/
+voice_extractor_installation.json
+/VoiceExtractor.exe
 omnvoice/
 GPT-SoVITS*/
 **/hf_cache/
@@ -30,6 +35,7 @@ GPT-SoVITS*/
 *.onnx
 *.safetensors
 *.spec
+!VoiceExtractor.spec
 
 # Audio/video inputs and generated media
 *.wav
