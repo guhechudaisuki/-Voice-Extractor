@@ -52,7 +52,7 @@
 ## 使用
 
 1. 在“参考音频”中选择同一个人的一段或多段讲话。
-2. 在“待提取音频”中选择一个或多个目标音频。
+2. 在“待提取音频或视频”中选择一个或多个目标文件。
 3. 如果某些主要配角色与目标人物音色接近，可点击“添加一个排除角色”，并为每个角色上传一段或多段同一人的讲话。
 4. 保持多人和歌声过滤开启；程序会自动完成多模型分工复核和完整句检查。
 5. 点击开始，等待批次完成。
@@ -61,6 +61,20 @@
 
 - `Start Voice Extractor.bat`：图形界面入口。
 - `extract_cli.py`：批处理入口。
+
+命令行示例：
+
+```powershell
+python extract_cli.py `
+  --reference ref-a.wav --reference ref-b.wav `
+  --target episode-01.mp4 --target episode-02.wav `
+  --threshold 0.68 --silence-min 0.20 --silence-max 0.85 `
+  --video-segments
+```
+
+需要人工从清理后的单句中挑选时，增加 `--all-sentences`；它仍会先过滤歌声、纯音乐和多人重叠，
+但跳过目标人物声纹门，输出每个静音分隔单句及其 STT。视频片段只在目标是视频且指定
+`--video-segments` 时生成。
 
 预构建启动器： [dist/VoiceExtractor.exe](dist/VoiceExtractor.exe)
 
@@ -76,6 +90,9 @@
 ```powershell
 .\dist\VoiceExtractor.exe --check-only
 ```
+
+启动器会在窗口中实时显示检查和服务日志；同样内容会追加保存到 `output\launcher.log`，
+网页服务运行日志保存到 `output\app.log`。
 
 ## 资源清单
 

@@ -361,6 +361,10 @@ with gr.Blocks(title="参考音色句子提取", analytics_enabled=False) as dem
             value=False,
             label="视频输入同时输出视频片段",
         )
+    gr.Markdown(
+        "静音范围说明：短于下限的停顿视为同一句内部停顿；位于下限与上限之间时先切开，"
+        "只有前后声纹确认是同一人时才连同静音重新合并；长于上限的停顿始终强制切成两句。"
+    )
     run_button = gr.Button("开始提取", variant="primary")
     live_progress = gr.Number(value=0, label="总体进度（0-100%）", interactive=False)
     status = gr.Textbox(label="任务状态", lines=5)

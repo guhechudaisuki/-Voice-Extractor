@@ -29,6 +29,28 @@ def main() -> int:
         default=0.68,
         help="声纹阈值，默认 0.68",
     )
+    parser.add_argument(
+        "--silence-min",
+        type=float,
+        default=0.20,
+        help="静音合并下限（秒），默认 0.20",
+    )
+    parser.add_argument(
+        "--silence-max",
+        type=float,
+        default=0.85,
+        help="静音切分上限（秒），默认 0.85",
+    )
+    parser.add_argument(
+        "--all-sentences",
+        action="store_true",
+        help="输出去除歌声/多人后的全部静音单句，跳过目标声纹筛选",
+    )
+    parser.add_argument(
+        "--video-segments",
+        action="store_true",
+        help="目标包含视频时，同时导出对应的视频片段",
+    )
     parser.add_argument("--no-overlap", action="store_true", help="关闭多人重叠检测")
     parser.add_argument("--no-singing", action="store_true", help="关闭唱歌检测")
     args = parser.parse_args()
@@ -39,8 +61,13 @@ def main() -> int:
     batch = ExtractionPipeline(
         PipelineOptions(
             speaker_threshold=args.threshold,
+            silence_min_seconds=args.silence_min,
+            silence_split_seconds=args.silence_max,
+            silence_max_seconds=args.silence_max,
             use_overlap_detector=not args.no_overlap,
             use_singing_detector=not args.no_singing,
+            export_all_sentences=args.all_sentences,
+            export_video_clips=args.video_segments,
         )
     ).run_many(
         [Path(item) for item in args.reference],

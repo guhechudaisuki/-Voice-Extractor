@@ -140,9 +140,6 @@ class SpeakerBoundary:
     confidence: float
     primary_drop: float = 0.0
     secondary_drop: float = 0.0
-    # A boundary returned by the multi-scale audit carries the number of
-    # independent context sizes that observed it.  Ordinary one-pass callers
-    # keep the default value of one.
     scale_votes: int = 1
     scale_contexts: tuple[float, ...] = ()
 
@@ -159,7 +156,9 @@ class SpeakerBoundary:
             "primary_drop": round(float(self.primary_drop), 5),
             "secondary_drop": round(float(self.secondary_drop), 5),
             "scale_votes": int(self.scale_votes),
-            "scale_contexts": [round(float(value), 3) for value in self.scale_contexts],
+            "scale_contexts": [
+                round(float(value), 3) for value in self.scale_contexts
+            ],
         }
 
 
@@ -347,10 +346,7 @@ class SpeakerVerifier:
         if not windows:
             windows = [waveform]
 
-        if len(windows) == 1 and windows[0].numel() == waveform.numel():
-            window_embeddings = whole.unsqueeze(0)
-        else:
-            window_embeddings = self._embeddings_from_waveforms(windows)
+        window_embeddings = self._embeddings_from_waveforms(windows)
         window_scores = [float(value) for value in window_embeddings @ profile.centroid]
         window_tensor = torch.tensor(window_scores)
         minimum = float(window_tensor.min())
@@ -517,10 +513,7 @@ class CAMPlusVerifier:
         if not windows:
             windows = [waveform]
 
-        if len(windows) == 1 and windows[0].numel() == waveform.numel():
-            window_embeddings = whole.unsqueeze(0)
-        else:
-            window_embeddings = self._embeddings_from_waveforms(windows)
+        window_embeddings = self._embeddings_from_waveforms(windows)
         window_scores = [float(value) for value in window_embeddings @ profile.centroid]
         window_tensor = torch.tensor(window_scores)
         minimum = float(window_tensor.min())
@@ -2056,13 +2049,7 @@ class LocalSpeakerTurnSplitter:
             return []
         groups: list[list[SpeakerBoundary]] = [[candidates[0]]]
         for candidate in candidates[1:]:
-            # Keep a boundary exactly at the configured separation. This
-            # avoids swallowing a short reply when two corroborated change
-            # points happen to land on the same sampling interval.
-            if (
-                candidate.time - groups[-1][-1].time
-                < max(0.0, minimum_separation_seconds - 1e-6)
-            ):
+            if candidate.time - groups[-1][-1].time <= minimum_separation_seconds:
                 groups[-1].append(candidate)
             else:
                 groups.append([candidate])
@@ -2277,13 +2264,6 @@ class LocalSpeakerTurnSplitter:
         cluster_seconds: float,
         minimum_context_votes: int,
     ) -> list[SpeakerBoundary]:
-        """Collapse nearby observations and retain only cross-scale changes.
-
-        A single context can mistake an accent, breath, or short phoneme for a
-        change of speaker.  Distinct context sizes are treated as independent
-        observations; repeated hits from one scale do not increase confidence.
-        """
-
         if not detections:
             return []
         ordered = sorted(detections, key=lambda item: item[1].time)
@@ -2302,7 +2282,8 @@ class LocalSpeakerTurnSplitter:
             representative = min(
                 (boundary for _context, boundary in group),
                 key=lambda item: (
-                    item.primary_similarity + (item.secondary_similarity or 1.0),
+                    item.primary_similarity
+                    + (item.secondary_similarity or 1.0),
                     -item.confidence,
                 ),
             )
@@ -2336,27 +2317,17 @@ class LocalSpeakerTurnSplitter:
         minimum_separation_seconds: float = 0.20,
         progress: Callable[[float, str], None] | None = None,
     ) -> list[SpeakerBoundary]:
-        """Find speaker changes that survive multiple context sizes.
-
-        The method is deliberately an audit, not a new speaker clustering
-        model.  A boundary must be observed by at least two distinct context
-        sizes before callers may split or veto a candidate around it.
-        """
+        """Keep only speaker changes reproduced at multiple context sizes."""
 
         if not contexts:
             return []
         if cluster_seconds < 0.0:
-            raise ValueError("多尺度边界聚类窗口不能小于 0 秒")
+            raise ValueError("multiscale boundary cluster must be non-negative")
         if minimum_context_votes < 1:
-            raise ValueError("多尺度边界至少需要一个上下文尺度")
+            raise ValueError("multiscale boundaries need at least one context vote")
         progress = progress or (lambda _value, _message: None)
         unique_contexts = tuple(sorted({float(value) for value in contexts}))
         detections: list[tuple[float, SpeakerBoundary]] = []
-        # A short-context pass is an inexpensive screen.  Longer contexts are
-        # only evaluated for spans where that screen found a possible change;
-        # this keeps the default full-episode path close to the old runtime
-        # while retaining cross-scale confirmation on genuinely suspicious
-        # turns.
         screening_context = unique_contexts[len(unique_contexts) // 2]
         screen_boundaries = self.detect_speaker_boundaries(
             audio_path,
@@ -2370,28 +2341,27 @@ class LocalSpeakerTurnSplitter:
             minimum_separation_seconds=minimum_separation_seconds,
             progress=lambda value, message: progress(
                 0.45 * value,
-                f"多尺度换人审计 {screening_context:.2f}s：{message}",
+                f"multiscale boundary {screening_context:.2f}s: {message}",
             ),
         )
         detections.extend(
             (screening_context, boundary) for boundary in screen_boundaries
         )
         if not screen_boundaries:
-            progress(1.0, "多尺度换人审计完成：筛查未发现候选边界")
+            progress(1.0, "multiscale boundary audit: no candidate")
             return []
         suspicious_spans = [
             span
             for span in spans
-            if any(span.start < boundary.time < span.end for boundary in screen_boundaries)
+            if any(
+                span.start < boundary.time < span.end
+                for boundary in screen_boundaries
+            )
         ]
         remaining_contexts = [
             context for context in unique_contexts if context != screening_context
         ]
         for index, context in enumerate(remaining_contexts, start=1):
-            progress(
-                0.45 + 0.55 * (index - 1) / max(1, len(remaining_contexts)),
-                f"多尺度换人审计：上下文 {context:.2f}s",
-            )
             boundaries = self.detect_speaker_boundaries(
                 audio_path,
                 suspicious_spans,
@@ -2402,11 +2372,11 @@ class LocalSpeakerTurnSplitter:
                 primary_candidate_threshold=primary_candidate_threshold,
                 minimum_similarity_drop=minimum_similarity_drop,
                 minimum_separation_seconds=minimum_separation_seconds,
-                progress=lambda value, message, context=context: progress(
+                progress=lambda value, message, context=context, index=index: progress(
                     0.45
                     + 0.55 * ((index - 1) + value)
                     / max(1, len(remaining_contexts)),
-                    f"多尺度换人审计 {context:.2f}s：{message}",
+                    f"multiscale boundary {context:.2f}s: {message}",
                 ),
             )
             detections.extend((context, boundary) for boundary in boundaries)
@@ -2415,7 +2385,7 @@ class LocalSpeakerTurnSplitter:
             cluster_seconds=cluster_seconds,
             minimum_context_votes=minimum_context_votes,
         )
-        progress(1.0, f"多尺度换人审计完成：确认 {len(output)} 个稳定边界")
+        progress(1.0, f"multiscale boundary audit: {len(output)} stable")
         return output
 
     def analyze(
@@ -2424,34 +2394,13 @@ class LocalSpeakerTurnSplitter:
         spans: Sequence[TimeSpan],
         *,
         minimum_turn_seconds: float = 0.30,
-        minimum_edge_seconds: float | None = None,
         progress: Callable[[float, str], None] | None = None,
         **boundary_kwargs: float,
     ) -> SpeakerSplitResult:
-        """Return split spans and boundary diagnostics in one result.
-
-        ``minimum_turn_seconds`` controls how close a proposed boundary may be
-        to the edge of a normal turn. Shorter sides can remain as evidence for
-        a later complete-span identity check instead of being folded into the
-        neighboring speaker.
-        """
+        """Return split spans and boundary diagnostics in one result."""
 
         if minimum_turn_seconds < 0.0:
             raise ValueError("最短说话回合不能小于 0 秒")
-        if minimum_edge_seconds is None:
-            minimum_edge_seconds = min(
-                minimum_turn_seconds,
-                max(
-                    0.15,
-                    min(0.30, minimum_turn_seconds * 0.45),
-                ),
-            )
-        if minimum_edge_seconds < 0.0:
-            raise ValueError("minimum_edge_seconds must be non-negative")
-        if minimum_edge_seconds > minimum_turn_seconds:
-            raise ValueError(
-                "minimum_edge_seconds cannot exceed minimum_turn_seconds"
-            )
         waveform = load_mono(audio_path, self.SAMPLE_RATE)
         duration = waveform.numel() / self.SAMPLE_RATE
         normalized = self._normalize_spans(spans, duration)
@@ -2466,57 +2415,23 @@ class LocalSpeakerTurnSplitter:
             cuts = [
                 boundary.time
                 for boundary in boundaries
-                if span.start + minimum_edge_seconds <= boundary.time
-                <= span.end - minimum_edge_seconds
+                if span.start + minimum_turn_seconds <= boundary.time <= span.end - minimum_turn_seconds
             ]
-            turns.extend(
-                self._split_span_with_edge_evidence(
-                    span,
-                    cuts,
-                    minimum_turn_seconds,
-                    minimum_edge_seconds,
-                )
-            )
+            cursor = span.start
+            span_turns: list[TimeSpan] = []
+            for cut in cuts:
+                if cut - cursor >= minimum_turn_seconds:
+                    span_turns.append(TimeSpan(cursor, cut))
+                cursor = cut
+            if span.end - cursor >= minimum_turn_seconds:
+                span_turns.append(TimeSpan(cursor, span.end))
+            elif span_turns:
+                previous = span_turns[-1]
+                span_turns[-1] = TimeSpan(previous.start, span.end)
+            elif span.duration >= minimum_turn_seconds:
+                span_turns.append(span)
+            turns.extend(span_turns)
         return SpeakerSplitResult(tuple(turns), tuple(boundaries))
-
-    @staticmethod
-    def _split_span_with_edge_evidence(
-        span: TimeSpan,
-        cuts: Sequence[float],
-        minimum_turn_seconds: float,
-        minimum_edge_seconds: float,
-    ) -> list[TimeSpan]:
-        """Split a VAD island without folding short speaker sides together.
-
-        Sides below ``minimum_edge_seconds`` are omitted rather than attached
-        to the adjacent side. Sides at or above that floor remain candidates,
-        but the pipeline still requires a complete-span identity check before
-        exporting anything.
-        """
-
-        ordered_cuts = sorted(
-            {
-                float(cut)
-                for cut in cuts
-                if span.start + minimum_edge_seconds <= float(cut)
-                <= span.end - minimum_edge_seconds
-            }
-        )
-        cursor = span.start
-        output: list[TimeSpan] = []
-        for cut in ordered_cuts:
-            side = TimeSpan(cursor, cut)
-            if side.duration >= minimum_edge_seconds:
-                output.append(side)
-            cursor = cut
-        tail = TimeSpan(cursor, span.end)
-        if tail.duration >= minimum_edge_seconds:
-            output.append(tail)
-        elif not output and span.duration >= minimum_edge_seconds:
-            # No usable boundary side was produced; retain the original island
-            # so the normal target-speaker gate can make the decision.
-            output.append(span)
-        return output
 
     def split_speaker_spans(
         self,
@@ -2524,7 +2439,6 @@ class LocalSpeakerTurnSplitter:
         spans: Sequence[TimeSpan],
         *,
         minimum_turn_seconds: float = 0.30,
-        minimum_edge_seconds: float | None = None,
         progress: Callable[[float, str], None] | None = None,
         **boundary_kwargs: float,
     ) -> list[TimeSpan]:
@@ -2535,7 +2449,6 @@ class LocalSpeakerTurnSplitter:
                 audio_path,
                 spans,
                 minimum_turn_seconds=minimum_turn_seconds,
-                minimum_edge_seconds=minimum_edge_seconds,
                 progress=progress,
                 **boundary_kwargs,
             ).spans

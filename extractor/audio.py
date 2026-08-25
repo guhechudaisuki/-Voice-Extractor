@@ -54,6 +54,7 @@ def probe_duration(path: Path) -> float:
 
 def has_video_stream(path: Path) -> bool:
     """Return whether a media file contains a video stream."""
+
     result = _run(
         [
             str(FFPROBE),
@@ -242,12 +243,8 @@ def write_video_clip(
     start: float,
     end: float,
 ) -> Path:
-    """Render an accurately bounded preview clip from a source video.
+    """Render an accurately bounded clip from a source video."""
 
-    The bundled FFmpeg build does not guarantee libx264, so use its portable
-    MPEG-4 encoder. Seeking is placed after ``-i`` and the clip is re-encoded
-    to avoid keyframe-aligned boundaries from ``-c copy``.
-    """
     duration = max(0.01, end - start)
     destination.parent.mkdir(parents=True, exist_ok=True)
     _run(

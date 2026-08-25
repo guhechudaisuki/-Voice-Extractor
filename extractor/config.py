@@ -4,7 +4,22 @@ from pathlib import Path
 
 
 TOOL_ROOT = Path(__file__).resolve().parents[1]
-WORKSPACE_ROOT = TOOL_ROOT.parent
+
+
+def _asset_root() -> Path:
+    """Find the shared tool assets when this candidate lives under versions/."""
+
+    for candidate in (TOOL_ROOT, *TOOL_ROOT.parents):
+        if (
+            (candidate / "models").exists()
+            and (candidate.parent / "GPT-SoVITS-v2pro-20250604").exists()
+        ):
+            return candidate
+    return TOOL_ROOT
+
+
+ASSET_ROOT = _asset_root()
+WORKSPACE_ROOT = ASSET_ROOT.parent
 GPT_ROOT = WORKSPACE_ROOT / "GPT-SoVITS-v2pro-20250604"
 GPT_RUNTIME = GPT_ROOT / "runtime"
 FFMPEG = GPT_RUNTIME / "ffmpeg.exe"
@@ -20,16 +35,14 @@ PUNC_MODEL = ASR_MODELS / "punc_ct-transformer_zh-cn-common-vocab272727-pytorch"
 
 SV_CODE = GPT_ROOT / "GPT_SoVITS" / "eres2net"
 SV_MODEL = GPT_ROOT / "GPT_SoVITS" / "pretrained_models" / "sv" / "pretrained_eres2netv2w24s4ep4.ckpt"
-CAMPLUS_MODEL = TOOL_ROOT / "models" / "campplus_voxceleb" / "campplus_voxceleb.bin"
-WAVLM_SV_MODEL = TOOL_ROOT / "models" / "wavlm-base-plus-sv"
-WESPEAKER_MODEL = TOOL_ROOT / "models" / "wespeaker-resnet34-lm" / "onnx" / "model.onnx"
-ANIME_CHAR_MODEL = TOOL_ROOT / "models" / "anime-speaker-char" / "anime_speaker_char_ecapa.onnx"
-ANIME_VA_MODEL = TOOL_ROOT / "models" / "anime-speaker-va" / "anime_speaker_va_ecapa.onnx"
+CAMPLUS_MODEL = ASSET_ROOT / "models" / "campplus_voxceleb" / "campplus_voxceleb.bin"
+WAVLM_SV_MODEL = ASSET_ROOT / "models" / "wavlm-base-plus-sv"
+WESPEAKER_MODEL = ASSET_ROOT / "models" / "wespeaker-resnet34-lm" / "onnx" / "model.onnx"
 
 WHISPER_CACHE = WORKSPACE_ROOT / "omnvoice" / "hf_cache" / "models--openai--whisper-large-v3-turbo"
-OVERLAP_MODEL = TOOL_ROOT / "models" / "overlap" / "model.onnx"
-PANNS_MODEL = TOOL_ROOT / "models" / "panns" / "Cnn10_mAP=0.380.pth"
-PANNS_LABELS = TOOL_ROOT / "models" / "panns" / "class_labels_indices.csv"
+OVERLAP_MODEL = ASSET_ROOT / "models" / "overlap" / "model.onnx"
+PANNS_MODEL = ASSET_ROOT / "models" / "panns" / "Cnn10_mAP=0.380.pth"
+PANNS_LABELS = ASSET_ROOT / "models" / "panns" / "class_labels_indices.csv"
 
 VENDOR_ROOT = TOOL_ROOT / "vendor"
 WORK_ROOT = TOOL_ROOT / "work"

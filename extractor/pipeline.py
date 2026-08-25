@@ -49,14 +49,11 @@ LOGGER = logging.getLogger(__name__)
 @dataclass
 class PipelineOptions:
     speaker_threshold: float = 0.68
-    # Silence gaps in [silence_min_seconds, silence_split_seconds] remain
-    # separate until the two-side speaker check explicitly joins them. Gaps
-    # below the lower bound are treated as one continuous speech island; gaps
-    # above the upper bound are hard sentence boundaries.
+    # Gaps shorter than the lower bound are detector jitter inside one speech
+    # island. Gaps within [min, max] may be joined only after same-speaker
+    # verification. Gaps longer than the upper bound remain hard boundaries.
     silence_min_seconds: float = 0.20
     silence_split_seconds: float = 0.85
-    # Public name used by the UI and manifests. ``silence_split_seconds`` is
-    # retained as the internal/backward-compatible upper-bound name.
     silence_max_seconds: float | None = None
     overlap_threshold: float = 0.35
     singing_threshold: float = 0.22
@@ -69,10 +66,7 @@ class PipelineOptions:
     keep_rejected: bool = False
     use_singing_detector: bool = True
     use_overlap_detector: bool = True
-    # Export every cleaned silence-delimited sentence instead of applying the
-    # target-speaker gate. This is an explicit manual-review mode.
     export_all_sentences: bool = False
-    # When the source is a video, also export matching original-media clips.
     export_video_clips: bool = False
     cleanup_work: bool = False
 
@@ -131,177 +125,6 @@ class ExtractionPipeline:
         ensure_local_assets()
         self.options = options or PipelineOptions()
         self.device = device if device == "cuda" and torch.cuda.is_available() else "cpu"
-
-    @staticmethod
-    def _needs_final_multimodel_exclusion(
-        candidate: CandidateSentence,
-        exclusion: dict[str, float | str | bool] | None,
-        *,
-        require_third_model: bool = False,
-    ) -> bool:
-        """Decide when exclusion evidence needs an independent third vote.
-
-        The previous gate only opened for recall/low-coverage candidates.  A
-        long locator recovery could therefore contain a speaker switch and
-        never reach WeSpeaker, even when one of the supplied exclusion roles
-        already matched it.  Boundary risk is now part of the decision: a
-        candidate with locally detected boundaries is audited regardless of its
-        aggregate target score.  A third-model vote is still not a veto by
-        itself for a clean ordinary sentence; it becomes decisive when it
-        agrees with either base model or the candidate has an unresolved local
-        boundary.
-        """
-
-        if not exclusion:
-            return False
-        primary_vote = bool(exclusion.get("excluded_primary_vote"))
-        secondary_vote = bool(exclusion.get("excluded_secondary_vote"))
-        third_vote = bool(exclusion.get("excluded_wespeaker_vote"))
-        coverage = float(candidate.diagnostics.get("target_coverage", 1.0))
-        tier = str(candidate.diagnostics.get("speaker_tier", ""))
-        locator_boundaries = int(
-            candidate.diagnostics.get("locator_boundary_count", 0) or 0
-        )
-        local_boundaries = int(
-            candidate.diagnostics.get("multi_model_internal_boundary_count", 0)
-            or candidate.diagnostics.get("multi_model_anchor_boundary_count", 0)
-            or 0
-        )
-        boundary_risk = bool(
-            candidate.diagnostics.get("local_boundary_recovery")
-            or locator_boundaries >= 2
-            or local_boundaries >= 1
-        )
-        if require_third_model:
-            return third_vote and (primary_vote or secondary_vote or boundary_risk)
-        if not (primary_vote or secondary_vote):
-            return boundary_risk and third_vote
-        if coverage <= 0.05 and primary_vote:
-            return True
-        return (
-            (tier == "recall" and coverage < 0.60)
-            or (boundary_risk and coverage < 0.95)
-            or boundary_risk
-        )
-
-    @staticmethod
-    def _is_structural_boundary(boundary: SpeakerBoundary) -> bool:
-        """Return whether a local boundary is strong enough to block recovery.
-
-        Cross-scale agreement is the primary signal.  The low-similarity rule
-        remains as a compatibility fallback for boundaries produced by older
-        one-pass diagnostics.
-        """
-
-        return bool(
-            getattr(boundary, "scale_votes", 1) >= 2
-            or (
-                boundary.primary_similarity <= 0.15
-                and boundary.secondary_similarity is not None
-                and boundary.secondary_similarity <= 0.05
-            )
-        )
-
-    @staticmethod
-    def _is_reliable_boundary_record(record: object) -> bool:
-        """Apply the same boundary rule to serialized recovery diagnostics."""
-
-        if not isinstance(record, dict):
-            return False
-        try:
-            scale_votes = int(record.get("scale_votes", 1) or 1)
-            primary = float(record.get("primary_similarity", 1.0))
-            secondary_value = record.get("secondary_similarity")
-            secondary = (
-                float(secondary_value)
-                if secondary_value is not None
-                else 1.0
-            )
-            confidence = float(record.get("confidence", 0.0))
-            primary_drop = float(record.get("primary_drop", 0.0))
-            secondary_drop = float(record.get("secondary_drop", 0.0))
-        except (TypeError, ValueError):
-            return False
-        if scale_votes >= 2 or (primary <= 0.15 and secondary <= 0.05):
-            return True
-        # Older one-scale diagnostics do not carry scale_votes.  Preserve
-        # only a corroborated high-confidence cut; a low score from one model
-        # alone must not split an otherwise continuous utterance.
-        return bool(
-            confidence >= 0.80
-            and primary <= 0.48
-            and secondary <= 0.18
-            and primary_drop >= 0.06
-            and secondary_drop >= 0.02
-        )
-
-    @classmethod
-    def _candidate_boundary_times(
-        cls,
-        candidate: CandidateSentence,
-    ) -> list[float]:
-        """Collect reliable serialized cuts that fall inside one candidate.
-
-        Recovery diagnostics have been written by both the old one-pass
-        boundary detector and the newer multi-scale detector.  Normalizing
-        them here keeps later recovery code from treating a low-confidence
-        diagnostic as a hard cut, while still allowing old cached jobs to be
-        audited with the current rules.
-        """
-
-        diagnostics = candidate.diagnostics
-        values: list[float] = []
-        for key in (
-            "recovery_boundary_details",
-            "multi_model_internal_boundaries",
-            "multi_model_anchor_boundaries",
-        ):
-            records = diagnostics.get(key, [])
-            if not isinstance(records, (list, tuple)):
-                continue
-            for record in records:
-                if not cls._is_reliable_boundary_record(record):
-                    continue
-                try:
-                    values.append(float(record["time"]))
-                except (KeyError, TypeError, ValueError):
-                    continue
-        # A few early diagnostics stored only numeric recovery times.
-        records = diagnostics.get("recovery_boundaries", [])
-        if isinstance(records, (list, tuple)):
-            for record in records:
-                if isinstance(record, (int, float)):
-                    values.append(float(record))
-        return sorted(
-            {
-                round(value, 5)
-                for value in values
-                if candidate.start + 0.35 <= value <= candidate.end - 0.35
-            }
-        )
-
-    @staticmethod
-    def _anime_recovery_base_gate(diagnostics: dict[str, object]) -> bool:
-        """Require independent episode evidence before anime-score recovery."""
-
-        if not bool(diagnostics.get("multi_model_base_consensus")):
-            return False
-        if int(diagnostics.get("multi_model_common_anchor_count", 0) or 0) < 1:
-            return False
-        if not bool(
-            diagnostics.get("multi_model_wespeaker_support")
-            or diagnostics.get("multi_model_fourth_model_rescue")
-        ):
-            return False
-        if float(diagnostics.get("multi_model_continuity_ratio", 1.0) or 0.0) < 0.70:
-            return False
-        return not any(
-            float(diagnostics.get(name, 1.0) or 0.0) <= 0.0
-            for name in (
-                "excluded_primary_direct_margin",
-                "excluded_secondary_direct_margin",
-            )
-        )
 
     def _job_paths(self, job_id: str) -> dict[str, Path]:
         root = WORK_ROOT / job_id
@@ -368,30 +191,14 @@ class ExtractionPipeline:
         return normalized_groups, duration_groups
 
     @staticmethod
-    def _merge_vad_spans(
-        spans: list[TimeSpan],
-        gap: float = 0.18,
-        blocked: Iterable[TimeSpan] = (),
-    ) -> list[TimeSpan]:
+    def _merge_vad_spans(spans: list[TimeSpan], gap: float = 0.18) -> list[TimeSpan]:
         if not spans:
             return []
         spans = sorted(spans, key=lambda item: item.start)
-        blocked = tuple(blocked)
         merged: list[TimeSpan] = [spans[0]]
         for span in spans[1:]:
             previous = merged[-1]
-            gap_start = previous.end
-            gap_end = span.start
-            crosses_blocked = any(
-                min(gap_end, dirty.end) - max(gap_start, dirty.start) > 0.01
-                for dirty in blocked
-            )
-            distance = span.start - previous.end
-            # A zero/negative distance is already contiguous. For a positive
-            # gap, the lower-bound interval stays separate at the exact
-            # threshold; only a gap strictly below ``gap`` is detector jitter.
-            joins_by_gap = distance <= 0.0 or distance < max(0.0, gap - 1e-6)
-            if joins_by_gap and not crosses_blocked:
+            if span.start <= previous.end + gap:
                 merged[-1] = TimeSpan(previous.start, max(previous.end, span.end))
             else:
                 merged.append(span)
@@ -546,693 +353,6 @@ class ExtractionPipeline:
             for target in target_spans
         )
         return min(1.0, covered / span.duration)
-
-    @staticmethod
-    def _same_speech_block(
-        left: TimeSpan,
-        right: TimeSpan,
-        blocks: Iterable[TimeSpan],
-    ) -> bool:
-        """Return whether two adjacent turns belong to one VAD speech island."""
-
-        if right.start - left.end > 0.02:
-            return False
-        return any(
-            block.start <= left.start + 0.02
-            and right.end <= block.end + 0.02
-            for block in blocks
-        )
-
-    @staticmethod
-    def _target_side_recovery_support(
-        match: SpeakerMatchDecision,
-        duration: float,
-        threshold: float,
-    ) -> bool:
-        """Recognize a short target-like side without exporting it alone.
-
-        A local splitter can cut a low-energy phoneme below the complete-turn
-        gate.  The side may still be useful when joining it to an adjacent
-        verified target turn, but it must carry independent support from both
-        speaker models and must not be treated as a standalone sentence.
-        """
-
-        secondary = match.secondary
-        if secondary is None or not 0.75 <= duration <= 4.0:
-            return False
-        if match.tier not in {"weak", "recall"}:
-            return False
-        return (
-            match.primary.score >= max(0.54, threshold - 0.15)
-            and secondary.score >= max(0.52, threshold - 0.16)
-            and match.primary.reference_max_score >= 0.50
-            and secondary.reference_max_score >= 0.48
-            and match.paired_reference_median >= 0.47
-        )
-
-    @staticmethod
-    def _short_edge_recovery_support(
-        match: SpeakerMatchDecision | None,
-        duration: float,
-        threshold: float,
-    ) -> bool:
-        """Return whether a sub-sentence fragment may support a join.
-
-        VAD and local speaker cuts can leave a 0.x-second phoneme on its own.
-        Such a fragment is never an output sentence.  It is useful only when
-        both speaker models provide direct reference evidence and a later
-        whole-span verification accepts the joined sentence.
-        """
-
-        if match is None or match.secondary is None:
-            return False
-        if not 0.20 <= duration < 1.20:
-            return False
-        primary = match.primary
-        secondary = match.secondary
-        if duration < 0.75:
-            local_window_score = min(
-                primary.window_p20_score,
-                secondary.window_p20_score,
-            )
-            local_window_vote = min(
-                primary.window_vote_ratio,
-                secondary.window_vote_ratio,
-            )
-        else:
-            local_window_score = max(
-                primary.window_p20_score,
-                secondary.window_p20_score,
-            )
-            local_window_vote = max(
-                primary.window_vote_ratio,
-                secondary.window_vote_ratio,
-            )
-        return (
-            primary.score >= max(0.52, threshold - 0.16)
-            and secondary.score >= max(0.48, threshold - 0.20)
-            and primary.reference_max_score >= 0.48
-            and secondary.reference_max_score >= 0.40
-            and match.paired_reference_median >= 0.44
-            and local_window_score >= 0.34
-            and local_window_vote >= 0.25
-        )
-
-    @staticmethod
-    def _short_edge_can_join(
-        candidate: CandidateSentence,
-        complete_edge_seconds: float,
-    ) -> bool:
-        """Require explicit evidence before joining a short rejected side."""
-
-        if candidate.duration < complete_edge_seconds:
-            return bool(candidate.diagnostics.get("short_edge_evidence"))
-        return bool(
-            candidate.diagnostics.get("short_edge_evidence")
-            or candidate.diagnostics.get("speaker_tier") == "recall"
-            or (
-                float(candidate.diagnostics.get("eres_score", 0.0)) >= 0.50
-                and float(candidate.diagnostics.get("camplus_score", 0.0)) >= 0.50
-                and float(
-                    candidate.diagnostics.get("paired_reference_median", 0.0)
-                )
-                >= 0.40
-            )
-        )
-
-    @staticmethod
-    def _short_seed_groups(
-        candidates: Iterable[CandidateSentence],
-        maximum_gap: float,
-        minimum_duration: float,
-    ) -> list[list[CandidateSentence]]:
-        """Group adjacent independently supported short islands.
-
-        These groups are only seeds. The caller still has to pass the joined
-        span through the complete dual-model speaker and exclusion gates before
-        it can become an output sentence.
-        """
-
-        ordered = sorted(candidates, key=lambda item: (item.start, item.end))
-        groups: list[list[CandidateSentence]] = []
-        current: list[CandidateSentence] = []
-
-        def flush() -> None:
-            if (
-                len(current) >= 2
-                and current[-1].end - current[0].start >= minimum_duration
-            ):
-                groups.append(list(current))
-
-        for candidate in ordered:
-            if not current:
-                current = [candidate]
-                continue
-            gap = candidate.start - current[-1].end
-            if gap <= maximum_gap:
-                current.append(candidate)
-            else:
-                flush()
-                current = [candidate]
-        flush()
-        return groups
-
-    def _verify_short_edge_candidate(
-        self,
-        candidate: CandidateSentence,
-        verifier: DualSpeakerVerifier,
-        waveform: torch.Tensor,
-        profile: SpeakerMatchProfile,
-        exclusion_profiles: list[ExclusionSpeakerProfile],
-        threshold: float,
-    ) -> SpeakerMatchDecision | None:
-        """Score a short fragment as join evidence without accepting it."""
-
-        if candidate.duration < 0.20:
-            return None
-        candidate.diagnostics["short_edge_pending"] = False
-        match = self._verify_speaker_span(
-            verifier,
-            waveform,
-            TimeSpan(candidate.start, candidate.end),
-            profile,
-            threshold,
-        )
-        self._apply_speaker_match(candidate, match, profile, threshold)
-        supported = self._short_edge_recovery_support(
-            match,
-            candidate.duration,
-            threshold,
-        )
-        candidate.diagnostics["short_edge_evidence"] = supported
-        candidate.diagnostics["short_edge_duration"] = round(candidate.duration, 5)
-        exclusion = verifier.exclusion_audit(
-            match,
-            profile,
-            exclusion_profiles,
-        )
-        if exclusion is not None:
-            candidate.diagnostics.update(exclusion)
-        if exclusion and exclusion.get("excluded_role_rejected"):
-            candidate.reject_reason = (
-                f"接近排除角色 {exclusion['excluded_role']}，已按排除角色删除"
-            )
-            candidate.diagnostics["short_edge_evidence"] = False
-        else:
-            # Keep this reason even when the match is strong enough to support
-            # a join.  The caller must never place the fragment in output by
-            # itself; _merge_verified_target_turns owns the whole-span gate.
-            candidate.reject_reason = "说话回合过短"
-        return match
-
-    def _reconcile_target_split_spans(
-        self,
-        split_result: list[TimeSpan],
-        clean_spans: list[TimeSpan],
-        target_spans: list[TimeSpan],
-        verifier: DualSpeakerVerifier,
-        profile: SpeakerMatchProfile,
-        waveform: torch.Tensor,
-        exclusion_profiles: list[ExclusionSpeakerProfile],
-        threshold: float,
-    ) -> tuple[list[TimeSpan], int]:
-        """Undo a false local cut when a complete target island is verified.
-
-        The generic change detector is intentionally cautious, but short
-        phonemes and prosody can still create a cut inside one target sentence.
-        A cut is reversible only inside one VAD island, when the independent
-        target locator covers both sides and the complete joined span passes
-        the ordinary dual-model identity gate again.  This does not join across
-        positive silence or use a lower global threshold.
-        """
-
-        if len(split_result) < 2 or not target_spans:
-            return list(split_result), 0
-        ordered = sorted(split_result, key=lambda item: (item.start, item.end))
-        output: list[TimeSpan] = []
-        merged_count = 0
-        index = 0
-        side_match_cache: dict[tuple[float, float], SpeakerMatchDecision] = {}
-
-        def side_match(span: TimeSpan) -> SpeakerMatchDecision:
-            key = (round(span.start, 3), round(span.end, 3))
-            match = side_match_cache.get(key)
-            if match is None:
-                match = self._verify_speaker_span(
-                    verifier, waveform, span, profile, threshold
-                )
-                side_match_cache[key] = match
-            return match
-
-        while index < len(ordered):
-            current = ordered[index]
-            while index + 1 < len(ordered):
-                following = ordered[index + 1]
-                if not self._same_speech_block(current, following, clean_spans):
-                    break
-                joined = TimeSpan(current.start, following.end)
-                if joined.duration > min(20.0, self.options.max_sentence_seconds):
-                    break
-                joined_coverage = self._target_coverage(joined, target_spans)
-                if joined_coverage < 0.55:
-                    break
-                left_match = side_match(current)
-                right_match = side_match(following)
-                # Locator coverage only says that a sliding window touched a
-                # side. It must never overrule the independent side identity
-                # check, otherwise a similar neighboring speaker can make an
-                # entire VAD island look like one target turn.
-                left_supported = left_match.accepted or self._target_side_recovery_support(
-                    left_match, current.duration, threshold
-                )
-                right_supported = right_match.accepted or self._target_side_recovery_support(
-                    right_match, following.duration, threshold
-                )
-                if not left_supported or not right_supported:
-                    break
-                left_exclusion = verifier.exclusion_audit(
-                    left_match, profile, exclusion_profiles
-                )
-                right_exclusion = verifier.exclusion_audit(
-                    right_match, profile, exclusion_profiles
-                )
-                if (
-                    left_exclusion
-                    and left_exclusion.get("excluded_role_rejected")
-                ) or (
-                    right_exclusion
-                    and right_exclusion.get("excluded_role_rejected")
-                ):
-                    break
-                match = self._verify_speaker_span(
-                    verifier,
-                    waveform,
-                    joined,
-                    profile,
-                    threshold,
-                )
-                exclusion = verifier.exclusion_audit(
-                    match,
-                    profile,
-                    exclusion_profiles,
-                )
-                if not match.accepted or (
-                    exclusion and exclusion.get("excluded_role_rejected")
-                ):
-                    break
-                current = joined
-                index += 1
-                merged_count += 1
-            output.append(current)
-            index += 1
-        return output, merged_count
-
-    @staticmethod
-    def _candidate_source_span(candidate: CandidateSentence) -> TimeSpan | None:
-        """Recover the original VAD/speaker span for a recovery candidate."""
-
-        diagnostics = candidate.diagnostics
-        pairs = (
-            ("locator_source_start", "locator_source_end"),
-            ("long_turn_parent_start", "long_turn_parent_end"),
-            ("original_turn_start", "original_turn_end"),
-            ("recovery_parent_start", "recovery_parent_end"),
-        )
-        for start_name, end_name in pairs:
-            try:
-                start = float(diagnostics[start_name])
-                end = float(diagnostics[end_name])
-            except (KeyError, TypeError, ValueError):
-                continue
-            if end > start:
-                return TimeSpan(start, end)
-        return None
-
-    @staticmethod
-    def _local_target_quality(match: SpeakerMatchDecision | None) -> float:
-        """Score a local window without turning it into a global threshold."""
-
-        if match is None or match.secondary is None:
-            return -1.0
-        primary = float(match.primary.score)
-        secondary = float(match.secondary.score)
-        direct = min(
-            float(match.primary.reference_max_score),
-            float(match.secondary.reference_max_score),
-        )
-        return 0.45 * primary + 0.45 * secondary + 0.10 * direct
-
-    def _audit_risky_target_edges(
-        self,
-        accepted_turns: list[CandidateSentence],
-        verifier: DualSpeakerVerifier,
-        profile: SpeakerMatchProfile,
-        audio_path: Path,
-        waveform: torch.Tensor,
-        exclusion_profiles: list[ExclusionSpeakerProfile],
-        target_spans: list[TimeSpan],
-        threshold: float,
-        progress: ProgressCallback,
-    ) -> int:
-        """Trim locator/repartition candidates whose edges are another voice.
-
-        A long VAD island can contain a short reply from a different speaker.
-        The 1.8 second target locator may still mark one broad region as
-        positive, and a whole-span embedding then hides that contamination.
-        This audit is restricted to candidates whose source turn had incomplete
-        target coverage.  It uses short multi-scale boundaries only to propose
-        cuts, then requires a target-quality gain on one side and a complete
-        re-verification of the retained core.
-        """
-
-        if not accepted_turns:
-            return 0
-        splitter = LocalSpeakerTurnSplitter(
-            verifier.primary,
-            secondary=verifier.secondary,
-        )
-        # Edge audits revisit the same split points from both directions. Keep
-        # the expensive dual-model embedding result per time span so a long
-        # batch does not appear to stall while recomputing identical windows.
-        match_cache: dict[tuple[float, float], SpeakerMatchDecision] = {}
-
-        def cached_match(span: TimeSpan) -> SpeakerMatchDecision:
-            key = (round(span.start, 3), round(span.end, 3))
-            match = match_cache.get(key)
-            if match is None:
-                match = self._verify_speaker_span(
-                    verifier, waveform, span, profile, threshold
-                )
-                match_cache[key] = match
-            return match
-
-        contrastive_cache: dict[
-            tuple[float, float, float, float], SpeakerMatchDecision | None
-        ] = {}
-
-        def contrastive_edge_match(
-            retained: TimeSpan,
-            residual: TimeSpan,
-            retained_match: SpeakerMatchDecision,
-            residual_match: SpeakerMatchDecision,
-        ) -> SpeakerMatchDecision | None:
-            if retained_match.accepted:
-                return retained_match
-            if not 0.25 <= residual.duration <= 0.90:
-                return retained_match
-            key = (
-                round(retained.start, 3),
-                round(retained.end, 3),
-                round(residual.start, 3),
-                round(residual.end, 3),
-            )
-            if key not in contrastive_cache:
-                contrastive_cache[key] = (
-                    verifier.promote_contrastive_edge_with_tertiary(
-                        self._waveform_span(waveform, retained),
-                        self._waveform_span(waveform, residual),
-                        profile,
-                        retained_match,
-                        residual_match,
-                        retained.duration,
-                        residual.duration,
-                    )
-                )
-            return contrastive_cache[key]
-
-        replacements: list[tuple[CandidateSentence, CandidateSentence]] = []
-        for candidate in list(accepted_turns):
-            diagnostics = candidate.diagnostics
-            # The same-turn pass has already validated both the recovered edge
-            # and the complete source span. Re-auditing its interior with
-            # shorter windows would mistake prosody changes for new speakers
-            # and cut the sentence back to the old incomplete core.
-            if diagnostics.get("same_turn_edge_recovery"):
-                continue
-            if not (
-                diagnostics.get("target_locator_recovery")
-                or diagnostics.get("long_turn_repartition")
-            ):
-                continue
-            source = self._candidate_source_span(candidate)
-            minimum_retained_seconds = max(1.20, self.options.min_output_seconds)
-            if source is None or candidate.duration < minimum_retained_seconds:
-                continue
-            source_coverage = diagnostics.get("locator_source_target_coverage")
-            if source_coverage is None:
-                source_coverage = diagnostics.get("long_turn_parent_coverage", 1.0)
-            try:
-                source_coverage = float(source_coverage)
-            except (TypeError, ValueError):
-                source_coverage = 1.0
-            if source_coverage >= 0.90:
-                continue
-
-            audit_span = TimeSpan(
-                max(source.start, candidate.start - 0.05),
-                min(source.end, candidate.end + 0.05),
-            )
-            if audit_span.duration < max(1.80, minimum_retained_seconds + 0.25):
-                continue
-            short_candidate = candidate.duration < 2.20
-            boundaries = splitter.detect_multiscale_speaker_boundaries(
-                audio_path,
-                [audit_span],
-                # The boundary detector requires at least 0.30 s of context;
-                # keep the short-candidate audit within that contract.
-                contexts=(0.30, 0.40, 0.55) if short_candidate else (0.30, 0.40, 0.55, 0.70),
-                cluster_seconds=0.20,
-                minimum_context_votes=2,
-                scan_hop_seconds=0.05,
-                primary_candidate_threshold=0.72,
-                minimum_similarity_drop=0.04,
-                minimum_separation_seconds=0.15,
-                progress=lambda value, message: progress(
-                    0.80,
-                    f"局部边缘纯度审计：{message}",
-                ),
-            )
-            internal = sorted(
-                {
-                    round(boundary.time, 3): boundary
-                    for boundary in boundaries
-                    if candidate.start + (0.08 if short_candidate else 0.15)
-                    <= boundary.time
-                    <= candidate.end - (0.08 if short_candidate else 0.15)
-                }.values(),
-                key=lambda item: item.time,
-            )
-            if not internal:
-                continue
-
-            current = TimeSpan(candidate.start, candidate.end)
-            current_match = cached_match(current)
-            changed = False
-            audit_details: list[dict[str, float | str]] = []
-            edge_margin = 0.08 if short_candidate else 0.15
-            # A local boundary is evidence about an edge, not permission to
-            # repeatedly carve the middle out of a sentence.  Audit each edge
-            # at most once and prefer the boundary nearest the original edge;
-            # this keeps a short contaminating reply out without deleting a
-            # low-energy phoneme later in the same target sentence.
-            for edge_kind in ("head", "tail"):
-                options: list[
-                    tuple[
-                        float,
-                        str,
-                        TimeSpan,
-                        SpeakerMatchDecision,
-                        SpeakerMatchDecision,
-                        SpeakerBoundary,
-                    ]
-                ] = []
-                for boundary in internal:
-                    cut = float(boundary.time)
-                    if not current.start + edge_margin < cut < current.end - edge_margin:
-                        continue
-                    left = TimeSpan(current.start, cut)
-                    right = TimeSpan(cut, current.end)
-                    left_match = cached_match(left)
-                    right_match = cached_match(right)
-                    left_quality = self._local_target_quality(left_match)
-                    right_quality = self._local_target_quality(right_match)
-                    left_exclusion = verifier.exclusion_audit(
-                        left_match,
-                        profile,
-                        exclusion_profiles,
-                        tertiary_recovery=left_match.tier == "tertiary",
-                    )
-                    right_exclusion = verifier.exclusion_audit(
-                        right_match,
-                        profile,
-                        exclusion_profiles,
-                        tertiary_recovery=right_match.tier == "tertiary",
-                    )
-                    left_negative = bool(
-                        left_exclusion
-                        and left_exclusion.get("excluded_role_rejected")
-                    )
-                    right_negative = bool(
-                        right_exclusion
-                        and right_exclusion.get("excluded_role_rejected")
-                    )
-                    if boundary.scale_votes < 3:
-                        continue
-                    if (
-                        right.duration >= minimum_retained_seconds
-                        and right_quality - left_quality >= 0.10
-                        and right_quality >= 0.52
-                        and (
-                            left_negative
-                            or left_quality <= (0.35 if left.duration < 0.40 else 0.50)
-                        )
-                    ) and edge_kind == "head":
-                        options.append(
-                            (
-                                right_quality - left_quality,
-                                "head",
-                                right,
-                                right_match,
-                                left_match,
-                                boundary,
-                            )
-                        )
-                    if (
-                        left.duration >= minimum_retained_seconds
-                        and left_quality - right_quality >= 0.10
-                        and left_quality >= 0.52
-                        and (
-                            right_negative
-                            or right_quality <= (0.35 if right.duration < 0.40 else 0.50)
-                        )
-                    ) and edge_kind == "tail":
-                        options.append(
-                            (
-                                left_quality - right_quality,
-                                "tail",
-                                left,
-                                left_match,
-                                right_match,
-                                boundary,
-                            )
-                        )
-                if not options:
-                    continue
-                if edge_kind == "head":
-                    # Earliest accepted cut is the conservative head trim.
-                    # A larger quality gain is only a tie-breaker.
-                    selected = min(
-                        options,
-                        key=lambda item: (
-                            item[2].start - candidate.start,
-                            -item[0],
-                        ),
-                    )
-                else:
-                    # Latest accepted cut is the conservative tail trim.
-                    selected = min(
-                        options,
-                        key=lambda item: (
-                            candidate.end - item[2].end,
-                            -item[0],
-                        ),
-                    )
-                (
-                    gain,
-                    edge,
-                    retained,
-                    retained_match,
-                    residual_match,
-                    boundary,
-                ) = selected
-                if (
-                    retained.duration < minimum_retained_seconds
-                    or retained.duration >= current.duration - 0.05
-                ):
-                    continue
-                contrastive = contrastive_edge_match(
-                    retained,
-                    (
-                        TimeSpan(current.start, boundary.time)
-                        if edge == "tail"
-                        else TimeSpan(boundary.time, current.end)
-                    ),
-                    retained_match,
-                    residual_match,
-                )
-                if contrastive is None:
-                    continue
-                retained_match = contrastive
-                audit_details.append(
-                    {
-                        "edge": edge,
-                        "retained_start": retained.start,
-                        "retained_end": retained.end,
-                        "quality_gain": round(gain, 5),
-                        "boundary": round(boundary.time, 5),
-                        "boundary_scale_votes": boundary.scale_votes,
-                        "contrastive_edge": contrastive is not None
-                        and bool(
-                            retained_match.diagnostics.get(
-                                "contrastive_edge_tertiary_passed"
-                            )
-                        ),
-                    }
-                )
-                current = retained
-                current_match = retained_match
-                changed = True
-
-            if not changed:
-                continue
-            if not current_match.accepted:
-                promoted = verifier.promote_local_with_tertiary(
-                    self._waveform_span(waveform, current),
-                    profile,
-                    current_match,
-                    current.duration,
-                )
-                if promoted is not None:
-                    current_match = promoted
-            if not current_match.accepted:
-                continue
-            exclusion = verifier.exclusion_audit(
-                current_match,
-                profile,
-                exclusion_profiles,
-                tertiary_recovery=current_match.tier == "tertiary",
-            )
-            if exclusion and exclusion.get("excluded_role_rejected"):
-                continue
-            replacement = CandidateSentence(current.start, current.end, "")
-            replacement.diagnostics.update(candidate.diagnostics)
-            self._apply_speaker_match(replacement, current_match, profile, threshold)
-            replacement.diagnostics.update(
-                {
-                    "edge_purity_trim": True,
-                    "edge_purity_source_start": candidate.start,
-                    "edge_purity_source_end": candidate.end,
-                    "edge_purity_source_target_coverage": round(source_coverage, 5),
-                    "edge_purity_boundaries": [boundary.to_dict() for boundary in internal],
-                    "edge_purity_steps": audit_details,
-                    "target_coverage": round(
-                        self._target_coverage(current, target_spans),
-                        5,
-                    ),
-                }
-            )
-            if exclusion is not None:
-                replacement.diagnostics.update(exclusion)
-            replacements.append((candidate, replacement))
-
-        for original, replacement in replacements:
-            for index, current in enumerate(accepted_turns):
-                if current is original:
-                    accepted_turns[index] = replacement
-                    break
-        if replacements:
-            progress(0.80, f"局部边缘纯度审计：修正 {len(replacements)} 个候选")
-        return len(replacements)
 
     @staticmethod
     def _partition_tainted_spans(
@@ -1419,105 +539,516 @@ class ExtractionPipeline:
             hop_seconds=min(0.9, max(0.5, span.duration / 2)),
         )
 
-    def _recover_same_turn_edges(
+    @staticmethod
+    def _wavlm_same_speaker_floor(profile) -> float:
+        """Calibrate edge continuity from the reference speaker itself."""
+
+        embeddings = profile.embeddings
+        if embeddings.shape[0] < 2:
+            return max(0.82, float(profile.acceptance_floor))
+        pairwise = embeddings @ embeddings.T
+        mask = torch.triu(
+            torch.ones_like(pairwise, dtype=torch.bool), diagonal=1
+        )
+        values = pairwise[mask]
+        if values.numel() == 0:
+            return max(0.82, float(profile.acceptance_floor))
+        return max(
+            float(profile.acceptance_floor),
+            float(torch.quantile(values, 0.20)),
+        )
+
+    @staticmethod
+    def _frame_db_levels(
+        waveform: torch.Tensor,
+        span: TimeSpan,
+        *,
+        frame_seconds: float = 0.02,
+        hop_seconds: float = 0.01,
+    ) -> tuple[list[float], list[float]]:
+        start_sample = max(0, round(span.start * 16000))
+        end_sample = min(waveform.numel(), round(span.end * 16000))
+        frame = max(1, round(frame_seconds * 16000))
+        hop = max(1, round(hop_seconds * 16000))
+        times: list[float] = []
+        levels: list[float] = []
+        cursor = start_sample
+        while cursor + frame <= end_sample:
+            part = waveform[cursor : cursor + frame]
+            rms = torch.sqrt(torch.mean(part.square()) + 1e-12)
+            times.append(cursor / 16000)
+            levels.append(float(20.0 * torch.log10(rms + 1e-12)))
+            cursor += hop
+        return times, levels
+
+    @classmethod
+    def _quiet_gap_ratio(
+        cls,
+        waveform: torch.Tensor,
+        gap: TimeSpan,
+    ) -> tuple[float, float]:
+        """Measure whether a proposed join really contains a silent pause."""
+
+        if gap.duration < 0.06:
+            return 0.0, -120.0
+        _times, levels = cls._frame_db_levels(waveform, gap)
+        context = TimeSpan(max(0.0, gap.start - 0.40), gap.end + 0.40)
+        _context_times, context_levels = cls._frame_db_levels(waveform, context)
+        if not levels or not context_levels:
+            return 0.0, -120.0
+        speech_level = float(torch.quantile(torch.tensor(context_levels), 0.75))
+        quiet_floor = min(-38.0, speech_level - 15.0)
+        ratio = sum(level <= quiet_floor for level in levels) / len(levels)
+        return float(ratio), float(quiet_floor)
+
+    @staticmethod
+    def _shared_source_speech_block(
+        left: TimeSpan,
+        right: TimeSpan,
+        source_speech_spans: Iterable[TimeSpan],
+        *,
+        tolerance: float = 0.03,
+    ) -> TimeSpan | None:
+        """Return the original VAD block containing both proposed sentence parts."""
+
+        merged_start = min(left.start, right.start)
+        merged_end = max(left.end, right.end)
+        return next(
+            (
+                block
+                for block in source_speech_spans
+                if block.start <= merged_start + tolerance
+                and merged_end <= block.end + tolerance
+            ),
+            None,
+        )
+
+    @classmethod
+    def _refine_boundary_to_quiet_gap(
+        cls,
+        waveform: torch.Tensor,
+        candidate: TimeSpan,
+        boundary: float,
+        *,
+        target_side: str,
+        radius: float = 0.50,
+    ) -> tuple[float, list[dict[str, float]]]:
+        """Snap a coarse identity change to the adjacent short acoustic pause."""
+
+        search = TimeSpan(
+            max(candidate.start, boundary - radius),
+            min(candidate.end, boundary + radius),
+        )
+        times, levels = cls._frame_db_levels(waveform, search)
+        if not times:
+            return boundary, []
+        speech_level = float(torch.quantile(torch.tensor(levels), 0.75))
+        quiet_floor = max(-55.0, min(-38.0, speech_level - 18.0))
+        quiet = [level <= quiet_floor for level in levels]
+        runs: list[dict[str, float]] = []
+        index = 0
+        while index < len(quiet):
+            if not quiet[index]:
+                index += 1
+                continue
+            first = index
+            while index + 1 < len(quiet) and quiet[index + 1]:
+                index += 1
+            start = times[first]
+            end = times[index] + 0.02
+            if end - start >= 0.06:
+                runs.append(
+                    {
+                        "start": round(start, 5),
+                        "end": round(end, 5),
+                        "duration": round(end - start, 5),
+                        "threshold_db": round(quiet_floor, 3),
+                    }
+                )
+            index += 1
+
+        if target_side == "left":
+            following = [run for run in runs if run["start"] >= boundary - 0.02]
+            refined = following[0]["end"] if following else boundary
+        else:
+            preceding = [run for run in runs if run["end"] <= boundary + 0.02]
+            refined = preceding[-1]["end"] if preceding else boundary
+        refined = min(candidate.end - 0.20, max(candidate.start + 0.20, refined))
+        return float(refined), runs
+
+    def _repair_final_sentence_boundaries(
         self,
         accepted_turns: list[CandidateSentence],
-        turn_spans: list[TimeSpan],
-        stable_boundaries: list[SpeakerBoundary],
+        rejected: list[CandidateSentence],
+        scored_turns: list[
+            tuple[TimeSpan, CandidateSentence, SpeakerMatchDecision | None]
+        ],
         verifier: DualSpeakerVerifier,
         profile: SpeakerMatchProfile,
+        audio_path: Path,
         waveform: torch.Tensor,
-        target_spans: list[TimeSpan],
         exclusion_profiles: list[ExclusionSpeakerProfile],
         threshold: float,
-        forbidden_joins: Iterable[TimeSpan],
+        blocked_join_spans: Iterable[TimeSpan],
+        source_speech_spans: Iterable[TimeSpan],
         progress: ProgressCallback,
-    ) -> int:
-        """Restore a short clipped edge inside an otherwise stable turn.
+    ) -> tuple[int, int]:
+        """Repair only proven edge omissions and mixed recovery candidates.
 
-        Target locators can stop at the last high-energy phoneme even when the
-        original VAD/speaker turn continues for a short tail.  The extension
-        is considered only when no multi-scale boundary occurs anywhere in the
-        source turn and the complete source turn passes verification again.
-        This prevents the old locator recovery from re-installing a mixed turn.
+        Short edges are never exported or identified independently. A missing
+        edge must remain inside the same original VAD block as the accepted
+        core, and the complete sentence must pass the regular dual-model and
+        exclusion audits. Internal cropping is limited to a recovery candidate
+        with one independently stable identity boundary.
         """
 
-        if not accepted_turns or not turn_spans:
-            return 0
-        structural = [
-            boundary
-            for boundary in stable_boundaries
-            if self._is_structural_boundary(boundary)
-        ]
-        recovered: list[CandidateSentence] = []
-        for candidate in list(accepted_turns):
-            if candidate.diagnostics.get("local_boundary_recovery"):
-                continue
-            try:
-                turn_index = int(candidate.diagnostics.get("speaker_turn_index", -1))
-            except (TypeError, ValueError):
-                turn_index = -1
-            source = turn_spans[turn_index] if 0 <= turn_index < len(turn_spans) else None
-            if source is None or not (
-                source.start <= candidate.start + 0.05
-                and candidate.end <= source.end + 0.05
-            ):
-                containing = [
-                    span
-                    for span in turn_spans
-                    if span.start <= candidate.start + 0.05
-                    and candidate.end <= span.end + 0.05
-                ]
-                if not containing:
-                    continue
-                source = min(containing, key=lambda item: item.duration)
-            if (
-                source.start > candidate.start + 0.05
-                or source.end < candidate.end - 0.05
-            ):
-                continue
-            extension = source.duration - candidate.duration
-            # Low-energy sentence edges can be substantially longer than the
-            # old fixed 1.25 s allowance.  The extension is still bounded and
-            # must pass an independent side check below; this is not a global
-            # threshold relaxation.
-            maximum_extension = max(
-                1.25,
-                min(2.40, self.options.silence_split_seconds * 2.5),
+        if not accepted_turns:
+            return 0, 0
+        tertiary, tertiary_profile = verifier._tertiary_pair(profile)
+        same_speaker_floor = self._wavlm_same_speaker_floor(tertiary_profile)
+        cropped = 0
+        expanded = 0
+        boundary_splitter: LocalSpeakerTurnSplitter | None = None
+
+        crop_candidates = [
+            candidate
+            for candidate in accepted_turns
+            if candidate.diagnostics.get("multi_model_target_recovery")
+            and int(
+                candidate.diagnostics.get(
+                    "multi_model_internal_boundary_count", 0
+                )
+                or 0
             )
-            if not 0.05 <= extension <= maximum_extension:
-                continue
-            if source.duration > min(20.0, self.options.max_sentence_seconds):
-                continue
-            if any(source.start + 0.30 < boundary.time < source.end - 0.30 for boundary in structural):
-                continue
-            if any(
-                min(source.end, blocked.end) - max(source.start, blocked.start) > 0.01
-                for blocked in forbidden_joins
-            ):
-                continue
-            coverage = self._target_coverage(source, target_spans)
-            if target_spans and coverage < 0.55:
-                continue
-
-            # Audit both missing sides independently.  The previous code chose
-            # either the head or tail, so a candidate clipped on both ends
-            # could never recover the second valid side.
-            edge_results: list[tuple[str, TimeSpan, float]] = []
-            edge_details: list[dict[str, object]] = []
-            if candidate.start > source.start + 0.05:
-                edge_results.append(
-                    ("head", TimeSpan(source.start, candidate.start), 0.0)
+            == 1
+            and candidate.diagnostics.get("speaker_tier")
+            not in {"short_strong", "strong", "balanced"}
+            and candidate.duration >= self.options.min_output_seconds * 2
+        ]
+        if crop_candidates:
+            assert verifier.secondary is not None
+            boundary_splitter = LocalSpeakerTurnSplitter(
+                verifier.primary,
+                secondary=verifier.secondary,
+            )
+            boundaries = boundary_splitter.detect_multiscale_speaker_boundaries(
+                audio_path,
+                [TimeSpan(item.start, item.end) for item in crop_candidates],
+                progress=lambda value, message: progress(
+                    0.40 * value,
+                    f"恢复候选边界终审：{message}",
+                ),
+            )
+            for candidate in list(crop_candidates):
+                local = [
+                    boundary
+                    for boundary in boundaries
+                    if candidate.start + 0.20
+                    <= boundary.time
+                    <= candidate.end - 0.20
+                ]
+                if len(local) != 1:
+                    continue
+                boundary = local[0]
+                left = TimeSpan(candidate.start, boundary.time)
+                right = TimeSpan(boundary.time, candidate.end)
+                parts = [
+                    self._waveform_span(waveform, left),
+                    self._waveform_span(waveform, right),
+                ]
+                primary_embeddings = verifier.primary._embeddings_from_waveforms(parts)
+                secondary_embeddings = verifier.secondary._embeddings_from_waveforms(parts)
+                tertiary_embeddings = tertiary._embeddings_from_waveforms(parts)
+                pair_similarity = float(
+                    tertiary_embeddings[0] @ tertiary_embeddings[1]
                 )
-            if source.end > candidate.end + 0.05:
-                edge_results.append(
-                    ("tail", TimeSpan(candidate.end, source.end), 0.0)
+                if pair_similarity >= same_speaker_floor:
+                    continue
+                secondary_profile = verifier._ensure_secondary(profile)
+                left_scores = (
+                    float(primary_embeddings[0] @ profile.primary.centroid),
+                    float(secondary_embeddings[0] @ secondary_profile.centroid),
+                    float(tertiary_embeddings[0] @ tertiary_profile.centroid),
                 )
-            if not edge_results:
-                continue
+                right_scores = (
+                    float(primary_embeddings[1] @ profile.primary.centroid),
+                    float(secondary_embeddings[1] @ secondary_profile.centroid),
+                    float(tertiary_embeddings[1] @ tertiary_profile.centroid),
+                )
+                margins = tuple(
+                    left_score - right_score
+                    for left_score, right_score in zip(left_scores, right_scores)
+                )
+                left_wins = all(value > 0.0 for value in margins)
+                right_wins = all(value < 0.0 for value in margins)
+                if not (left_wins or right_wins):
+                    continue
+                if (
+                    abs(margins[0]) < 0.08
+                    or abs(margins[1]) < 0.08
+                    or abs(margins[2]) < 0.15
+                ):
+                    continue
+                target_side = "left" if left_wins else "right"
+                refined, quiet_runs = self._refine_boundary_to_quiet_gap(
+                    waveform,
+                    TimeSpan(candidate.start, candidate.end),
+                    boundary.time,
+                    target_side=target_side,
+                )
+                retained_span = (
+                    TimeSpan(candidate.start, refined)
+                    if target_side == "left"
+                    else TimeSpan(refined, candidate.end)
+                )
+                discarded_span = (
+                    TimeSpan(refined, candidate.end)
+                    if target_side == "left"
+                    else TimeSpan(candidate.start, refined)
+                )
+                if retained_span.duration < self.options.min_output_seconds:
+                    continue
+                retained_match = self._verify_speaker_span(
+                    verifier,
+                    waveform,
+                    retained_span,
+                    profile,
+                    threshold,
+                )
+                exclusion = verifier.exclusion_audit(
+                    retained_match,
+                    profile,
+                    exclusion_profiles,
+                )
+                if exclusion and exclusion.get("excluded_role_rejected"):
+                    continue
 
-            supported_edges: list[tuple[str, TimeSpan, float]] = []
-            for edge_kind, edge_span, _ in edge_results:
+                replacement = CandidateSentence(
+                    retained_span.start,
+                    retained_span.end,
+                    "",
+                )
+                replacement.diagnostics.update(candidate.diagnostics)
+                self._apply_speaker_match(
+                    replacement,
+                    retained_match,
+                    profile,
+                    threshold,
+                )
+                replacement.diagnostics.update(
+                    {
+                        "final_identity_boundary_crop": True,
+                        "final_identity_parent_span": [
+                            candidate.start,
+                            candidate.end,
+                        ],
+                        "final_identity_boundary": boundary.to_dict(),
+                        "final_identity_refined_boundary": round(refined, 5),
+                        "final_identity_target_side": target_side,
+                        "final_identity_wavlm_pair": round(pair_similarity, 5),
+                        "final_identity_wavlm_same_floor": round(
+                            same_speaker_floor, 5
+                        ),
+                        "final_identity_target_margins": [
+                            round(value, 5) for value in margins
+                        ],
+                        "final_identity_quiet_runs": quiet_runs,
+                    }
+                )
+                if exclusion is not None:
+                    replacement.diagnostics.update(exclusion)
+                accepted_turns.remove(candidate)
+                accepted_turns.append(replacement)
+                discarded = CandidateSentence(
+                    discarded_span.start,
+                    discarded_span.end,
+                    "",
+                    reject_reason="检测到连续换人，已裁掉非目标人物一侧",
+                )
+                discarded.diagnostics.update(
+                    {
+                        "final_identity_boundary_discard": True,
+                        "final_identity_parent_span": [
+                            candidate.start,
+                            candidate.end,
+                        ],
+                    }
+                )
+                rejected.append(discarded)
+                cropped += 1
+
+        accepted_turns.sort(key=lambda item: (item.start, item.end))
+        accepted_ids = {id(candidate) for candidate in accepted_turns}
+        edge_pool = [
+            (candidate, match)
+            for _span, candidate, match in scored_turns
+            if match is not None
+            and not match.accepted
+            and id(candidate) not in accepted_ids
+            and candidate.duration >= self.options.min_sentence_seconds
+            and candidate.duration <= min(8.0, self.options.max_sentence_seconds)
+        ]
+        blocked = tuple(blocked_join_spans)
+        source_blocks = tuple(source_speech_spans)
+        used_edges: set[int] = set()
+        for core in list(accepted_turns):
+            core_span = TimeSpan(core.start, core.end)
+            plans: list[tuple[float, CandidateSentence, TimeSpan]] = []
+            for edge, _match in edge_pool:
+                if id(edge) in used_edges:
+                    continue
+                edge_span = TimeSpan(edge.start, edge.end)
+                if any(
+                    min(edge_span.end, existing.end)
+                    - max(edge_span.start, existing.start)
+                    > 0.10
+                    for existing in accepted_turns
+                ):
+                    continue
+                left_gap = core_span.start - edge_span.end
+                right_gap = edge_span.start - core_span.end
+                if 0.06 <= left_gap <= self.options.silence_split_seconds:
+                    merged_span = TimeSpan(edge_span.start, core_span.end)
+                    gap_span = TimeSpan(edge_span.end, core_span.start)
+                    plans.append((left_gap, edge, merged_span))
+                elif 0.06 <= right_gap <= self.options.silence_split_seconds:
+                    merged_span = TimeSpan(core_span.start, edge_span.end)
+                    gap_span = TimeSpan(core_span.end, edge_span.start)
+                    plans.append((right_gap, edge, merged_span))
+            if not plans:
+                continue
+            for gap, edge, merged_span in sorted(plans, key=lambda item: item[0]):
+                edge_span = TimeSpan(edge.start, edge.end)
+                gap_span = (
+                    TimeSpan(edge.end, core.start)
+                    if edge.end <= core.start
+                    else TimeSpan(core.end, edge.start)
+                )
+                if any(
+                    min(gap_span.end, dirty.end)
+                    - max(gap_span.start, dirty.start)
+                    > 0.01
+                    for dirty in blocked
+                ):
+                    continue
+                quiet_ratio, quiet_floor = self._quiet_gap_ratio(
+                    waveform,
+                    gap_span,
+                )
+                if quiet_ratio < 0.50:
+                    continue
+                source_block = self._shared_source_speech_block(
+                    core_span,
+                    edge_span,
+                    source_blocks,
+                )
+                if source_block is None:
+                    continue
+                initial_match = self._verify_speaker_span(
+                    verifier,
+                    waveform,
+                    merged_span,
+                    profile,
+                    threshold,
+                )
+                if not initial_match.accepted:
+                    continue
+                initial_exclusion = verifier.exclusion_audit(
+                    initial_match,
+                    profile,
+                    exclusion_profiles,
+                )
+                if initial_exclusion and initial_exclusion.get(
+                    "excluded_role_rejected"
+                ):
+                    continue
+
+                internal_boundary: SpeakerBoundary | None = None
+                discarded_internal_span: TimeSpan | None = None
+                if edge_span.duration >= 1.40:
+                    if boundary_splitter is None:
+                        assert verifier.secondary is not None
+                        boundary_splitter = LocalSpeakerTurnSplitter(
+                            verifier.primary,
+                            secondary=verifier.secondary,
+                        )
+                    internal_boundaries = (
+                        boundary_splitter.detect_multiscale_speaker_boundaries(
+                            audio_path,
+                            [edge_span],
+                            contexts=(0.50, 0.60, 0.70),
+                            cluster_seconds=0.25,
+                            minimum_context_votes=3,
+                            scan_hop_seconds=0.05,
+                            primary_candidate_threshold=0.82,
+                            minimum_similarity_drop=0.04,
+                            minimum_separation_seconds=0.15,
+                            progress=lambda value, message: progress(
+                                0.55 + 0.25 * value,
+                                f"新增句尾换人复核：{message}",
+                            ),
+                        )
+                    )
+                    decisive = [
+                        boundary
+                        for boundary in internal_boundaries
+                        if edge_span.start + 0.45
+                        <= boundary.time
+                        <= edge_span.end - 0.45
+                        and boundary.scale_votes >= 3
+                        and boundary.primary_similarity <= 0.20
+                        and boundary.secondary_similarity is not None
+                        and boundary.secondary_similarity <= 0.10
+                    ]
+                    if decisive:
+                        edge_on_left = edge_span.end <= core_span.start
+                        internal_boundary = (
+                            decisive[-1] if edge_on_left else decisive[0]
+                        )
+                        if edge_on_left:
+                            discarded_internal_span = TimeSpan(
+                                edge_span.start,
+                                internal_boundary.time,
+                            )
+                            edge_span = TimeSpan(
+                                internal_boundary.time,
+                                edge_span.end,
+                            )
+                            merged_span = TimeSpan(
+                                internal_boundary.time,
+                                core_span.end,
+                            )
+                        else:
+                            discarded_internal_span = TimeSpan(
+                                internal_boundary.time,
+                                edge_span.end,
+                            )
+                            edge_span = TimeSpan(
+                                edge_span.start,
+                                internal_boundary.time,
+                            )
+                            merged_span = TimeSpan(
+                                core_span.start,
+                                internal_boundary.time,
+                            )
+                        if edge_span.duration < self.options.min_sentence_seconds:
+                            continue
+
+                core_audio = self._waveform_span(waveform, core_span)
+                edge_audio = self._waveform_span(waveform, edge_span)
+                edge_embeddings = tertiary._embeddings_from_waveforms(
+                    [core_audio, edge_audio]
+                )
+                pair_similarity = float(edge_embeddings[0] @ edge_embeddings[1])
+                edge_target_score = float(
+                    edge_embeddings[1] @ tertiary_profile.centroid
+                )
+                # A rejected neighboring turn must never inherit the accepted
+                # core's identity.  The edge is a separate utterance after a
+                # quiet gap, so it needs both an independent target decision
+                # and local same-speaker continuity before it can be joined.
+                if pair_similarity < same_speaker_floor:
+                    continue
                 edge_match = self._verify_speaker_span(
                     verifier,
                     waveform,
@@ -1525,124 +1056,117 @@ class ExtractionPipeline:
                     profile,
                     threshold,
                 )
-                edge_coverage = self._target_coverage(edge_span, target_spans)
-                # Locator coverage is only a hint. It cannot promote an edge
-                # whose independent speaker identity check failed.
-                edge_supported = (
-                    edge_match.accepted
-                    or self._target_side_recovery_support(
-                        edge_match,
-                        edge_span.duration,
-                        threshold,
-                    )
-                    or self._short_edge_recovery_support(
-                        edge_match,
-                        edge_span.duration,
-                        threshold,
-                    )
-                )
+                if not edge_match.accepted:
+                    continue
                 edge_exclusion = verifier.exclusion_audit(
                     edge_match,
                     profile,
                     exclusion_profiles,
                 )
                 if edge_exclusion and edge_exclusion.get("excluded_role_rejected"):
-                    edge_supported = False
-                edge_details.append(
+                    continue
+                merged_match = self._verify_speaker_span(
+                    verifier,
+                    waveform,
+                    merged_span,
+                    profile,
+                    threshold,
+                )
+                if not merged_match.accepted:
+                    continue
+                identity_match = merged_match
+                exclusion = verifier.exclusion_audit(
+                    identity_match,
+                    profile,
+                    exclusion_profiles,
+                )
+                if exclusion and exclusion.get("excluded_role_rejected"):
+                    continue
+
+                replacement = CandidateSentence(
+                    merged_span.start,
+                    merged_span.end,
+                    "",
+                )
+                replacement.diagnostics.update(core.diagnostics)
+                self._apply_speaker_match(
+                    replacement,
+                    identity_match,
+                    profile,
+                    threshold,
+                )
+                replacement.diagnostics.update(
                     {
-                        "edge": edge_kind,
-                        "start": edge_span.start,
-                        "end": edge_span.end,
-                        "duration": round(edge_span.duration, 5),
-                        "target_coverage": round(edge_coverage, 5),
-                        "supported": edge_supported,
-                        "excluded": bool(
-                            edge_exclusion
-                            and edge_exclusion.get("excluded_role_rejected")
+                        "final_same_speaker_edge_recovery": True,
+                        "final_same_speaker_core_span": [core.start, core.end],
+                        "final_same_speaker_edge_span": [edge.start, edge.end],
+                        "final_same_speaker_gap_seconds": round(gap, 5),
+                        "final_same_speaker_gap_quiet_ratio": round(
+                            quiet_ratio, 5
                         ),
+                        "final_same_speaker_gap_quiet_floor_db": round(
+                            quiet_floor, 3
+                        ),
+                        "final_same_speaker_wavlm_pair": round(
+                            pair_similarity, 5
+                        ),
+                        "final_same_speaker_wavlm_floor": round(
+                            same_speaker_floor, 5
+                        ),
+                        "final_same_speaker_edge_target": round(
+                            edge_target_score, 5
+                        ),
+                        "final_same_speaker_source_block": [
+                            source_block.start,
+                            source_block.end,
+                        ],
+                        "final_same_speaker_internal_boundary": (
+                            internal_boundary.to_dict()
+                            if internal_boundary is not None
+                            else None
+                        ),
+                        "final_target_core_anchored_extension": False,
+                        "post_target_silence_merge": True,
                     }
                 )
-                if edge_supported:
-                    supported_edges.append(
-                        (edge_kind, edge_span, edge_coverage)
-                    )
-            if not supported_edges:
-                continue
-
-            expanded_start = min(
-                [candidate.start]
-                + [edge.start for _kind, edge, _coverage in supported_edges]
-            )
-            expanded_end = max(
-                [candidate.end]
-                + [edge.end for _kind, edge, _coverage in supported_edges]
-            )
-            expanded_span = TimeSpan(expanded_start, expanded_end)
-            expanded_extension = expanded_span.duration - candidate.duration
-            if not 0.05 <= expanded_extension <= maximum_extension:
-                continue
-            expanded_coverage = self._target_coverage(expanded_span, target_spans)
-            match = self._verify_speaker_span(
-                verifier,
-                waveform,
-                expanded_span,
-                profile,
-                threshold,
-            )
-            if not match.accepted:
-                continue
-            exclusion = verifier.exclusion_audit(
-                match,
-                profile,
-                exclusion_profiles,
-            )
-            if exclusion and exclusion.get("excluded_role_rejected"):
-                continue
-
-            expanded = CandidateSentence(expanded_span.start, expanded_span.end, "")
-            expanded.diagnostics.update(candidate.diagnostics)
-            self._apply_speaker_match(expanded, match, profile, threshold)
-            expanded.diagnostics.update(
-                {
-                    "same_turn_edge_recovery": True,
-                    "same_turn_source_start": source.start,
-                    "same_turn_source_end": source.end,
-                    "same_turn_extension_seconds": round(expanded_extension, 5),
-                    "same_turn_edge_sides": [
-                        kind for kind, _edge, _edge_coverage in supported_edges
-                    ],
-                    "same_turn_edge_details": edge_details,
-                    "same_turn_edge_start": min(
-                        edge.start for _kind, edge, _coverage in supported_edges
-                    ),
-                    "same_turn_edge_end": max(
-                        edge.end for _kind, edge, _coverage in supported_edges
-                    ),
-                    "same_turn_edge_coverage": round(
-                        max(coverage, expanded_coverage), 5
-                    ),
-                    "target_coverage": round(expanded_coverage, 5),
-                }
-            )
-            if exclusion is not None:
-                expanded.diagnostics.update(exclusion)
-            recovered.append(expanded)
-
-        if not recovered:
-            return 0
-        for expanded in recovered:
-            for existing in list(accepted_turns):
+                if exclusion is not None:
+                    replacement.diagnostics.update(exclusion)
+                accepted_turns.remove(core)
+                accepted_turns.append(replacement)
+                used_edges.add(id(edge))
+                rejected[:] = [
+                    item for item in rejected if id(item) != id(edge)
+                ]
                 if (
-                    existing.start >= expanded.start - 0.05
-                    and existing.end <= expanded.end + 0.05
+                    discarded_internal_span is not None
+                    and discarded_internal_span.duration >= 0.20
                 ):
-                    accepted_turns.remove(existing)
-            accepted_turns.append(expanded)
+                    discarded_internal = CandidateSentence(
+                        discarded_internal_span.start,
+                        discarded_internal_span.end,
+                        "",
+                        reject_reason="新增句尾内部检测到换人，已裁掉非目标人物一侧",
+                    )
+                    discarded_internal.diagnostics.update(
+                        {
+                            "final_same_speaker_internal_discard": True,
+                            "final_same_speaker_internal_boundary": (
+                                internal_boundary.to_dict()
+                                if internal_boundary is not None
+                                else None
+                            ),
+                        }
+                    )
+                    rejected.append(discarded_internal)
+                expanded += 1
+                break
+
+        accepted_turns.sort(key=lambda item: (item.start, item.end))
         progress(
-            0.76,
-            f"同一说话回合短尾复核：恢复 {len(recovered)} 个完整回合",
+            1.0,
+            f"边界终审完成：补全 {expanded} 段，裁切 {cropped} 段",
         )
-        return len(recovered)
+        return expanded, cropped
 
     def _merge_verified_target_turns(
         self,
@@ -1656,61 +1180,33 @@ class ExtractionPipeline:
         vad_spans: list[TimeSpan],
         forbidden_joins: Iterable[TimeSpan],
         progress: ProgressCallback,
-        exclusion_profiles: Iterable[ExclusionSpeakerProfile] = (),
     ) -> int:
         """Join short-silence fragments only around a formally accepted core.
 
-        Edge fragments never become output by themselves. They may repair a
-        clipped edge next to a strict target turn, or form a short-seed group
-        when no strict core exists. In both cases the two models must agree and
-        the complete joined sentence must pass formal verification again.
+        Edge fragments never become output by themselves.  They may only repair
+        a clipped edge when they are adjacent to a strict target turn,
+        both speaker models regard the neighboring audio as the same voice, and
+        the complete joined sentence passes formal verification again.
         """
 
-        pending_short = [
-            candidate
-            for candidate in rejected
-            if candidate.reject_reason == "说话回合过短"
-            and candidate.diagnostics.get("short_edge_pending")
-            and candidate.duration >= 0.20
-        ]
-        if not accepted_turns and len(pending_short) < 2:
+        if not accepted_turns:
             return 0
         accepted_ids = {id(candidate) for candidate in accepted_turns}
-        # Do not run speaker models for every tiny VAD island in an episode.
-        # Only fragments adjacent to a verified target turn can repair that
-        # turn, so score those pending edges on demand here.
-        pending_edges = [
-            candidate
-            for candidate in pending_short
-            if any(
-                other is not candidate
-                and (
-                    0.0
-                    <= candidate.start - other.end
-                    <= self.options.silence_split_seconds
-                    or 0.0
-                    <= other.start - candidate.end
-                    <= self.options.silence_split_seconds
-                )
-                for other in [*accepted_turns, *pending_short]
-            )
-        ]
-        for candidate in pending_edges:
-            self._verify_short_edge_candidate(
-                candidate,
-                verifier,
-                waveform,
-                profile,
-                list(exclusion_profiles),
-                threshold,
-            )
         possible_edges = [
             candidate
             for candidate in rejected
-            if candidate.reject_reason in {"声纹匹配不足", "说话回合过短"}
-            and self._short_edge_can_join(
-                candidate,
-                max(1.20, self.options.min_output_seconds),
+            if candidate.reject_reason == "声纹匹配不足"
+            and (
+                candidate.diagnostics.get("speaker_tier") == "recall"
+                or (
+                    candidate.duration >= 1.20
+                    and float(candidate.diagnostics.get("eres_score", 0.0)) >= 0.50
+                    and float(candidate.diagnostics.get("camplus_score", 0.0)) >= 0.50
+                    and float(
+                        candidate.diagnostics.get("paired_reference_median", 0.0)
+                    )
+                    >= 0.40
+                )
             )
             and not any(
                 min(candidate.end, accepted.end) - max(candidate.start, accepted.start)
@@ -1741,18 +1237,6 @@ class ExtractionPipeline:
                 candidate = min(right, key=lambda item: item.start)
                 edge_by_id[id(candidate)] = candidate
         recall_edges = list(edge_by_id.values())
-        recall_ids = {id(candidate) for candidate in recall_edges}
-        short_only_edges = [
-            candidate
-            for candidate in possible_edges
-            if id(candidate) not in recall_ids
-        ]
-        for group in self._short_seed_groups(
-            short_only_edges,
-            self.options.silence_split_seconds,
-            max(1.20, self.options.min_output_seconds),
-        ):
-            recall_edges.extend(group)
         pool = sorted(
             [*accepted_turns, *recall_edges],
             key=lambda item: (item.start, item.end),
@@ -1783,13 +1267,7 @@ class ExtractionPipeline:
             strict_members = [
                 candidate for candidate in members if id(candidate) in accepted_ids
             ]
-            short_seed_members = [
-                candidate
-                for candidate in members
-                if candidate.diagnostics.get("short_edge_evidence")
-            ]
-            short_only = not strict_members
-            if short_only and len(short_seed_members) < 2:
+            if not strict_members:
                 continue
             if len(members) == 1:
                 output.append(strict_members[0])
@@ -1798,15 +1276,10 @@ class ExtractionPipeline:
             coverage = self._target_coverage(merged_span, target_spans)
             if (
                 merged_span.duration > min(20.0, self.options.max_sentence_seconds)
-                or (coverage < 0.30 and not short_only)
-                or (
-                    short_only
-                    and merged_span.duration < max(1.20, self.options.min_output_seconds)
-                )
+                or coverage < 0.30
             ):
-                if strict_members:
-                    output.extend(strict_members)
-                    used_accepted_ids.update(id(candidate) for candidate in strict_members)
+                output.extend(strict_members)
+                used_accepted_ids.update(id(candidate) for candidate in strict_members)
                 continue
             match = self._verify_speaker_span(
                 verifier,
@@ -1815,16 +1288,7 @@ class ExtractionPipeline:
                 profile,
                 threshold,
             )
-            merged_exclusion = verifier.exclusion_audit(
-                match,
-                profile,
-                list(exclusion_profiles),
-            )
             if not match.accepted:
-                output.extend(strict_members)
-                used_accepted_ids.update(id(candidate) for candidate in strict_members)
-                continue
-            if merged_exclusion and merged_exclusion.get("excluded_role_rejected"):
                 output.extend(strict_members)
                 used_accepted_ids.update(id(candidate) for candidate in strict_members)
                 continue
@@ -1836,7 +1300,6 @@ class ExtractionPipeline:
                     "post_target_silence_merge": True,
                     "merged_strict_target_count": len(strict_members),
                     "merged_recall_edge_count": len(members) - len(strict_members),
-                    "short_seed_merge": short_only,
                     "target_coverage": round(coverage, 5),
                     "speech_ratio": round(
                         speech_ratio(vad_spans, merged_span.start, merged_span.end),
@@ -1874,171 +1337,6 @@ class ExtractionPipeline:
                 candidate for candidate in rejected if id(candidate) not in used_recall_ids
             ]
         return merged_count
-
-    def _repartition_long_target_turns(
-        self,
-        accepted_turns: list[CandidateSentence],
-        rejected: list[CandidateSentence],
-        verifier: DualSpeakerVerifier,
-        profile: SpeakerMatchProfile,
-        waveform: torch.Tensor,
-        target_spans: list[TimeSpan],
-        exclusion_profiles: list[ExclusionSpeakerProfile],
-        threshold: float,
-        progress: ProgressCallback,
-    ) -> int:
-        """Re-score target evidence inside a long, low-coverage turn.
-
-        A whole-turn embedding can be strong after averaging several speakers.
-        When the locator covers only part of such a turn, the original span is
-        therefore not exportable.  We form groups from the locator's positive
-        regions, verify each group independently, and discard the mixed parent.
-        The larger bridge is used only inside this recovery pass: it repairs
-        locator holes within one continuous VAD island and never joins two
-        silence islands globally.
-        """
-
-        if not accepted_turns or not target_spans:
-            return 0
-        evidence_bridge = max(1.50, self.options.silence_split_seconds)
-        replaced = 0
-        for parent in list(accepted_turns):
-            coverage = float(parent.diagnostics.get("target_coverage", 1.0))
-            if parent.duration < 8.0 or coverage >= 0.90:
-                continue
-            evidence = sorted(
-                {
-                    (round(max(parent.start, item.start), 5),
-                     round(min(parent.end, item.end), 5))
-                    for item in target_spans
-                    if min(parent.end, item.end) - max(parent.start, item.start) >= 0.35
-                }
-            )
-            if not evidence:
-                continue
-            # First identify at least one independently matching locator
-            # interval. Unsupported intervals before that anchor are usually
-            # the other speaker's lead-in and must not be averaged into the
-            # recovered target. Intervals after an anchor may fill a short
-            # locator hole and are rechecked on the complete group below.
-            supported_indexes: list[int] = []
-            for index, (start, end) in enumerate(evidence):
-                item = TimeSpan(start, end)
-                if item.duration < 0.75:
-                    continue
-                item_match = self._verify_speaker_span(
-                    verifier, waveform, item, profile, threshold
-                )
-                if item_match.accepted:
-                    supported_indexes.append(index)
-            if not supported_indexes:
-                parent.reject_reason = "疑似混合说话人，保守舍弃"
-                accepted_turns.remove(parent)
-                rejected.append(parent)
-                continue
-            groups: list[TimeSpan] = []
-            anchor = supported_indexes[0]
-            start, end = evidence[anchor]
-            for index in range(anchor + 1, len(evidence)):
-                next_start, next_end = evidence[index]
-                if next_start - end > evidence_bridge:
-                    groups.append(TimeSpan(start, end))
-                    start, end = next_start, next_end
-                else:
-                    end = max(end, next_end)
-            groups.append(TimeSpan(start, end))
-
-            replacements: list[CandidateSentence] = []
-            for group in groups:
-                if group.duration < max(2.20, self.options.min_output_seconds):
-                    continue
-                group_coverage = self._target_coverage(group, target_spans)
-                if group_coverage < 0.70:
-                    continue
-                group_match = self._verify_speaker_span(
-                    verifier, waveform, group, profile, threshold
-                )
-                if not group_match.accepted and group.duration <= 15.0:
-                    group_match = (
-                        verifier.promote_with_tertiary(
-                            self._waveform_span(waveform, group),
-                            profile,
-                            group_match,
-                            group.duration,
-                        )
-                        or group_match
-                    )
-                if not group_match.accepted:
-                    continue
-                exclusion = verifier.exclusion_audit(
-                    group_match, profile, exclusion_profiles,
-                    tertiary_recovery=group_match.tier == "tertiary",
-                )
-                if exclusion and exclusion.get("excluded_role_rejected"):
-                    continue
-                replacement = CandidateSentence(group.start, group.end, "")
-                self._apply_speaker_match(replacement, group_match, profile, threshold)
-                replacement.diagnostics.update(
-                    {
-                        "long_turn_repartition": True,
-                        "long_turn_parent_start": parent.start,
-                        "long_turn_parent_end": parent.end,
-                        "long_turn_parent_coverage": round(coverage, 5),
-                        "target_coverage": round(group_coverage, 5),
-                    }
-                )
-                if exclusion is not None:
-                    replacement.diagnostics.update(exclusion)
-                replacements.append(replacement)
-
-            if not replacements:
-                parent.reject_reason = "疑似混合说话人，保守舍弃"
-                accepted_turns.remove(parent)
-                rejected.append(parent)
-                continue
-            accepted_turns.remove(parent)
-            parent.reject_reason = "疑似混合说话人，保守舍弃"
-            rejected.append(parent)
-            accepted_turns.extend(replacements)
-            replaced += len(replacements)
-
-        if replaced:
-            accepted_turns.sort(key=lambda item: (item.start, item.end))
-            progress(0.80, f"长回合递归重分配：恢复 {replaced} 个独立目标段")
-        return replaced
-
-    @staticmethod
-    def _prune_weak_recovery_candidates(
-        accepted_turns: list[CandidateSentence],
-        rejected: list[CandidateSentence],
-    ) -> int:
-        """Remove recovery promotions that lack a complete target region."""
-
-        removed = 0
-        retained: list[CandidateSentence] = []
-        for candidate in accepted_turns:
-            diagnostics = candidate.diagnostics
-            coverage = float(diagnostics.get("target_coverage", 1.0) or 0.0)
-            locator_fragment = (
-                bool(diagnostics.get("target_locator_recovery"))
-                and not bool(diagnostics.get("post_target_silence_merge"))
-                and candidate.duration < 8.0
-                and coverage < 0.90
-            )
-            weak_cluster_fragment = (
-                bool(diagnostics.get("multi_model_target_recovery"))
-                and diagnostics.get("speaker_tier") == "rejected"
-                and candidate.duration < 8.0
-                and coverage < 0.85
-            )
-            if locator_fragment or weak_cluster_fragment:
-                candidate.reject_reason = "局部目标候选未连接到完整句"
-                rejected.append(candidate)
-                removed += 1
-            else:
-                retained.append(candidate)
-        accepted_turns[:] = retained
-        return removed
 
     def _build_adaptive_speaker_profile(
         self,
@@ -2208,7 +1506,6 @@ class ExtractionPipeline:
         cuts = [span.start, *candidates, span.end]
         parts = [TimeSpan(start, end) for start, end in zip(cuts, cuts[1:])]
         accepted: list[tuple[CandidateSentence, SpeakerMatchDecision]] = []
-        edge_supported: list[tuple[CandidateSentence, SpeakerMatchDecision]] = []
         rejected: list[CandidateSentence] = []
         for part_index, part in enumerate(parts, start=1):
             match: SpeakerMatchDecision | None = None
@@ -2222,25 +1519,10 @@ class ExtractionPipeline:
                     "recovery_part_index": part_index,
                     "recovery_part_count": len(parts),
                     "recovery_boundaries": candidates,
-                    "recovery_boundary_details": [
-                        boundary.to_dict() for boundary in boundaries
-                    ],
                 }
             )
             if part.duration < minimum:
-                # A boundary can isolate a low-energy target phoneme.  Score
-                # it as non-exportable edge evidence so the later merge pass
-                # can reunite it with an adjacent complete target turn.
-                match = self._verify_short_edge_candidate(
-                    candidate,
-                    verifier,
-                    waveform,
-                    profile,
-                    exclusion_profiles,
-                    threshold,
-                )
-                if match is None:
-                    candidate.reject_reason = "说话回合过短"
+                candidate.reject_reason = "说话回合过短"
             else:
                 match = self._verify_speaker_span(
                     verifier, waveform, part, profile, threshold
@@ -2280,15 +1562,6 @@ class ExtractionPipeline:
                         candidate.diagnostics["local_edge_only"] = (
                             original_match_tier == "rejected"
                         )
-                    elif self._target_side_recovery_support(
-                        match,
-                        part.duration,
-                        threshold,
-                    ):
-                        # Keep a recall-quality side available for one joined
-                        # sentence, but never expose it as an independent clip.
-                        candidate.diagnostics["target_side_recovery_evidence"] = True
-                        candidate.reject_reason = "声纹匹配不足"
                     elif not candidate.reject_reason:
                         candidate.reject_reason = "声纹匹配不足"
             progress(
@@ -2302,13 +1575,7 @@ class ExtractionPipeline:
                 f"片段 {part_index}/{len(parts)}",
             )
             if candidate.reject_reason:
-                if (
-                    candidate.diagnostics.get("target_side_recovery_evidence")
-                    and match is not None
-                ):
-                    edge_supported.append((candidate, match))
-                else:
-                    rejected.append(candidate)
+                rejected.append(candidate)
             else:
                 assert match is not None
                 accepted.append((candidate, match))
@@ -2317,30 +1584,18 @@ class ExtractionPipeline:
         # only to audit the change points; exporting each phonetic fragment
         # separately would recreate the incomplete-sentence problem.
         merged_accepted: list[tuple[CandidateSentence, SpeakerMatchDecision]] = []
-        merge_pool = sorted(
-            [*accepted, *edge_supported],
-            key=lambda item: (item[0].start, item[0].end),
-        )
-        accepted_ids = {id(candidate) for candidate, _match in accepted}
         cursor = 0
-        while cursor < len(merge_pool):
-            group = [merge_pool[cursor]]
+        while cursor < len(accepted):
+            group = [accepted[cursor]]
             cursor += 1
             while (
-                cursor < len(merge_pool)
-                and merge_pool[cursor][0].start - group[-1][0].end <= 0.02
+                cursor < len(accepted)
+                and accepted[cursor][0].start - group[-1][0].end <= 0.02
             ):
-                group.append(merge_pool[cursor])
+                group.append(accepted[cursor])
                 cursor += 1
-            strict_group = [item for item in group if id(item[0]) in accepted_ids]
-            if not strict_group:
-                rejected.extend(item[0] for item in group)
-                continue
             if len(group) == 1:
-                merged_accepted.extend(strict_group)
-                rejected.extend(
-                    item[0] for item in group if id(item[0]) not in accepted_ids
-                )
+                merged_accepted.extend(group)
                 continue
             joined_span = TimeSpan(group[0][0].start, group[-1][0].end)
             joined_match = self._verify_speaker_span(
@@ -2383,23 +1638,14 @@ class ExtractionPipeline:
                         "original_turn_start": span.start,
                         "original_turn_end": span.end,
                         "local_target_parts_merged": len(group),
-                        "local_target_side_evidence_merged": sum(
-                            id(item[0]) not in accepted_ids for item in group
-                        ),
                         "recovery_boundaries": candidates,
-                        "recovery_boundary_details": [
-                            boundary.to_dict() for boundary in boundaries
-                        ],
                     }
                 )
                 if joined_exclusion is not None:
                     joined.diagnostics.update(joined_exclusion)
                 merged_accepted.append((joined, joined_match))
             else:
-                merged_accepted.extend(strict_group)
-                rejected.extend(
-                    item[0] for item in group if id(item[0]) not in accepted_ids
-                )
+                merged_accepted.extend(group)
         accepted = merged_accepted
 
         if not accepted:
@@ -2411,9 +1657,6 @@ class ExtractionPipeline:
                 {
                     "local_boundary_recovery": True,
                     "recovery_boundaries": candidates,
-                    "recovery_boundary_details": [
-                        boundary.to_dict() for boundary in boundaries
-                    ],
                 }
             )
             return [], [discarded]
@@ -2764,7 +2007,6 @@ class ExtractionPipeline:
         profile: SpeakerMatchProfile,
         audio_path: Path,
         waveform: torch.Tensor,
-        target_spans: list[TimeSpan],
         exclusion_profiles: list[ExclusionSpeakerProfile],
         progress: ProgressCallback,
     ) -> int:
@@ -2793,102 +2035,6 @@ class ExtractionPipeline:
             and match.primary.embedding is not None
             and match.secondary.embedding is not None
         }
-        # A mixed original turn can fail whole-clip verification even when
-        # one side is a clean target sentence.  Feed stable recovery pieces
-        # into the same anchor-consensus path instead of lowering the global
-        # speaker threshold for the mixed turn.
-        recovery_pieces: list[CandidateSentence] = []
-        recovery_sources: dict[
-            tuple[float, float], tuple[CandidateSentence, list[float]]
-        ] = {}
-        low_coverage_parent_ids: set[int] = set()
-        for parent in list(rejected):
-            if parent.reject_reason not in {
-                "声纹匹配不足",
-                "疑似混合说话人，目标声纹不连续",
-                "疑似混合说话人，保守舍弃",
-            }:
-                continue
-            coverage = float(parent.diagnostics.get("target_coverage", 1.0) or 0.0)
-            is_split_piece = bool(parent.diagnostics.get("recovery_subsegment"))
-            stable_times = self._candidate_boundary_times(parent)
-            continuity_ratio = float(
-                parent.diagnostics.get("multi_model_continuity_ratio", 1.0) or 1.0
-            )
-            mixed_evidence = bool(
-                stable_times
-                or int(
-                    parent.diagnostics.get(
-                        "multi_model_internal_boundary_count", 0
-                    )
-                    or 0
-                )
-                > 0
-                or continuity_ratio < 0.70
-            )
-            if coverage < 0.85 and mixed_evidence and not is_split_piece:
-                low_coverage_parent_ids.add(id(parent))
-            source_start = float(
-                parent.diagnostics.get("original_turn_start", parent.start)
-            )
-            source_end = float(
-                parent.diagnostics.get("original_turn_end", parent.end)
-            )
-            if stable_times:
-                recovery_sources[(round(source_start, 5), round(source_end, 5))] = (
-                    parent,
-                    stable_times,
-                )
-        for parent, stable_times in recovery_sources.values():
-            source_start = float(parent.diagnostics.get("original_turn_start", parent.start))
-            source_end = float(parent.diagnostics.get("original_turn_end", parent.end))
-            points = [source_start, *stable_times, source_end]
-            for part_index, (start, end) in enumerate(zip(points, points[1:]), start=1):
-                part = TimeSpan(start, end)
-                if part.duration < max(1.80, self.options.min_sentence_seconds):
-                    continue
-                if any(
-                    abs(existing.start - part.start) <= 0.02
-                    and abs(existing.end - part.end) <= 0.02
-                    for existing in [*accepted_turns, *rejected]
-                ):
-                    continue
-                piece = CandidateSentence(part.start, part.end, "")
-                piece.diagnostics.update(parent.diagnostics)
-                piece.diagnostics.update(
-                    {
-                        "recovery_subsegment": True,
-                        "recovery_parent_start": source_start,
-                        "recovery_parent_end": source_end,
-                        "recovery_subsegment_index": part_index,
-                        "recovery_subsegment_count": len(points) - 1,
-                        "recovery_parent_target_coverage": round(
-                            float(parent.diagnostics.get("target_coverage", 0.0) or 0.0),
-                            5,
-                        ),
-                        "target_coverage": round(
-                            self._target_coverage(part, target_spans), 5
-                        ),
-                    }
-                )
-                match = self._verify_speaker_span(
-                    verifier,
-                    waveform,
-                    part,
-                    profile,
-                    profile.primary.suggested_threshold,
-                )
-                self._apply_speaker_match(
-                    piece,
-                    match,
-                    profile,
-                    profile.primary.suggested_threshold,
-                )
-                piece.reject_reason = "声纹匹配不足"
-                recovery_pieces.append(piece)
-                matches[id(piece)] = match
-        if recovery_pieces:
-            rejected.extend(recovery_pieces)
         boundary_clean_residuals = [
             candidate
             for candidate in rejected
@@ -2923,12 +2069,6 @@ class ExtractionPipeline:
             <= candidate.duration
             <= min(15.0, self.options.max_sentence_seconds)
             and id(candidate) in matches
-            and id(candidate) not in low_coverage_parent_ids
-            and (
-                not candidate.diagnostics.get("recovery_subsegment")
-                or float(candidate.diagnostics.get("target_coverage", 0.0) or 0.0)
-                >= 0.60
-            )
         ]
         if not raw_anchors:
             return 0
@@ -3150,12 +2290,9 @@ class ExtractionPipeline:
                     continuity_ratio, 5
                 )
                 decisive_boundary = any(
-                    int(boundary.get("scale_votes", 1)) >= 2
-                    or (
-                        float(boundary.get("primary_similarity", 1.0)) <= 0.15
-                        and boundary.get("secondary_similarity") is not None
-                        and float(boundary["secondary_similarity"]) <= 0.05
-                    )
+                    float(boundary["primary_similarity"]) <= 0.15
+                    and boundary.get("secondary_similarity") is not None
+                    and float(boundary["secondary_similarity"]) <= 0.05
                     for boundary in anchor.diagnostics.get(
                         "multi_model_anchor_boundaries", []
                     )
@@ -3195,7 +2332,6 @@ class ExtractionPipeline:
 
         provisional: list[CandidateSentence] = []
         for candidate, fourth_embedding in zip(eligible, fourth_candidates):
-            boundary_piece = bool(candidate.diagnostics.get("recovery_subsegment"))
             match = matches[id(candidate)]
             assert match.secondary is not None
             assert match.primary.embedding is not None
@@ -3219,10 +2355,7 @@ class ExtractionPipeline:
             common_anchor_mask = (
                 (match.primary.embedding @ primary_anchors.T >= 0.64)
                 & (match.secondary.embedding @ secondary_anchors.T >= 0.58)
-                & (
-                    fourth_embedding @ fourth_anchors.T
-                    >= (0.45 if boundary_piece else 0.60)
-                )
+                & (fourth_embedding @ fourth_anchors.T >= 0.60)
             )
             common_anchor_count = int(common_anchor_mask.sum())
             fourth_direct = float(
@@ -3236,13 +2369,6 @@ class ExtractionPipeline:
             base_consensus = (
                 primary_second >= 0.64
                 and secondary_second >= 0.58
-            )
-            boundary_consensus = (
-                boundary_piece
-                and primary_second >= 0.64
-                and secondary_second >= 0.58
-                and fourth_first >= 0.45
-                and common_anchor_count >= 1
             )
             wespeaker_dominant_consensus = (
                 float(primary_top[0]) >= 0.66
@@ -3258,18 +2384,13 @@ class ExtractionPipeline:
             )
             base_consensus = (
                 base_consensus
-                or boundary_consensus
                 or wespeaker_dominant_consensus
                 or fourth_model_rescue
             )
             contrastive_edge = bool(
                 candidate.diagnostics.get("contrastive_edge_trim")
             )
-            fourth_support = fourth_first >= (
-                0.60
-                if contrastive_edge
-                else (0.45 if boundary_piece else 0.64)
-            )
+            fourth_support = fourth_first >= (0.60 if contrastive_edge else 0.64)
             contrastive_fourth_passed = not contrastive_edge
             if contrastive_edge:
                 residual_fourth = fourth_residuals[id(candidate)]
@@ -3318,7 +2439,6 @@ class ExtractionPipeline:
                     "episode_wespeaker_top1": round(fourth_first, 5),
                     "episode_wespeaker_top2": round(fourth_second, 5),
                     "multi_model_base_consensus": base_consensus,
-                    "multi_model_boundary_consensus": boundary_consensus,
                     "multi_model_wespeaker_dominant_consensus": (
                         wespeaker_dominant_consensus
                     ),
@@ -3340,7 +2460,7 @@ class ExtractionPipeline:
             boundary_residual = (
                 candidate.reject_reason
                 == "疑似混合说话人，目标声纹不连续"
-            ) or boundary_piece
+            )
             if boundary_residual or contrastive_edge:
                 exclusion = verifier.multimodel_exclusion_audit(
                     match,
@@ -3362,24 +2482,14 @@ class ExtractionPipeline:
                     f"更接近{exclusion['excluded_role']}，已按排除角色删除"
                 )
                 continue
-            if boundary_residual and exclusion:
-                exclusion_votes = int(
-                    exclusion.get("excluded_multimodel_vote_count", 0) or 0
-                )
-                boundary_target_consensus = bool(
-                    boundary_piece
-                    and candidate.diagnostics.get("multi_model_boundary_consensus")
-                    and int(candidate.diagnostics.get("multi_model_common_anchor_count", 0))
-                    >= 2
-                )
-                if not exclusion.get("excluded_all_models_clear", False) and not (
-                    boundary_target_consensus and exclusion_votes < 2
-                ):
-                    candidate.reject_reason = "边界残片未通过三模型排除人物净胜复核"
-                    candidate.diagnostics["structural_hard_reject"] = True
-                    continue
-                if boundary_target_consensus and exclusion_votes == 1:
-                    candidate.diagnostics["excluded_ambiguous_target_consensus"] = True
+            if (
+                boundary_residual
+                and exclusion
+                and not exclusion.get("excluded_all_models_clear", False)
+            ):
+                candidate.reject_reason = "边界残片未通过三模型排除人物净胜复核"
+                candidate.diagnostics["structural_hard_reject"] = True
+                continue
 
             overlapping = [
                 existing
@@ -3419,7 +2529,6 @@ class ExtractionPipeline:
                 provisional,
                 continuity_ranges,
             ):
-                boundary_piece = bool(candidate.diagnostics.get("recovery_subsegment"))
                 common_windows = (
                     (
                         primary_windows[start_index:end_index]
@@ -3434,7 +2543,7 @@ class ExtractionPipeline:
                     & (
                         fourth_windows[start_index:end_index]
                         @ fourth_anchors.T
-                        >= (0.32 if boundary_piece else 0.40)
+                        >= 0.40
                     )
                 ).any(dim=1)
                 continuity_ratio = float(common_windows.float().mean())
@@ -3481,22 +2590,6 @@ class ExtractionPipeline:
                     >= 0.68
                 )
                 edge_tolerant = edge_tolerant or fourth_model_edge_tolerant
-                if boundary_piece:
-                    edge_tolerant = edge_tolerant or (
-                        continuity_ratio >= 0.55
-                        and int(
-                            candidate.diagnostics.get(
-                                "multi_model_common_anchor_count", 0
-                            )
-                        )
-                        >= 1
-                        and float(candidate.diagnostics.get("episode_eres_top2", 0.0))
-                        >= 0.64
-                        and float(
-                            candidate.diagnostics.get("episode_camplus_top2", 0.0)
-                        )
-                        >= 0.56
-                    )
                 candidate.diagnostics["multi_model_edge_tolerant"] = edge_tolerant
                 if continuity_ratio < 0.70 and not edge_tolerant:
                     candidate.reject_reason = "多模型复核显示目标声纹不连续"
@@ -3506,9 +2599,10 @@ class ExtractionPipeline:
 
         internal_boundaries: list[SpeakerBoundary] = []
         if continuity_ready:
-            internal_boundaries = purity_splitter.detect_multiscale_speaker_boundaries(
+            internal_boundaries = purity_splitter.detect_speaker_boundaries(
                 audio_path,
                 [TimeSpan(item.start, item.end) for item in continuity_ready],
+                context_seconds=0.90,
                 scan_hop_seconds=0.10,
                 primary_candidate_threshold=0.78,
                 minimum_similarity_drop=0.06,
@@ -3530,24 +2624,17 @@ class ExtractionPipeline:
             candidate.diagnostics["multi_model_internal_boundary_count"] = len(
                 boundaries
             )
-            candidate.diagnostics["multi_model_internal_boundaries"] = [
-                boundary.to_dict() for boundary in boundaries
-            ]
             decisive_boundary = any(
-                self._is_structural_boundary(boundary)
+                boundary.primary_similarity <= 0.15
+                and boundary.secondary_similarity is not None
+                and boundary.secondary_similarity <= 0.05
                 for boundary in boundaries
             )
             candidate.diagnostics["multi_model_decisive_boundary"] = (
                 decisive_boundary
             )
-            low_coverage_boundary = bool(
-                boundaries
-                and float(candidate.diagnostics.get("target_coverage", 1.0) or 0.0)
-                < 0.85
-            )
             if boundaries and (
-                low_coverage_boundary
-                or not candidate.diagnostics.get("multi_model_edge_tolerant")
+                not candidate.diagnostics.get("multi_model_edge_tolerant")
                 or decisive_boundary
             ):
                 candidate.reject_reason = "多模型复核确认内部换人"
@@ -3744,131 +2831,6 @@ class ExtractionPipeline:
         rejected[:] = retained_rejected
         return promoted
 
-    def _promote_anime_identity_candidates(
-        self,
-        scored_turns: list[
-            tuple[TimeSpan, CandidateSentence, SpeakerMatchDecision | None]
-        ],
-        accepted_turns: list[CandidateSentence],
-        rejected: list[CandidateSentence],
-        profile: SpeakerMatchProfile,
-        waveform: torch.Tensor,
-        reference_clips: list[Path],
-        negative_reference_clips: list[list[Path]],
-        progress: ProgressCallback,
-    ) -> int:
-        """Recover a narrow class of complete target turns missed by SV models.
-
-        This is an optional independent identity check, not a lower speaker
-        threshold. It requires both anime ECAPA variants to beat every supplied
-        exclusion role by a margin, while ERes2Net/CAM++ still provide minimum
-        acoustic support and the target locator covers the whole turn.
-        """
-
-        if not negative_reference_clips:
-            return 0
-        try:
-            from .anime import AnimeIdentityVerifier
-        except Exception:
-            return 0
-        if not AnimeIdentityVerifier.available():
-            return 0
-
-        eligible: list[tuple[CandidateSentence, SpeakerMatchDecision]] = []
-        match_by_id = {
-            id(candidate): match
-            for _span, candidate, match in scored_turns
-            if match is not None
-        }
-        for candidate in rejected:
-            if candidate.reject_reason != "声纹匹配不足":
-                continue
-            match = match_by_id.get(id(candidate))
-            secondary = match.secondary if match is not None else None
-            if match is None or secondary is None:
-                continue
-            diagnostics = candidate.diagnostics
-            # The anime-domain scorer is an auxiliary identity check. It may
-            # recover a borderline target turn only after the ordinary
-            # episode-level multi-model evidence has established the same
-            # target cluster. It must never overturn a base-model rejection
-            # when there is no common anchor, no WeSpeaker support, or a
-            # supplied exclusion role wins a direct-reference comparison.
-            if (
-                candidate.duration < max(1.20, self.options.min_output_seconds)
-                or candidate.duration > min(15.0, self.options.max_sentence_seconds)
-                or float(diagnostics.get("target_coverage", 0.0)) < 0.90
-                or match.primary.score < 0.50
-                or secondary.score < 0.40
-                or match.primary.reference_max_score < 0.48
-                or secondary.reference_max_score < 0.38
-                or match.paired_reference_median < 0.38
-                or not self._anime_recovery_base_gate(diagnostics)
-            ):
-                continue
-            eligible.append((candidate, match))
-        if not eligible:
-            return 0
-
-        scorer = None
-        try:
-            progress(0.80, f"动漫声纹独立恢复：准备复核 {len(eligible)} 个完整候选")
-            scorer = AnimeIdentityVerifier()
-            anime_profile = scorer.build_profile(reference_clips, negative_reference_clips)
-            promoted_ids: set[int] = set()
-            promoted = 0
-            for index, (candidate, _match) in enumerate(eligible, start=1):
-                decision = scorer.score(
-                    self._waveform_span(waveform, TimeSpan(candidate.start, candidate.end)),
-                    anime_profile,
-                )
-                candidate.diagnostics.update(
-                    {
-                        "anime_identity_checked": True,
-                        "anime_char_target_max": decision.char_target_max,
-                        "anime_char_exclusion_max": decision.char_exclusion_max,
-                        "anime_char_margin": decision.char_margin,
-                        "anime_va_target_max": decision.va_target_max,
-                        "anime_va_exclusion_max": decision.va_exclusion_max,
-                        "anime_va_margin": decision.va_margin,
-                        "anime_identity_margin_floor": scorer.MARGIN_FLOOR,
-                    }
-                )
-                if (
-                    decision.char_margin <= scorer.MARGIN_FLOOR
-                    or decision.va_margin <= scorer.MARGIN_FLOOR
-                ):
-                    progress(0.80, f"动漫声纹独立恢复：复核 {index}/{len(eligible)}")
-                    continue
-                candidate.reject_reason = ""
-                candidate.diagnostics["anime_identity_recovery"] = True
-                overlapping = [
-                    existing
-                    for existing in accepted_turns
-                    if min(candidate.end, existing.end)
-                    - max(candidate.start, existing.start)
-                    > 0.10
-                ]
-                if overlapping and not all(
-                    candidate.start <= existing.start + 0.25
-                    and candidate.end >= existing.end - 0.25
-                    for existing in overlapping
-                ):
-                    continue
-                for existing in overlapping:
-                    accepted_turns.remove(existing)
-                accepted_turns.append(candidate)
-                promoted_ids.add(id(candidate))
-                promoted += 1
-                progress(0.80, f"动漫声纹独立恢复：复核 {index}/{len(eligible)}，恢复 1 段")
-            rejected[:] = [
-                candidate for candidate in rejected if id(candidate) not in promoted_ids
-            ]
-            return promoted
-        finally:
-            if scorer is not None:
-                scorer.close()
-
     def _write_outputs(
         self,
         accepted: list[CandidateSentence],
@@ -3913,7 +2875,12 @@ class ExtractionPipeline:
             candidate.text_file = str(text_path.relative_to(output_dir))
             if video_source is not None:
                 video_path = video_dir / f"{stem_name}.mp4"
-                write_video_clip(video_source, video_path, candidate.start, candidate.end)
+                write_video_clip(
+                    video_source,
+                    video_path,
+                    candidate.start,
+                    candidate.end,
+                )
                 candidate.video_file = str(video_path.relative_to(output_dir))
             progress(0.94 + 0.05 * index / max(1, len(accepted)), f"导出句子 {index}/{len(accepted)}")
 
@@ -4141,11 +3108,9 @@ class ExtractionPipeline:
                 )
                 for group_index, group in enumerate(negative_stem_groups, start=1)
             ]
-            # The lower bound has a distinct meaning from the upper bound:
-            # sub-threshold VAD gaps are treated as detector jitter inside one
-            # speech island; only gaps in [min, max] remain eligible for the
-            # later dual-model same-speaker join. Gaps above max stay hard
-            # sentence boundaries.
+            # Sub-lower-bound gaps are treated as VAD jitter inside one speech
+            # island. Medium gaps remain separate until the existing
+            # same-speaker merge approves them; larger gaps stay hard splits.
             vad_spans = self._merge_vad_spans(
                 vad_map.get(stem, []),
                 gap=max(
@@ -4284,14 +3249,45 @@ class ExtractionPipeline:
                     )
 
                 if self.options.export_all_sentences:
-                    # Manual-review mode deliberately stops before any target
-                    # speaker decision.  The audio has already passed the
-                    # human-singing and overlap filters above; each remaining
-                    # lower-bound-aware silence island is transcribed and
-                    # exported so the user can select the identity by ear.
+                    # Manual-review mode stops before target-identity scoring.
+                    # It still keeps the singing/overlap filters above and only
+                    # rejoins medium silence gaps when both speaker models agree.
+                    review_spans = self._merge_short_silence_same_speaker(
+                        clean_atomic_spans,
+                        verifier,
+                        profile,
+                        target_waveform,
+                        progress=lambda value, message: progress(
+                            0.56 + 0.06 * value,
+                            f"全部单句模式：{message}",
+                        ),
+                        maximum_silence_seconds=self.options.silence_split_seconds,
+                        forbidden_joins=blocked_join_spans,
+                    )
+                    usable_review_spans = [
+                        span
+                        for span in review_spans
+                        if span.duration >= self.options.min_output_seconds
+                    ]
+                    short_review_spans = [
+                        span
+                        for span in review_spans
+                        if span.duration < self.options.min_output_seconds
+                    ]
+                    rejected.extend(
+                        CandidateSentence(
+                            span.start,
+                            span.end,
+                            "",
+                            reject_reason="讲话片段短于训练下限",
+                        )
+                        for span in short_review_spans
+                    )
                     progress(
                         0.64,
-                        f"全句模式：按静音切分保留 {len(clean_atomic_spans)} 段，跳过目标声纹筛选",
+                        f"全部单句模式：{len(clean_atomic_spans)} 个语音岛整理为 "
+                        f"{len(usable_review_spans)} 个可训练片段；"
+                        f"舍弃短片段 {len(short_review_spans)} 个，跳过目标人物筛选",
                     )
                     all_candidates = [
                         CandidateSentence(
@@ -4308,14 +3304,15 @@ class ExtractionPipeline:
                                 ),
                             },
                         )
-                        for span in clean_atomic_spans
+                        for span in usable_review_spans
                     ]
                     segmenter = WhisperSegmenter(self.device)
                     transcribed = segmenter.transcribe_spans(
                         stem,
                         [TimeSpan(item.start, item.end) for item in all_candidates],
                         progress=lambda value, message: progress(
-                            0.64 + 0.20 * value, message
+                            0.64 + 0.20 * value,
+                            message,
                         ),
                     )
                     by_span: dict[int, list[CandidateSentence]] = {}
@@ -4334,7 +3331,8 @@ class ExtractionPipeline:
                         languages: list[str] = []
                         for fragment in fragments:
                             text = self._join_transcript_text(
-                                text, fragment.whisper_text
+                                text,
+                                fragment.whisper_text,
                             )
                             if fragment.language and fragment.language != "auto":
                                 languages.append(fragment.language)
@@ -4371,7 +3369,7 @@ class ExtractionPipeline:
                     )
                     progress(
                         1.0,
-                        f"全句模式完成：输出 {len(accepted_all)} 段，STT 无文本 {len(rejected)} 段",
+                        f"全部单句模式完成：输出 {len(accepted_all)} 段",
                     )
                     return PipelineResult(
                         job_id,
@@ -4383,20 +3381,12 @@ class ExtractionPipeline:
                         transcript,
                     )
 
-                # Keep every silence-delimited island independent until target
-                # identity has been verified. A short gap is evidence for the
-                # later same-speaker join, not permission to contaminate the
-                # first speaker embedding with the following island. This is
-                # important for short replies: a preceding breath/noise tail
-                # can otherwise lower the target score of the next sentence.
-                # Singing and overlap filtering above have already removed the
-                # islands that must remain hard no-join gaps.
+                # Keep silence-delimited islands independent until target
+                # identity has been verified.  Pairwise speaker similarity can
+                # confuse two similar voices and turn a rapid dialogue into one
+                # averaged, falsely accepted target embedding.  Verified target
+                # islands are joined later, preserving the short silence.
                 clean_spans = list(clean_atomic_spans)
-                progress(
-                    0.63,
-                    f"静音切分完成：{len(clean_spans)} 个独立语音岛；"
-                    f"短于 {self.options.silence_split_seconds:.2f} 秒的间隔留给身份确认后合并",
-                )
                 progress(
                     0.63,
                     f"保留 {len(clean_spans)} 个静音分隔语音岛，先独立核验目标人物",
@@ -4405,20 +3395,11 @@ class ExtractionPipeline:
                 split_result = verifier.split_speaker_spans(
                     stem,
                     clean_spans,
-                    # Preserve short local sides as edge evidence. The old
-                    # 0.85s floor folded a short reply back into the previous
-                    # speaker, making a mixed sentence look like one target
-                    # turn. These sides remain non-exportable until a joined
-                    # whole-span verification succeeds.
-                    minimum_turn_seconds=0.30,
-                    minimum_edge_seconds=0.20,
+                    minimum_turn_seconds=0.85,
                     context_seconds=1.20,
                     scan_hop_seconds=0.30,
                     minimum_similarity_drop=0.08,
-                    # Do not collapse corroborated boundaries around a short
-                    # reply into one change point. The downstream whole-span
-                    # gate is stricter than this discovery pass.
-                    minimum_separation_seconds=0.25,
+                    minimum_separation_seconds=0.70,
                     progress=lambda value, message: progress(0.63 + 0.07 * value, message),
                 )
                 target_spans = verifier.locate_target_spans(
@@ -4435,28 +3416,11 @@ class ExtractionPipeline:
                     bridge_seconds=0.55,
                     progress=lambda value, message: progress(0.70 + 0.03 * value, message),
                 )
+                progress(0.73, f"换人切分完成：得到 {len(split_result)} 个独立说话回合")
                 effective_threshold = max(
                     self.options.speaker_threshold,
                     profile.primary.suggested_threshold,
                 )
-                split_result, reconciled_split_count = (
-                    self._reconcile_target_split_spans(
-                        split_result,
-                        clean_spans,
-                        target_spans,
-                        verifier,
-                        profile,
-                        target_waveform,
-                        exclusion_profiles,
-                        effective_threshold,
-                    )
-                )
-                if reconciled_split_count:
-                    progress(
-                        0.73,
-                        f"目标覆盖复核：恢复 {reconciled_split_count} 个误切边界",
-                    )
-                progress(0.73, f"换人切分完成：得到 {len(split_result)} 个独立说话回合")
                 scored_turns: list[
                     tuple[TimeSpan, CandidateSentence, SpeakerMatchDecision | None]
                 ] = []
@@ -4487,16 +3451,12 @@ class ExtractionPipeline:
                     )
                     match: SpeakerMatchDecision | None = None
                     if (
-                        candidate.diagnostics["speech_seconds"] < 0.20
+                        candidate.diagnostics["speech_seconds"] < 0.35
                         or candidate.diagnostics["speech_ratio"] < 0.18
                     ):
                         candidate.reject_reason = "有效讲话不足或接近空段"
                     elif candidate.duration < self.options.min_sentence_seconds:
-                        # Keep a short VAD island available as edge evidence.
-                        # It is scored lazily only if a neighboring complete
-                        # target turn makes a join plausible.
                         candidate.reject_reason = "说话回合过短"
-                        candidate.diagnostics["short_edge_pending"] = True
                     elif candidate.duration > self.options.max_sentence_seconds:
                         candidate.reject_reason = "说话回合过长"
                     else:
@@ -4522,16 +3482,7 @@ class ExtractionPipeline:
                     (span, candidate, match)
                     for span, candidate, match in scored_turns
                     if match is not None
-                    and (
-                        self._needs_boundary_recovery(match, candidate.duration)
-                        or (
-                            candidate.duration >= 3.0
-                            and float(candidate.diagnostics.get("target_coverage", 1.0)) < 0.90
-                            and match.primary.score >= 0.46
-                            and match.secondary is not None
-                            and match.secondary.score >= 0.46
-                        )
-                    )
+                    and self._needs_boundary_recovery(match, candidate.duration)
                 ]
                 recovery_boundaries: list[SpeakerBoundary] = []
                 if recovery_turns:
@@ -4544,39 +3495,17 @@ class ExtractionPipeline:
                         verifier.primary,
                         secondary=verifier.secondary,
                     )
-                    screen_boundaries = recovery_splitter.detect_speaker_boundaries(
+                    recovery_boundaries = recovery_splitter.detect_speaker_boundaries(
                         stem,
                         [item[0] for item in recovery_turns],
                         context_seconds=0.60,
                         scan_hop_seconds=0.10,
                         primary_candidate_threshold=0.78,
-                        minimum_similarity_drop=0.06,
                         minimum_separation_seconds=0.30,
                         progress=lambda value, message: progress(
-                            0.77 + 0.01 * value, message
+                            0.77 + 0.02 * value, message
                         ),
                     )
-                    suspicious_turns = [
-                        item[0]
-                        for item in recovery_turns
-                        if float(item[1].diagnostics.get("target_coverage", 1.0)) < 0.90
-                        or any(
-                            item[0].start < boundary.time < item[0].end
-                            for boundary in screen_boundaries
-                        )
-                    ]
-                    if suspicious_turns:
-                        recovery_boundaries = recovery_splitter.detect_multiscale_speaker_boundaries(
-                            stem,
-                            suspicious_turns,
-                            scan_hop_seconds=0.10,
-                            primary_candidate_threshold=0.78,
-                            minimum_similarity_drop=0.06,
-                            minimum_separation_seconds=0.30,
-                            progress=lambda value, message: progress(
-                                0.78 + 0.01 * value, message
-                            ),
-                        )
 
                 recovery_lookup = {id(candidate): index for index, (_span, candidate, _match) in enumerate(recovery_turns, start=1)}
                 local_exclusion_spans: list[TimeSpan] = []
@@ -4719,16 +3648,6 @@ class ExtractionPipeline:
                             if boundary.confidence >= 0.90
                             and start < boundary.time < end
                         ]
-                        structural_boundaries = [
-                            boundary
-                            for boundary in internal_boundaries
-                            if self._is_structural_boundary(boundary)
-                        ]
-                        # A stable boundary is a hard limit for locator
-                        # recovery.  The individual sides can still be
-                        # recovered by the later anchor-consensus pass.
-                        if structural_boundaries:
-                            continue
                         # Emotional/prosodic changes can create several false
                         # local speaker boundaries inside one compact target
                         # region. Add one boundary-suppressed whole candidate;
@@ -4797,32 +3716,11 @@ class ExtractionPipeline:
                     }.values(),
                     key=lambda item: (item.start, item.duration),
                 )
-
-                def source_turn_for_locator(locator: TimeSpan) -> TimeSpan:
-                    """Bind a locator candidate to its actual split turn.
-
-                    Locator candidates are assembled in a nested target/turn
-                    loop.  Reusing that loop variable after the loop silently
-                    attached every candidate to the last turn in the episode,
-                    which disabled the later edge audit for mixed utterances.
-                    """
-
-                    containing = [
-                        turn
-                        for turn in split_result
-                        if turn.start <= locator.start + 0.05
-                        and locator.end <= turn.end + 0.05
-                    ]
-                    if containing:
-                        return min(containing, key=lambda item: item.duration)
-                    return locator
-
                 locator_recovered = 0
                 locator_rejected: list[
                     tuple[TimeSpan, SpeakerMatchDecision, float]
                 ] = []
                 for recovery_index, base in enumerate(locator_bases, start=1):
-                    source_turn = source_turn_for_locator(base)
                     base_key = (round(base.start, 5), round(base.end, 5))
                     recovered_span = base
                     edge_expanded = False
@@ -4882,14 +3780,6 @@ class ExtractionPipeline:
                         continue
                     coverage = self._target_coverage(recovered_span, target_spans)
                     if coverage < 0.55:
-                        continue
-                    if any(
-                        self._is_structural_boundary(boundary)
-                        for boundary in recovery_boundaries
-                        if recovered_span.start < boundary.time < recovered_span.end
-                    ):
-                        # Do not reinstall a whole target region over a stable
-                        # change point.  The split pieces are handled below.
                         continue
                     boundary_suppressed = base_key in boundary_suppressed_keys
                     recovered_match = self._verify_speaker_span(
@@ -4958,12 +3848,6 @@ class ExtractionPipeline:
                             "tertiary_locator_recovery": (
                                 recovered_match.tier == "tertiary"
                             ),
-                            "locator_source_start": source_turn.start,
-                            "locator_source_end": source_turn.end,
-                            "locator_source_target_coverage": round(
-                                self._target_coverage(source_turn, target_spans),
-                                5,
-                            ),
                             "boundary_suppressed_recovery": boundary_suppressed,
                             "locator_edge_expansion": edge_expanded,
                             "tertiary_target_coverage": round(
@@ -5024,61 +3908,20 @@ class ExtractionPipeline:
                         f"目标人物完整句恢复：定位恢复 {locator_recovered} 段",
                     )
 
-                # The locator may have replaced a complete verified turn with
-                # a high-confidence core. Recheck the original local turn now,
-                # after locator recovery, so a short same-speaker tail can be
-                # restored without allowing a stable speaker boundary through.
-                self._recover_same_turn_edges(
-                    accepted_turns,
-                    list(split_result),
-                    recovery_boundaries,
-                    verifier,
-                    profile,
-                    target_waveform,
-                    target_spans,
-                    exclusion_profiles,
-                    effective_threshold,
-                    blocked_join_spans,
-                    progress,
-                )
-
-                # A rescued local edge is normally only evidence for a nearby
-                # complete sentence.  Keep it as a standalone output only when
-                # it is long enough to be a real utterance and both independent
-                # speaker models (or the explicit tertiary rescue) support the
-                # whole span.  This recovers a clipped target tail while still
-                # rejecting the common 0.x-second wrong-speaker residue.
-                unconnected_edges: list[CandidateSentence] = []
-                for candidate in accepted_turns:
-                    if not candidate.diagnostics.get("local_edge_only"):
-                        continue
-                    diagnostics = candidate.diagnostics
-                    primary_score = float(diagnostics.get("eres_score", 0.0) or 0.0)
-                    secondary_score = float(
-                        diagnostics.get("camplus_score", 0.0) or 0.0
-                    )
-                    target_coverage = float(
-                        diagnostics.get("target_coverage", 0.0) or 0.0
-                    )
-                    standalone = (
-                        candidate.duration >= max(1.20, self.options.min_output_seconds)
-                        and target_coverage >= 0.90
-                        and primary_score >= 0.48
-                        and secondary_score >= 0.48
-                        and diagnostics.get("speaker_tier")
-                        in {"tertiary", "strong", "balanced"}
-                        and not diagnostics.get("excluded_role_rejected")
-                    )
-                    if standalone:
-                        diagnostics["standalone_local_edge"] = True
-                    else:
-                        unconnected_edges.append(candidate)
+                # Rejected-tier WavLM fragments are permitted only as sentence
+                # edge evidence.  A locator-recovered complete target sentence
+                # removes them through overlap; anything left here is an
+                # isolated ambiguous fragment and must never be exported.
+                unconnected_edges = [
+                    candidate
+                    for candidate in accepted_turns
+                    if candidate.diagnostics.get("local_edge_only")
+                ]
                 if unconnected_edges:
-                    unconnected_ids = {id(candidate) for candidate in unconnected_edges}
                     accepted_turns = [
                         candidate
                         for candidate in accepted_turns
-                        if id(candidate) not in unconnected_ids
+                        if not candidate.diagnostics.get("local_edge_only")
                     ]
                     for candidate in unconnected_edges:
                         candidate.reject_reason = "局部目标候选未连接到完整句"
@@ -5112,7 +3955,6 @@ class ExtractionPipeline:
                     profile,
                     stem,
                     target_waveform,
-                    target_spans,
                     exclusion_profiles,
                     progress,
                 )
@@ -5120,22 +3962,6 @@ class ExtractionPipeline:
                     progress(
                         0.795,
                         f"多模型目标子簇恢复：新增 {consensus_recovered} 个完整回合",
-                    )
-
-                anime_recovered = self._promote_anime_identity_candidates(
-                    scored_turns,
-                    accepted_turns,
-                    rejected,
-                    profile,
-                    target_waveform,
-                    reference_clips,
-                    negative_reference_clips,
-                    progress,
-                )
-                if anime_recovered:
-                    progress(
-                        0.80,
-                        f"独立身份复核恢复：新增 {anime_recovered} 个完整回合",
                     )
 
                 target_merges = self._merge_verified_target_turns(
@@ -5147,59 +3973,16 @@ class ExtractionPipeline:
                     effective_threshold,
                     target_spans,
                     vad_spans,
-                    blocked_join_spans,
+                    [*blocked_join_spans, *clean_atomic_spans],
                     progress=lambda value, message: progress(
                         0.795 + 0.005 * value,
                         message,
                     ),
-                    exclusion_profiles=exclusion_profiles,
                 )
                 if target_merges:
                     progress(
                         0.80,
                         f"目标人物短静音合并完成：形成 {target_merges} 个完整句",
-                    )
-
-                repartitioned = self._repartition_long_target_turns(
-                    accepted_turns,
-                    rejected,
-                    verifier,
-                    profile,
-                    target_waveform,
-                    target_spans,
-                    exclusion_profiles,
-                    effective_threshold,
-                    progress,
-                )
-                if repartitioned:
-                    progress(
-                        0.80,
-                        f"长回合身份复核完成：保留 {len(accepted_turns)} 个独立目标段",
-                    )
-                edge_audited = self._audit_risky_target_edges(
-                    accepted_turns,
-                    verifier,
-                    profile,
-                    stem,
-                    target_waveform,
-                    exclusion_profiles,
-                    target_spans,
-                    effective_threshold,
-                    progress,
-                )
-                if edge_audited:
-                    progress(
-                        0.80,
-                        f"目标边缘纯度复核完成：修正 {edge_audited} 个回合",
-                    )
-                pruned_recoveries = self._prune_weak_recovery_candidates(
-                    accepted_turns,
-                    rejected,
-                )
-                if pruned_recoveries:
-                    progress(
-                        0.80,
-                        f"局部恢复完整性复核：舍弃 {pruned_recoveries} 个不完整候选",
                     )
 
                 adaptive_recovered = 0
@@ -5314,8 +4097,6 @@ class ExtractionPipeline:
                         f"排除角色最终复核：0/{len(accepted_turns)}",
                     )
                     retained_turns: list[CandidateSentence] = []
-                    fourth_verifier = None
-                    fourth_profile = None
                     for audit_index, candidate in enumerate(accepted_turns, start=1):
                         audit_match = self._verify_speaker_span(
                             verifier,
@@ -5336,44 +4117,6 @@ class ExtractionPipeline:
                         )
                         if exclusion is not None:
                             candidate.diagnostics.update(exclusion)
-                        if (
-                            exclusion
-                            and not exclusion.get("excluded_role_rejected")
-                            and self._needs_final_multimodel_exclusion(candidate, exclusion)
-                        ):
-                            if fourth_verifier is None or fourth_profile is None:
-                                fourth_verifier, fourth_profile = verifier.quaternary_pair(profile)
-                            candidate_waveform = self._waveform_span(
-                                target_waveform,
-                                TimeSpan(candidate.start, candidate.end),
-                            )
-                            fourth_embedding = fourth_verifier.embeddings_from_waveforms(
-                                [candidate_waveform]
-                            )[0]
-                            multimodel_exclusion = verifier.multimodel_exclusion_audit(
-                                audit_match,
-                                profile,
-                                fourth_embedding,
-                                fourth_profile,
-                                exclusion_profiles,
-                            )
-                            candidate.diagnostics["final_multimodel_exclusion_checked"] = True
-                            if multimodel_exclusion is not None:
-                                candidate.diagnostics.update(multimodel_exclusion)
-                            if self._needs_final_multimodel_exclusion(
-                                candidate,
-                                multimodel_exclusion,
-                                require_third_model=True,
-                            ):
-                                exclusion = multimodel_exclusion
-                                if exclusion is not None:
-                                    # The third-model decision is a real veto,
-                                    # not just a diagnostic marker. The old
-                                    # path set ``final_multimodel_exclusion_veto``
-                                    # but left ``excluded_role_rejected`` false,
-                                    # allowing the mixed candidate into STT.
-                                    exclusion["excluded_role_rejected"] = True
-                                candidate.diagnostics["final_multimodel_exclusion_veto"] = True
                         if exclusion and exclusion.get("excluded_role_rejected"):
                             candidate.reject_reason = (
                                 f"更接近{exclusion['excluded_role']}，已按排除角色删除"
@@ -5386,6 +4129,29 @@ class ExtractionPipeline:
                             f"排除角色最终复核：{audit_index}/{len(accepted_turns)}",
                         )
                     accepted_turns = retained_turns
+
+                boundary_expanded, boundary_cropped = (
+                    self._repair_final_sentence_boundaries(
+                        accepted_turns,
+                        rejected,
+                        scored_turns,
+                        verifier,
+                        profile,
+                        stem,
+                        target_waveform,
+                        exclusion_profiles,
+                        effective_threshold,
+                        blocked_join_spans,
+                        vad_spans,
+                        progress=lambda _value, message: progress(0.80, message),
+                    )
+                )
+                if boundary_expanded or boundary_cropped:
+                    progress(
+                        0.80,
+                        "完整句边界修复："
+                        f"补全 {boundary_expanded} 段，裁切 {boundary_cropped} 段",
+                    )
 
                 progress(
                     0.80,
@@ -5428,41 +4194,14 @@ class ExtractionPipeline:
                         rejected.append(turn)
                         continue
                     fragment_count = len(sentences)
-                    if fragment_count >= 2:
-                        ordered_fragments = sorted(
-                            sentences, key=lambda item: (item.start, item.end)
-                        )
-                        fragment_gaps = [
-                            round(max(0.0, right.start - left.end), 5)
-                            for left, right in zip(
-                                ordered_fragments, ordered_fragments[1:]
-                            )
-                        ]
-                        # Whisper may split one continuous utterance at an
-                        # internal punctuation mark or an omitted word
-                        # timestamp.  The speaker segmentation already made
-                        # this turn atomic, so fragment count alone is not
-                        # evidence of a speaker switch. Only a real long gap
-                        # remains a hard boundary; contiguous fragments are
-                        # merged into the one verified speaker turn below.
-                        hard_fragment_gap = any(
-                            gap > self.options.silence_split_seconds
-                            for gap in fragment_gaps
-                        )
-                        turn.diagnostics.update(
-                            {
-                                "stt_fragment_count": fragment_count,
-                                "stt_fragment_gaps": fragment_gaps,
-                                "stt_multi_fragment_merged": not hard_fragment_gap,
-                            }
-                        )
-                        if (
-                            hard_fragment_gap
-                            and not turn.diagnostics.get("post_target_silence_merge")
-                        ):
-                            turn.reject_reason = "STT 显示多个独立话段，疑似连续换人"
-                            rejected.append(turn)
-                            continue
+                    if (
+                        not turn.diagnostics.get("post_target_silence_merge")
+                        and fragment_count >= 2
+                    ):
+                        turn.reject_reason = "STT 显示多个独立话段，疑似连续换人"
+                        turn.diagnostics["stt_fragment_count"] = fragment_count
+                        rejected.append(turn)
+                        continue
                     if turn.duration < self.options.min_output_seconds:
                         turn.reject_reason = "讲话片段短于训练下限"
                         rejected.append(turn)

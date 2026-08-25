@@ -3,10 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import socket
 import subprocess
 import sys
 import time
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 
 
@@ -119,6 +121,17 @@ MODULES = {
 
 def say(message: str) -> None:
     print(message, flush=True)
+    log_value = os.environ.get("VOICE_EXTRACT_LAUNCHER_LOG")
+    if not log_value:
+        return
+    try:
+        log_path = Path(log_value)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().isoformat(timespec="seconds")
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(f"{stamp} {message}\n")
+    except OSError:
+        return
 
 
 def find_source_root(executable_root: Path) -> Path:
@@ -381,13 +394,34 @@ def ensure_assets(source_root: Path, python: Path) -> None:
     say("Dependency and model check: OK")
 
 
+def _find_service_port() -> int:
+    configured = os.environ.get("VOICE_EXTRACT_PORT")
+    if configured:
+        try:
+            port = int(configured)
+        except ValueError as exc:
+            raise RuntimeError("VOICE_EXTRACT_PORT must be an integer") from exc
+        if not 1 <= port <= 65535:
+            raise RuntimeError("VOICE_EXTRACT_PORT must be between 1 and 65535")
+        return port
+
+    for port in range(7865, 7896):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if probe.connect_ex(("127.0.0.1", port)) != 0:
+                return port
+    raise RuntimeError("No empty service port found in range 7865-7895")
+
+
 def launch_app(source_root: Path, python: Path) -> int:
     env = os.environ.copy()
     env["PYTHONPATH"] = str(source_root) + os.pathsep + env.get("PYTHONPATH", "")
     env.setdefault("HF_HUB_OFFLINE", "1")
     env.setdefault("MODELSCOPE_CACHE", str(source_root / "models" / "modelscope_cache"))
     env.setdefault("PYTHONUNBUFFERED", "1")
-    say("Starting the local service. The web UI is Chinese.")
+    port = _find_service_port()
+    env["VOICE_EXTRACT_PORT"] = str(port)
+    say(f"Starting the local service at http://127.0.0.1:{port}. The web UI is Chinese.")
     return subprocess.call([str(python), "-u", "app.py"], cwd=str(source_root), env=env)
 
 
@@ -399,6 +433,10 @@ def main() -> int:
     )
     try:
         source_root = find_source_root(executable_root)
+        os.environ.setdefault(
+            "VOICE_EXTRACT_LAUNCHER_LOG",
+            str(source_root / "output" / "launcher.log"),
+        )
         python = find_python(source_root)
         say("Voice Extractor dependency check")
         say("--------------------------------")
