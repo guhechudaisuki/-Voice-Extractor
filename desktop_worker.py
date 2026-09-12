@@ -64,6 +64,7 @@ def main() -> int:
             targets,
             negative_references=negative_groups,
             progress=progress,
+            subtitles=request.get("subtitles", {}),
         )
         rows: list[dict[str, object]] = []
         for target, result in zip(targets, batch.results):

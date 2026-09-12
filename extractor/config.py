@@ -19,7 +19,7 @@ def _asset_root() -> Path:
 
     for candidate in (TOOL_ROOT, *TOOL_ROOT.parents):
         if (
-            (candidate / "models").exists()
+            ((candidate / "model").exists() or (candidate / "models").exists())
             and (candidate.parent / "GPT-SoVITS-v2pro-20250604").exists()
         ):
             return candidate
@@ -27,6 +27,7 @@ def _asset_root() -> Path:
 
 
 ASSET_ROOT = _configured_path("VOICE_EXTRACT_ASSET_ROOT") or _asset_root()
+MODEL_ROOT = _configured_path("VOICE_EXTRACT_MODEL_ROOT") or ASSET_ROOT / "model"
 WORKSPACE_ROOT = ASSET_ROOT.parent
 GPT_ROOT = (
     _configured_path("VOICE_EXTRACT_GPT_ROOT")
@@ -44,7 +45,7 @@ UVR_MODEL = (
 
 ASR_MODELS = (
     _configured_path("VOICE_EXTRACT_ASR_MODELS")
-    or GPT_ROOT / "tools" / "asr" / "models"
+    or MODEL_ROOT / "stt"
 )
 PARAFORMER_MODEL = ASR_MODELS / "speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch"
 VAD_MODEL = ASR_MODELS / "speech_fsmn_vad_zh-cn-16k-common-pytorch"
@@ -59,28 +60,27 @@ SV_CODE = (
 )
 SV_MODEL = (
     _configured_path("VOICE_EXTRACT_SV_MODEL")
-    or GPT_ROOT
-    / "GPT_SoVITS"
-    / "pretrained_models"
-    / "sv"
+    or MODEL_ROOT
+    / "speaker"
+    / "eres2net"
     / "pretrained_eres2netv2w24s4ep4.ckpt"
 )
 CAMPLUS_MODEL = (
     _configured_path("VOICE_EXTRACT_CAMPLUS_MODEL")
-    or ASSET_ROOT / "models" / "campplus_voxceleb" / "campplus_voxceleb.bin"
+    or MODEL_ROOT / "speaker" / "campplus_voxceleb" / "campplus_voxceleb.bin"
 )
 WAVLM_SV_MODEL = (
     _configured_path("VOICE_EXTRACT_WAVLM_MODEL")
-    or ASSET_ROOT / "models" / "wavlm-base-plus-sv"
+    or MODEL_ROOT / "speaker" / "wavlm-base-plus-sv"
 )
 WESPEAKER_MODEL = (
     _configured_path("VOICE_EXTRACT_WESPEAKER_MODEL")
-    or ASSET_ROOT / "models" / "wespeaker-resnet34-lm" / "onnx" / "model.onnx"
+    or MODEL_ROOT / "speaker" / "wespeaker-resnet34-lm" / "onnx" / "model.onnx"
 )
 
 WHISPER_CACHE_ROOT = (
     _configured_path("VOICE_EXTRACT_WHISPER_CACHE")
-    or WORKSPACE_ROOT / "omnvoice" / "hf_cache"
+    or MODEL_ROOT / "stt" / "whisper" / "hf_cache"
 )
 WHISPER_CACHE = WHISPER_CACHE_ROOT / "models--openai--whisper-large-v3-turbo"
 OVERLAP_MODEL = (

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import gc
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Iterable, Literal, Sequence
 
@@ -20,6 +20,7 @@ SpeakerMatchTier = Literal[
     "strong",
     "balanced",
     "tertiary",
+    "raw_rescue",
     "recall",
     "weak",
     "rejected",
@@ -62,6 +63,16 @@ class SpeakerMatchDecision:
     merge_only: bool = False
     paired_reference_median: float = 0.0
     diagnostics: dict[str, float | str | bool] = field(default_factory=dict)
+    # ``primary`` and ``secondary`` always refer to the UVR/stem channel so
+    # existing callers remain stem-authoritative.  These optional fields hold
+    # evidence from the corresponding original (unseparated) clip.
+    raw_primary: SpeakerDecision | None = field(
+        default=None, repr=False, compare=False
+    )
+    raw_secondary: SpeakerDecision | None = field(
+        default=None, repr=False, compare=False
+    )
+    raw_tier: SpeakerMatchTier | None = field(default=None, compare=False)
 
 
 @dataclass
@@ -69,6 +80,12 @@ class SpeakerMatchProfile:
     primary: SpeakerProfile
     reference_paths: list[Path]
     base_threshold: float
+    # Independent profile made from original references.  It is optional so
+    # old callers can continue using the UVR-only profile and explicitly opt
+    # into dual-channel rescue when raw references are available.
+    raw_primary: SpeakerProfile | None = None
+    raw_secondary: CAMPlusProfile | None = None
+    raw_reference_paths: list[Path] = field(default_factory=list)
 
 
 @dataclass
@@ -122,6 +139,12 @@ class ExclusionSpeakerProfile:
     secondary: CAMPlusProfile
     reference_paths: list[Path] = field(default_factory=list)
     quaternary: WeSpeakerProfile | None = None
+    # Optional original-channel negative profile.  Raw rescue is never
+    # allowed to bypass a supplied exclusion person, so the two channels are
+    # tracked independently here as well.
+    raw_primary: SpeakerProfile | None = None
+    raw_secondary: CAMPlusProfile | None = None
+    raw_reference_paths: list[Path] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -1016,15 +1039,55 @@ class DualSpeakerVerifier:
             base_threshold=base_threshold,
         )
 
+    def build_channel_profile(
+        self,
+        reference_paths: Sequence[Path],
+        raw_reference_paths: Sequence[Path] | None,
+        base_threshold: float,
+    ) -> SpeakerMatchProfile:
+        """Build independent target profiles for UVR and original channels.
+
+        ``reference_paths`` are separated (UVR) clips and
+        ``raw_reference_paths`` are the corresponding original clips.  The
+        raw profile is optional and is used only by the dual-channel rescue
+        path; the returned profile's normal ``primary`` fields stay UVR
+        authoritative for backwards compatibility.
+        """
+
+        uvr_paths = [Path(path) for path in reference_paths if path]
+        profile = self.build_profile(uvr_paths, base_threshold)
+        raw_paths = [Path(path) for path in (raw_reference_paths or []) if path]
+        if not raw_paths:
+            return profile
+
+        raw_primary = self.primary.build_profile(raw_paths, base_threshold)
+        self._ensure_secondary(profile)
+        assert self.secondary is not None
+        raw_secondary = self.secondary.build_profile(
+            raw_paths,
+            reference_indexes=raw_primary.reference_indexes,
+        )
+        profile.raw_primary = raw_primary
+        profile.raw_secondary = raw_secondary
+        profile.raw_reference_paths = raw_paths
+        return profile
+
     def build_exclusion_profiles(
         self,
         reference_groups: Sequence[Sequence[Path]],
         target_profile: SpeakerMatchProfile,
+        raw_reference_groups: Sequence[Sequence[Path]] | None = None,
     ) -> list[ExclusionSpeakerProfile]:
-        """Build anonymous per-role profiles used only as negative boundaries."""
+        """Build anonymous per-role profiles used only as negative boundaries.
+
+        When ``raw_reference_groups`` is provided, each role also gets an
+        independent original-channel profile.  It is consulted only to veto a
+        raw rescue; the UVR profiles remain the primary exclusion gate.
+        """
 
         self._ensure_secondary(target_profile)
         assert self.secondary is not None
+        raw_groups = list(raw_reference_groups or [])
         output: list[ExclusionSpeakerProfile] = []
         for index, paths in enumerate(reference_groups, start=1):
             group = [Path(path) for path in paths if path]
@@ -1035,15 +1098,46 @@ class DualSpeakerVerifier:
                 group,
                 reference_indexes=primary.reference_indexes,
             )
+            raw_group: list[Path] = []
+            if index - 1 < len(raw_groups):
+                raw_group = [Path(path) for path in raw_groups[index - 1] if path]
+            raw_primary: SpeakerProfile | None = None
+            raw_secondary: CAMPlusProfile | None = None
+            if raw_group:
+                raw_primary = self.primary.build_profile(
+                    raw_group,
+                    target_profile.base_threshold,
+                )
+                raw_secondary = self.secondary.build_profile(
+                    raw_group,
+                    reference_indexes=raw_primary.reference_indexes,
+                )
             output.append(
                 ExclusionSpeakerProfile(
                     label=f"排除角色 {index}",
                     primary=primary,
                     secondary=secondary,
                     reference_paths=group,
+                    raw_primary=raw_primary,
+                    raw_secondary=raw_secondary,
+                    raw_reference_paths=raw_group,
                 )
             )
         return output
+
+    def build_channel_exclusion_profiles(
+        self,
+        reference_groups: Sequence[Sequence[Path]],
+        target_profile: SpeakerMatchProfile,
+        raw_reference_groups: Sequence[Sequence[Path]] | None = None,
+    ) -> list[ExclusionSpeakerProfile]:
+        """Build negative profiles for both the UVR and original channels."""
+
+        return self.build_exclusion_profiles(
+            reference_groups,
+            target_profile,
+            raw_reference_groups=raw_reference_groups,
+        )
 
     def exclusion_audit(
         self,
@@ -1075,6 +1169,44 @@ class DualSpeakerVerifier:
             (target_secondary.embeddings @ secondary_embedding).max()
         )
 
+        # Raw-channel scores are optional.  They are only used as an extra
+        # negative veto when both the target and the exclusion role have
+        # independently built raw profiles.  Missing raw references never
+        # weaken the canonical UVR audit.
+        raw_primary_decision = getattr(match, "raw_primary", None)
+        raw_secondary_decision = getattr(match, "raw_secondary", None)
+        raw_target_primary = getattr(target_profile, "raw_primary", None)
+        raw_target_secondary = getattr(target_profile, "raw_secondary", None)
+        raw_audit_available = (
+            raw_primary_decision is not None
+            and raw_secondary_decision is not None
+            and raw_primary_decision.embedding is not None
+            and raw_secondary_decision.embedding is not None
+            and raw_target_primary is not None
+            and raw_target_secondary is not None
+        )
+        raw_target_primary_score = 0.0
+        raw_target_secondary_score = 0.0
+        raw_target_primary_max = 0.0
+        raw_target_secondary_max = 0.0
+        if raw_audit_available:
+            assert raw_primary_decision is not None
+            assert raw_secondary_decision is not None
+            assert raw_target_primary is not None
+            assert raw_target_secondary is not None
+            raw_target_primary_score = float(
+                raw_primary_decision.embedding @ raw_target_primary.centroid
+            )
+            raw_target_secondary_score = float(
+                raw_secondary_decision.embedding @ raw_target_secondary.centroid
+            )
+            raw_target_primary_max = float(
+                (raw_target_primary.embeddings @ raw_primary_decision.embedding).max()
+            )
+            raw_target_secondary_max = float(
+                (raw_target_secondary.embeddings @ raw_secondary_decision.embedding).max()
+            )
+
         strongest: dict[str, float | str | bool] | None = None
         strongest_margin = float("inf")
         for exclusion in exclusion_profiles:
@@ -1098,6 +1230,41 @@ class DualSpeakerVerifier:
             secondary_negative_vote = (
                 secondary_margin <= 0.02 and secondary_direct_margin <= 0.02
             )
+            raw_primary_margin: float | None = None
+            raw_secondary_margin: float | None = None
+            raw_primary_direct_margin: float | None = None
+            raw_secondary_direct_margin: float | None = None
+            raw_primary_negative_vote = False
+            raw_secondary_negative_vote = False
+            if (
+                raw_audit_available
+                and exclusion.raw_primary is not None
+                and exclusion.raw_secondary is not None
+            ):
+                assert raw_primary_decision is not None
+                assert raw_secondary_decision is not None
+                assert raw_primary_decision.embedding is not None
+                assert raw_secondary_decision.embedding is not None
+                raw_primary_margin = raw_target_primary_score - float(
+                    raw_primary_decision.embedding @ exclusion.raw_primary.centroid
+                )
+                raw_secondary_margin = raw_target_secondary_score - float(
+                    raw_secondary_decision.embedding @ exclusion.raw_secondary.centroid
+                )
+                raw_primary_direct_margin = raw_target_primary_max - float(
+                    (exclusion.raw_primary.embeddings @ raw_primary_decision.embedding).max()
+                )
+                raw_secondary_direct_margin = raw_target_secondary_max - float(
+                    (exclusion.raw_secondary.embeddings @ raw_secondary_decision.embedding).max()
+                )
+                raw_primary_negative_vote = (
+                    raw_primary_margin <= 0.02
+                    and raw_primary_direct_margin <= 0.02
+                )
+                raw_secondary_negative_vote = (
+                    raw_secondary_margin <= 0.02
+                    and raw_secondary_direct_margin <= 0.02
+                )
             # A WavLM rescue is deliberately used only for dual-model
             # disagreements.  If one lightweight model still votes for a
             # supplied exclusion person, the other model must beat that person
@@ -1120,9 +1287,19 @@ class DualSpeakerVerifier:
                     )
                 )
             )
+            raw_negative_vote = raw_primary_negative_vote and raw_secondary_negative_vote
+            # The diagonal rescue combines original-channel ERes2Net with
+            # stem-channel CAM++.  If those same two witnesses both prefer a
+            # supplied exclusion role, the rescue must be vetoed even though
+            # neither single channel has two negative votes by itself.
+            diagonal_negative_vote = (
+                match.tier == "raw_rescue"
+                and raw_primary_negative_vote
+                and secondary_negative_vote
+            )
             rejected = (
                 primary_negative_vote and secondary_negative_vote
-            ) or tertiary_conflict
+            ) or tertiary_conflict or raw_negative_vote or diagonal_negative_vote
             combined_margin = primary_margin + secondary_margin
             diagnostics: dict[str, float | str | bool] = {
                 "excluded_role_rejected": rejected,
@@ -1134,7 +1311,29 @@ class DualSpeakerVerifier:
                 "excluded_primary_vote": primary_negative_vote,
                 "excluded_secondary_vote": secondary_negative_vote,
                 "excluded_tertiary_conflict": tertiary_conflict,
+                "excluded_raw_available": bool(
+                    raw_primary_margin is not None and raw_secondary_margin is not None
+                ),
+                "excluded_raw_primary_vote": raw_primary_negative_vote,
+                "excluded_raw_secondary_vote": raw_secondary_negative_vote,
+                "excluded_raw_vote": raw_negative_vote,
+                "excluded_diagonal_vote": diagonal_negative_vote,
             }
+            if raw_primary_margin is not None:
+                diagnostics.update(
+                    {
+                        "excluded_raw_primary_margin": round(raw_primary_margin, 5),
+                        "excluded_raw_secondary_margin": round(
+                            raw_secondary_margin or 0.0, 5
+                        ),
+                        "excluded_raw_primary_direct_margin": round(
+                            raw_primary_direct_margin or 0.0, 5
+                        ),
+                        "excluded_raw_secondary_direct_margin": round(
+                            raw_secondary_direct_margin or 0.0, 5
+                        ),
+                    }
+                )
             if rejected:
                 return diagnostics
             if combined_margin < strongest_margin:
@@ -1564,24 +1763,32 @@ class DualSpeakerVerifier:
             hop_seconds=hop_seconds,
         )
 
-    def verify_waveform(
+    def _verify_channel_waveform(
         self,
         waveform: torch.Tensor,
-        profile: SpeakerMatchProfile,
+        primary_profile: SpeakerProfile,
+        secondary_profile: CAMPlusProfile,
         threshold: float,
         duration: float,
         window_seconds: float = 1.8,
         hop_seconds: float = 0.9,
     ) -> SpeakerMatchDecision:
+        """Run the two lightweight speaker models against one channel.
+
+        Keeping this operation profile-agnostic lets the dual-channel API run
+        the exact same scoring logic against an independent original profile
+        without temporarily mutating the verifier's cached UVR profile.
+        """
+
         primary = self.primary.verify_waveform(
             waveform,
-            profile.primary,
+            primary_profile,
             threshold,
             window_seconds=window_seconds,
             hop_seconds=hop_seconds,
         )
-        secondary_profile = self._ensure_secondary(profile)
-        assert self.secondary is not None
+        if self.secondary is None:
+            raise RuntimeError("CAM++ 澹扮汗妯″瀷灏氭湭鍒濆鍖栭€氶亾")
         secondary_threshold = max(0.56, min(0.62, threshold - 0.12))
         secondary = self.secondary.verify_waveform(
             waveform,
@@ -1593,7 +1800,7 @@ class DualSpeakerVerifier:
         paired_reference_median = self._paired_reference_median(
             primary,
             secondary,
-            profile.primary,
+            primary_profile,
             secondary_profile,
         )
         tier = self._classify_match(
@@ -1629,6 +1836,763 @@ class DualSpeakerVerifier:
             merge_only=tier == "weak",
             paired_reference_median=round(paired_reference_median, 5),
             diagnostics=diagnostics,
+        )
+
+    def verify_waveform(
+        self,
+        waveform: torch.Tensor,
+        profile: SpeakerMatchProfile,
+        threshold: float,
+        duration: float,
+        window_seconds: float = 1.8,
+        hop_seconds: float = 0.9,
+    ) -> SpeakerMatchDecision:
+        """Verify a UVR/stem waveform using the canonical dual-model gate."""
+
+        secondary_profile = self._ensure_secondary(profile)
+        return self._verify_channel_waveform(
+            waveform,
+            profile.primary,
+            secondary_profile,
+            threshold,
+            duration,
+            window_seconds=window_seconds,
+            hop_seconds=hop_seconds,
+        )
+
+    @staticmethod
+    def _channel_diagnostics(
+        prefix: str,
+        decision: SpeakerMatchDecision,
+    ) -> dict[str, float | str | bool]:
+        """Flatten one channel's decision into manifest-friendly diagnostics."""
+
+        primary = decision.primary
+        secondary = decision.secondary
+        result: dict[str, float | str | bool] = {
+            f"{prefix}_accepted": bool(decision.accepted),
+            f"{prefix}_tier": decision.tier,
+            f"{prefix}_match_mode": decision.match_mode,
+            f"{prefix}_eres_score": primary.score,
+            f"{prefix}_eres_window_min": primary.window_min_score,
+            f"{prefix}_eres_window_p20": primary.window_p20_score,
+            f"{prefix}_eres_window_count": float(len(primary.window_scores)),
+            f"{prefix}_eres_window_vote_ratio": primary.window_vote_ratio,
+            f"{prefix}_eres_reference_vote_ratio": primary.vote_ratio,
+            f"{prefix}_eres_reference_median": primary.reference_median_score,
+            f"{prefix}_eres_reference_max": primary.reference_max_score,
+            f"{prefix}_eres_reference_spread": primary.reference_spread,
+            f"{prefix}_paired_reference_median": decision.paired_reference_median,
+        }
+        if secondary is None:
+            result[f"{prefix}_camplus_available"] = False
+            return result
+        result.update(
+            {
+                f"{prefix}_camplus_available": True,
+                f"{prefix}_camplus_score": secondary.score,
+                f"{prefix}_camplus_window_min": secondary.window_min_score,
+                f"{prefix}_camplus_window_p20": secondary.window_p20_score,
+                f"{prefix}_camplus_window_count": float(len(secondary.window_scores)),
+                f"{prefix}_camplus_window_vote_ratio": secondary.window_vote_ratio,
+                f"{prefix}_camplus_reference_vote_ratio": secondary.vote_ratio,
+                f"{prefix}_camplus_reference_median": secondary.reference_median_score,
+                f"{prefix}_camplus_reference_max": secondary.reference_max_score,
+                f"{prefix}_camplus_reference_spread": secondary.reference_spread,
+            }
+        )
+        return result
+
+    @staticmethod
+    def _cross_channel_reference_support(
+        uvr_match: SpeakerMatchDecision,
+        raw_match: SpeakerMatchDecision,
+        uvr_primary_profile: SpeakerProfile,
+        uvr_secondary_profile: CAMPlusProfile,
+        raw_primary_profile: SpeakerProfile,
+        raw_secondary_profile: CAMPlusProfile,
+    ) -> tuple[int, float, float]:
+        """Find references that support both channels for both models.
+
+        Returns ``(common_reference_count, best_primary_pair,
+        best_secondary_pair)``.  A pair score is the weaker of the UVR and
+        raw cosine scores for one reference.  Requiring this shared-reference
+        evidence prevents two unrelated centroids from accidentally forming a
+        rescue consensus.
+        """
+
+        if (
+            uvr_match.primary.embedding is None
+            or uvr_match.secondary is None
+            or uvr_match.secondary.embedding is None
+            or raw_match.primary.embedding is None
+            or raw_match.secondary is None
+            or raw_match.secondary.embedding is None
+        ):
+            return 0, 0.0, 0.0
+        uvr_primary_scores = uvr_primary_profile.embeddings @ uvr_match.primary.embedding
+        uvr_secondary_scores = (
+            uvr_secondary_profile.embeddings @ uvr_match.secondary.embedding
+        )
+        raw_primary_scores = raw_primary_profile.embeddings @ raw_match.primary.embedding
+        raw_secondary_scores = (
+            raw_secondary_profile.embeddings @ raw_match.secondary.embedding
+        )
+        uvr_primary_indexes = uvr_primary_profile.reference_indexes or tuple(
+            range(len(uvr_primary_scores))
+        )
+        uvr_secondary_indexes = uvr_secondary_profile.reference_indexes or tuple(
+            range(len(uvr_secondary_scores))
+        )
+        raw_primary_indexes = raw_primary_profile.reference_indexes or tuple(
+            range(len(raw_primary_scores))
+        )
+        raw_secondary_indexes = raw_secondary_profile.reference_indexes or tuple(
+            range(len(raw_secondary_scores))
+        )
+        up = {
+            index: float(score)
+            for index, score in zip(uvr_primary_indexes, uvr_primary_scores)
+        }
+        us = {
+            index: float(score)
+            for index, score in zip(uvr_secondary_indexes, uvr_secondary_scores)
+        }
+        rp = {
+            index: float(score)
+            for index, score in zip(raw_primary_indexes, raw_primary_scores)
+        }
+        rs = {
+            index: float(score)
+            for index, score in zip(raw_secondary_indexes, raw_secondary_scores)
+        }
+        common = sorted(set(up) & set(us) & set(rp) & set(rs))
+        if not common:
+            return 0, 0.0, 0.0
+        best_primary = max(min(up[index], rp[index]) for index in common)
+        best_secondary = max(min(us[index], rs[index]) for index in common)
+        return len(common), float(best_primary), float(best_secondary)
+
+    @staticmethod
+    def _diagonal_reference_support(
+        uvr_match: SpeakerMatchDecision,
+        raw_match: SpeakerMatchDecision,
+        uvr_secondary_profile: CAMPlusProfile,
+        raw_primary_profile: SpeakerProfile,
+        raw_primary_floor: float,
+        uvr_secondary_floor: float,
+    ) -> tuple[int, float]:
+        """Pair raw ERes2Net with UVR CAM++ on the same reference clip.
+
+        UVR can remove speaker harmonics that ERes2Net relies on while CAM++
+        remains stable on the separated stem.  A diagonal rescue is therefore
+        allowed only when the original-channel ERes2Net score and the
+        stem-channel CAM++ score point to the *same* source reference.  This is
+        deliberately different from taking two unrelated per-model maxima.
+        """
+
+        if (
+            raw_match.primary.embedding is None
+            or uvr_match.secondary is None
+            or uvr_match.secondary.embedding is None
+        ):
+            return 0, 0.0
+        raw_scores = raw_primary_profile.embeddings @ raw_match.primary.embedding
+        uvr_scores = (
+            uvr_secondary_profile.embeddings @ uvr_match.secondary.embedding
+        )
+        raw_indexes = raw_primary_profile.reference_indexes or tuple(
+            range(len(raw_scores))
+        )
+        uvr_indexes = uvr_secondary_profile.reference_indexes or tuple(
+            range(len(uvr_scores))
+        )
+        raw_by_index = {
+            index: float(score) for index, score in zip(raw_indexes, raw_scores)
+        }
+        uvr_by_index = {
+            index: float(score) for index, score in zip(uvr_indexes, uvr_scores)
+        }
+        common = sorted(set(raw_by_index) & set(uvr_by_index))
+        supported = [
+            index
+            for index in common
+            if raw_by_index[index] >= raw_primary_floor
+            and uvr_by_index[index] >= uvr_secondary_floor
+        ]
+        if supported:
+            best_pair = max(
+                min(raw_by_index[index], uvr_by_index[index])
+                for index in supported
+            )
+            return len(supported), float(best_pair)
+
+        # A separator can alter the relative ordering of reference clips even
+        # though both channels still point at the same target voice.  Retain a
+        # weaker shared anchor in that case, while leaving the independent
+        # direct-score/gain floors in ``_raw_rescue_gate`` as the hard safety
+        # checks.  This recovers clips such as a quiet target utterance whose
+        # raw ERes2Net and stem CAM++ maxima land on adjacent references.
+        weak_supported = [
+            index
+            for index in common
+            if raw_by_index[index] >= max(0.42, raw_primary_floor - 0.10)
+            and uvr_by_index[index] >= max(0.46, uvr_secondary_floor - 0.10)
+        ]
+        if not weak_supported:
+            return 0, 0.0
+        best_pair = min(max(raw_by_index.values()), max(uvr_by_index.values()))
+        return len(weak_supported), float(best_pair)
+
+    @classmethod
+    def _raw_rescue_gate(
+        cls,
+        uvr_match: SpeakerMatchDecision,
+        raw_match: SpeakerMatchDecision,
+        threshold: float,
+        duration: float,
+        *,
+        clean_gate: bool,
+        allow_raw_rescue: bool,
+        channel_duration_delta: float,
+        max_channel_duration_delta: float,
+        cross_channel_reference_count: int | None = None,
+        cross_channel_primary_pair: float | None = None,
+        cross_channel_secondary_pair: float | None = None,
+        diagonal_reference_count: int | None = None,
+        diagonal_reference_pair: float | None = None,
+    ) -> tuple[bool, str, dict[str, float | str | bool]]:
+        """Apply a conservative original-channel rescue policy.
+
+        The original channel may recover speech detail removed by UVR, but it
+        cannot act as an independent identity gate.  A rescue therefore needs
+        (1) a caller-confirmed clean/overlap-free segment, (2) a strict raw
+        two-model match, (3) minimum direct evidence from *both* UVR models,
+        and (4) a measurable raw-channel gain over the failed UVR decision.
+        """
+
+        # Floors are intentionally expressed relative to the UI threshold but
+        # bounded below.  This prevents a low user threshold from converting
+        # the raw channel into a permissive single-route classifier.
+        uvr_primary_floor = max(0.38, float(threshold) - 0.24)
+        uvr_secondary_floor = max(0.36, float(threshold) - 0.28)
+        uvr_primary_max_floor = max(0.42, float(threshold) - 0.28)
+        uvr_secondary_max_floor = max(0.38, float(threshold) - 0.30)
+        uvr_pair_floor = max(0.36, float(threshold) - 0.32)
+        uvr_p20_floor = max(0.28, float(threshold) - 0.36)
+        raw_primary_floor = max(0.64, float(threshold) - 0.06)
+        raw_secondary_floor = max(0.60, float(threshold) - 0.08)
+        raw_primary_max_floor = max(0.58, float(threshold) - 0.10)
+        raw_secondary_max_floor = max(0.54, float(threshold) - 0.12)
+        raw_pair_floor = max(0.52, float(threshold) - 0.14)
+        raw_p20_floor = max(0.40, float(threshold) - 0.22)
+        diagonal_raw_primary_floor = max(0.54, float(threshold) - 0.14)
+        diagonal_uvr_secondary_floor = max(0.56, float(threshold) - 0.12)
+        diagonal_uvr_primary_floor = max(0.44, float(threshold) - 0.24)
+        diagonal_raw_secondary_floor = max(0.46, float(threshold) - 0.22)
+        diagonal_raw_primary_max_floor = max(0.55, float(threshold) - 0.13)
+        diagonal_uvr_secondary_max_floor = max(0.56, float(threshold) - 0.12)
+        diagonal_raw_primary_p20_floor = max(0.45, float(threshold) - 0.23)
+        diagonal_uvr_secondary_p20_floor = max(0.40, float(threshold) - 0.28)
+        diagonal_pair_floor = max(0.48, float(threshold) - 0.20)
+        diagonal_gain_floor = 0.05
+
+        details: dict[str, float | str | bool] = {
+            "raw_rescue_uvr_primary_floor": round(uvr_primary_floor, 5),
+            "raw_rescue_uvr_secondary_floor": round(uvr_secondary_floor, 5),
+            "raw_rescue_uvr_primary_max_floor": round(uvr_primary_max_floor, 5),
+            "raw_rescue_uvr_secondary_max_floor": round(uvr_secondary_max_floor, 5),
+            "raw_rescue_uvr_pair_floor": round(uvr_pair_floor, 5),
+            "raw_rescue_uvr_p20_floor": round(uvr_p20_floor, 5),
+            "raw_rescue_raw_primary_floor": round(raw_primary_floor, 5),
+            "raw_rescue_raw_secondary_floor": round(raw_secondary_floor, 5),
+            "raw_rescue_raw_primary_max_floor": round(raw_primary_max_floor, 5),
+            "raw_rescue_raw_secondary_max_floor": round(raw_secondary_max_floor, 5),
+            "raw_rescue_raw_pair_floor": round(raw_pair_floor, 5),
+            "raw_rescue_raw_p20_floor": round(raw_p20_floor, 5),
+            "raw_rescue_diagonal_raw_primary_floor": round(
+                diagonal_raw_primary_floor, 5
+            ),
+            "raw_rescue_diagonal_uvr_secondary_floor": round(
+                diagonal_uvr_secondary_floor, 5
+            ),
+            "raw_rescue_diagonal_uvr_primary_floor": round(
+                diagonal_uvr_primary_floor, 5
+            ),
+            "raw_rescue_diagonal_raw_secondary_floor": round(
+                diagonal_raw_secondary_floor, 5
+            ),
+            "raw_rescue_diagonal_raw_primary_max_floor": round(
+                diagonal_raw_primary_max_floor, 5
+            ),
+            "raw_rescue_diagonal_uvr_secondary_max_floor": round(
+                diagonal_uvr_secondary_max_floor, 5
+            ),
+            "raw_rescue_diagonal_raw_primary_p20_floor": round(
+                diagonal_raw_primary_p20_floor, 5
+            ),
+            "raw_rescue_diagonal_uvr_secondary_p20_floor": round(
+                diagonal_uvr_secondary_p20_floor, 5
+            ),
+            "raw_rescue_diagonal_pair_floor": round(diagonal_pair_floor, 5),
+            "raw_rescue_diagonal_gain_floor": round(diagonal_gain_floor, 5),
+            "raw_rescue_channel_duration_delta": round(
+                float(channel_duration_delta), 5
+            ),
+            "raw_rescue_max_channel_duration_delta": round(
+                float(max_channel_duration_delta), 5
+            ),
+        }
+        if cross_channel_reference_count is not None:
+            details.update(
+                {
+                    "raw_rescue_cross_reference_count": float(
+                        cross_channel_reference_count
+                    ),
+                    "raw_rescue_cross_primary_pair": round(
+                        float(cross_channel_primary_pair or 0.0), 5
+                    ),
+                    "raw_rescue_cross_secondary_pair": round(
+                        float(cross_channel_secondary_pair or 0.0), 5
+                    ),
+                }
+            )
+        if diagonal_reference_count is not None:
+            details.update(
+                {
+                    "raw_rescue_diagonal_reference_count": float(
+                        diagonal_reference_count
+                    ),
+                    "raw_rescue_diagonal_reference_pair": round(
+                        float(diagonal_reference_pair or 0.0), 5
+                    ),
+                }
+            )
+
+        if not allow_raw_rescue:
+            return False, "disabled", details
+        if not clean_gate:
+            return False, "clean_gate_disabled", details
+        if channel_duration_delta > max_channel_duration_delta:
+            return False, "channel_duration_mismatch", details
+        if duration < cls.SHORT_MIN_DURATION:
+            return False, "duration_too_short", details
+        if raw_match.secondary is None or uvr_match.secondary is None:
+            return False, "missing_secondary_decision", details
+        # A sustained low window in the UVR stem usually means a speaker
+        # switch/overlap rather than harmless separator damage.  Do not let
+        # the raw channel bridge that identity boundary.
+        if not cls._window_continuity(
+            uvr_match.primary,
+            uvr_match.secondary,
+            duration,
+            threshold,
+        ):
+            return False, "uvr_discontinuous", details
+
+        uvr_primary = uvr_match.primary
+        uvr_secondary = uvr_match.secondary
+        raw_primary = raw_match.primary
+        raw_secondary = raw_match.secondary
+        uvr_evidence = (
+            uvr_primary.score >= uvr_primary_floor
+            and uvr_secondary.score >= uvr_secondary_floor
+            and uvr_primary.reference_max_score >= uvr_primary_max_floor
+            and uvr_secondary.reference_max_score >= uvr_secondary_max_floor
+            and uvr_match.paired_reference_median >= uvr_pair_floor
+            and max(uvr_primary.window_p20_score, uvr_secondary.window_p20_score)
+            >= uvr_p20_floor
+        )
+        details["raw_rescue_uvr_partial_evidence"] = uvr_evidence
+        if not uvr_evidence:
+            return False, "uvr_insufficient_evidence", details
+
+        strict_raw_evidence = (
+            raw_match.accepted
+            and raw_match.tier in {"short_strong", "strong", "balanced"}
+            and raw_primary.score >= raw_primary_floor
+            and raw_secondary.score >= raw_secondary_floor
+            and raw_primary.reference_max_score >= raw_primary_max_floor
+            and raw_secondary.reference_max_score >= raw_secondary_max_floor
+            and raw_match.paired_reference_median >= raw_pair_floor
+            and max(raw_primary.window_p20_score, raw_secondary.window_p20_score)
+            >= raw_p20_floor
+        )
+        details["raw_rescue_raw_strong_evidence"] = strict_raw_evidence
+
+        diagonal_evidence = (
+            raw_primary.score - uvr_primary.score >= diagonal_gain_floor
+            and raw_primary.score >= diagonal_raw_primary_floor
+            and uvr_secondary.score >= diagonal_uvr_secondary_floor
+            and uvr_primary.score >= diagonal_uvr_primary_floor
+            and raw_secondary.score >= diagonal_raw_secondary_floor
+            and raw_primary.reference_max_score
+            >= diagonal_raw_primary_max_floor
+            and uvr_secondary.reference_max_score
+            >= diagonal_uvr_secondary_max_floor
+            and raw_primary.window_p20_score
+            >= diagonal_raw_primary_p20_floor
+            and uvr_secondary.window_p20_score
+            >= diagonal_uvr_secondary_p20_floor
+            and max(
+                raw_match.paired_reference_median,
+                uvr_match.paired_reference_median,
+            )
+            >= diagonal_pair_floor
+            and int(diagonal_reference_count or 0) > 0
+            and float(diagonal_reference_pair or 0.0) >= diagonal_pair_floor
+        )
+        details["raw_rescue_diagonal_evidence"] = diagonal_evidence
+        details["raw_rescue_diagonal_primary_gain"] = round(
+            raw_primary.score - uvr_primary.score, 5
+        )
+
+        if not strict_raw_evidence and not diagonal_evidence:
+            return False, "raw_and_diagonal_evidence_below_floor", details
+
+        if strict_raw_evidence and cross_channel_reference_count is not None:
+            shared_primary_floor = min(uvr_primary_floor, raw_primary_floor)
+            shared_secondary_floor = min(uvr_secondary_floor, raw_secondary_floor)
+            shared_reference = (
+                cross_channel_reference_count > 0
+                and float(cross_channel_primary_pair or 0.0) >= shared_primary_floor
+                and float(cross_channel_secondary_pair or 0.0)
+                >= shared_secondary_floor
+            )
+            details["raw_rescue_cross_reference_support"] = shared_reference
+            if not shared_reference:
+                return False, "cross_channel_reference_mismatch", details
+
+        gains = {
+            "primary": raw_primary.score - uvr_primary.score,
+            "secondary": raw_secondary.score - uvr_secondary.score,
+            "paired": raw_match.paired_reference_median
+            - uvr_match.paired_reference_median,
+        }
+        details.update(
+            {
+                "raw_rescue_primary_gain": round(gains["primary"], 5),
+                "raw_rescue_secondary_gain": round(gains["secondary"], 5),
+                "raw_rescue_paired_gain": round(gains["paired"], 5),
+            }
+        )
+        if strict_raw_evidence and max(gains.values()) < 0.03:
+            return False, "raw_gain_insufficient", details
+        details["raw_rescue_mode"] = (
+            "strict_raw" if strict_raw_evidence else "diagonal"
+        )
+        return (
+            True,
+            "accepted" if strict_raw_evidence else "accepted_diagonal",
+            details,
+        )
+
+    @classmethod
+    def _raw_rescue_prefilter(
+        cls,
+        uvr_match: SpeakerMatchDecision,
+        threshold: float,
+        duration: float,
+    ) -> tuple[bool, str]:
+        """Reject obviously impossible rescues before loading the raw clip.
+
+        A failed stem decision can only be rescued when it still contains a
+        minimum amount of evidence.  Applying this inexpensive check before
+        the original-channel models avoids running two extra encoders for
+        every background/noise VAD island while retaining the lower floors
+        needed by the diagonal rescue path.
+        """
+
+        if duration < cls.SHORT_MIN_DURATION:
+            return False, "duration_too_short"
+        secondary = uvr_match.secondary
+        if secondary is None:
+            return False, "missing_secondary_decision"
+        primary = uvr_match.primary
+        if not cls._window_continuity(primary, secondary, duration, threshold):
+            return False, "uvr_discontinuous"
+        primary_floor = max(0.38, float(threshold) - 0.24)
+        secondary_floor = max(0.40, float(threshold) - 0.28)
+        primary_max_floor = max(0.42, float(threshold) - 0.28)
+        secondary_max_floor = max(0.38, float(threshold) - 0.30)
+        pair_floor = max(0.36, float(threshold) - 0.32)
+        p20_floor = max(0.28, float(threshold) - 0.36)
+        possible = (
+            primary.score >= primary_floor
+            and secondary.score >= secondary_floor
+            and primary.reference_max_score >= primary_max_floor
+            and secondary.reference_max_score >= secondary_max_floor
+            and uvr_match.paired_reference_median >= pair_floor
+            and max(primary.window_p20_score, secondary.window_p20_score)
+            >= p20_floor
+        )
+        return (True, "eligible") if possible else (False, "uvr_prefilter_below_floor")
+
+    def verify_dual_channel_waveform(
+        self,
+        uvr_waveform: torch.Tensor,
+        raw_waveform: torch.Tensor | None,
+        profile: SpeakerMatchProfile,
+        threshold: float,
+        duration: float,
+        window_seconds: float = 1.8,
+        hop_seconds: float = 0.9,
+        *,
+        clean_gate: bool = False,
+        allow_raw_rescue: bool = True,
+        audit_raw_on_uvr_accept: bool = False,
+        max_channel_duration_delta: float = 0.25,
+    ) -> SpeakerMatchDecision:
+        """Verify a stem and its time-aligned original waveform together.
+
+        The UVR/stem result is always returned as ``primary``/``secondary``.
+        Original-channel scores are attached as ``raw_*`` fields and scalar
+        diagnostics.  Only a failed UVR decision can enter the raw rescue gate;
+        a clean-gate assertion from the caller is mandatory because this class
+        cannot itself determine whether music or singing remains in the raw
+        waveform.  Accepted UVR decisions skip raw inference by default;
+        ``audit_raw_on_uvr_accept=True`` enables it for diagnostic A/B runs.
+        """
+
+        secondary_profile = self._ensure_secondary(profile)
+        uvr_match = self._verify_channel_waveform(
+            uvr_waveform,
+            profile.primary,
+            secondary_profile,
+            threshold,
+            duration,
+            window_seconds=window_seconds,
+            hop_seconds=hop_seconds,
+        )
+
+        diagnostics = dict(uvr_match.diagnostics)
+        diagnostics.update(self._channel_diagnostics("uvr", uvr_match))
+        diagnostics.update(
+            {
+                "dual_channel": True,
+                "dual_channel_primary": "uvr",
+                "raw_rescue": False,
+                "raw_rescue_reason": "uvr_accepted"
+                if uvr_match.accepted
+                else "pending",
+                "raw_channel_available": False,
+                "raw_profile_available": False,
+                "raw_clean_gate": bool(clean_gate),
+                "raw_rescue_enabled": bool(allow_raw_rescue),
+                "raw_audit_on_uvr_accept": bool(audit_raw_on_uvr_accept),
+                "raw_channel_skipped": False,
+            }
+        )
+
+        # The original channel exists to recover separator-damaged rejects.
+        # Running it for a clean UVR acceptance roughly doubles the speaker
+        # inference cost without changing the decision.  Diagnostic A/B runs
+        # can opt in explicitly when both-channel scores are needed.
+        if uvr_match.accepted and not audit_raw_on_uvr_accept:
+            diagnostics["raw_rescue_reason"] = "skipped_uvr_accepted"
+            diagnostics["raw_channel_skipped"] = True
+            return replace(
+                uvr_match,
+                diagnostics=diagnostics,
+                raw_tier=None,
+            )
+
+        raw_primary_profile = getattr(profile, "raw_primary", None)
+        raw_secondary_profile = getattr(profile, "raw_secondary", None)
+        if raw_primary_profile is None or raw_secondary_profile is None:
+            diagnostics["raw_rescue_reason"] = (
+                "uvr_accepted" if uvr_match.accepted else "raw_profile_unavailable"
+            )
+            return replace(
+                uvr_match,
+                diagnostics=diagnostics,
+                raw_tier=None,
+            )
+
+        possible, prefilter_reason = self._raw_rescue_prefilter(
+            uvr_match,
+            threshold,
+            duration,
+        )
+        if not possible:
+            diagnostics["raw_rescue_reason"] = prefilter_reason
+            diagnostics["raw_channel_skipped"] = True
+            return replace(
+                uvr_match,
+                diagnostics=diagnostics,
+                raw_tier=None,
+            )
+
+        if raw_waveform is None:
+            diagnostics["raw_rescue_reason"] = (
+                "uvr_accepted" if uvr_match.accepted else "raw_waveform_unavailable"
+            )
+            return replace(
+                uvr_match,
+                diagnostics=diagnostics,
+                raw_tier=None,
+            )
+
+        raw_value = raw_waveform.detach().float().flatten()
+        uvr_value = uvr_waveform.detach().float().flatten()
+        raw_duration = float(raw_value.numel()) / 16000.0
+        uvr_duration = float(uvr_value.numel()) / 16000.0
+        duration_delta = abs(raw_duration - uvr_duration)
+        diagnostics.update(
+            {
+                "raw_channel_available": bool(raw_value.numel()),
+                "raw_profile_available": True,
+                "uvr_waveform_samples": float(uvr_value.numel()),
+                "raw_waveform_samples": float(raw_value.numel()),
+                "uvr_waveform_duration": round(uvr_duration, 5),
+                "raw_waveform_duration": round(raw_duration, 5),
+                "raw_waveform_duration_delta": round(duration_delta, 5),
+            }
+        )
+        if not raw_value.numel():
+            diagnostics["raw_rescue_reason"] = (
+                "uvr_accepted" if uvr_match.accepted else "raw_waveform_empty"
+            )
+            return replace(uvr_match, diagnostics=diagnostics, raw_tier=None)
+
+        raw_match = self._verify_channel_waveform(
+            raw_value,
+            raw_primary_profile,
+            raw_secondary_profile,
+            threshold,
+            duration,
+            window_seconds=window_seconds,
+            hop_seconds=hop_seconds,
+        )
+        diagnostics.update(self._channel_diagnostics("raw", raw_match))
+        # Reference indexes only have cross-channel meaning when the caller
+        # supplied the same number/order of UVR and raw reference clips.  A
+        # mismatched list is still useful for diagnostics, but it must not be
+        # treated as an implicit correspondence for rescue.
+        if len(profile.reference_paths) != len(profile.raw_reference_paths):
+            cross_reference_count, cross_primary_pair, cross_secondary_pair = (
+                0,
+                0.0,
+                0.0,
+            )
+            diagonal_reference_count, diagonal_reference_pair = 0, 0.0
+        else:
+            cross_reference_count, cross_primary_pair, cross_secondary_pair = (
+                self._cross_channel_reference_support(
+                    uvr_match,
+                    raw_match,
+                    profile.primary,
+                    secondary_profile,
+                    raw_primary_profile,
+                    raw_secondary_profile,
+                )
+            )
+            diagonal_reference_count, diagonal_reference_pair = (
+                self._diagonal_reference_support(
+                    uvr_match,
+                    raw_match,
+                    secondary_profile,
+                    raw_primary_profile,
+                    max(0.55, float(threshold) - 0.13),
+                    max(0.56, float(threshold) - 0.12),
+                )
+            )
+        diagnostics.update(
+            {
+                "raw_rescue_cross_reference_count": float(cross_reference_count),
+                "raw_rescue_cross_primary_pair": round(cross_primary_pair, 5),
+                "raw_rescue_cross_secondary_pair": round(cross_secondary_pair, 5),
+                "raw_rescue_diagonal_reference_count": float(
+                    diagonal_reference_count
+                ),
+                "raw_rescue_diagonal_reference_pair": round(
+                    diagonal_reference_pair, 5
+                ),
+            }
+        )
+
+        # A clean UVR decision remains authoritative.  We still compute and
+        # expose raw evidence so callers can audit separator damage without
+        # changing an already accepted result.
+        if uvr_match.accepted:
+            diagnostics["raw_rescue_reason"] = "uvr_accepted"
+            return replace(
+                uvr_match,
+                diagnostics=diagnostics,
+                raw_primary=raw_match.primary,
+                raw_secondary=raw_match.secondary,
+                raw_tier=raw_match.tier,
+            )
+
+        rescued, reason, gate_details = self._raw_rescue_gate(
+            uvr_match,
+            raw_match,
+            threshold,
+            duration,
+            clean_gate=clean_gate,
+            allow_raw_rescue=allow_raw_rescue,
+            channel_duration_delta=duration_delta,
+            max_channel_duration_delta=max_channel_duration_delta,
+            cross_channel_reference_count=cross_reference_count,
+            cross_channel_primary_pair=cross_primary_pair,
+            cross_channel_secondary_pair=cross_secondary_pair,
+            diagonal_reference_count=diagonal_reference_count,
+            diagonal_reference_pair=diagonal_reference_pair,
+        )
+        diagnostics.update(gate_details)
+        diagnostics["raw_rescue_reason"] = reason
+        diagnostics["raw_rescue"] = rescued
+        if rescued:
+            diagnostics["speaker_tier"] = "raw_rescue"
+            diagnostics["speaker_match_mode"] = "raw_rescue"
+            return replace(
+                uvr_match,
+                accepted=True,
+                match_mode="raw_rescue",
+                tier="raw_rescue",
+                merge_only=False,
+                diagnostics=diagnostics,
+                raw_primary=raw_match.primary,
+                raw_secondary=raw_match.secondary,
+                raw_tier=raw_match.tier,
+            )
+        return replace(
+            uvr_match,
+            diagnostics=diagnostics,
+            raw_primary=raw_match.primary,
+            raw_secondary=raw_match.secondary,
+            raw_tier=raw_match.tier,
+        )
+
+    def verify_dual_channel(
+        self,
+        uvr_candidate_path: Path,
+        raw_candidate_path: Path,
+        profile: SpeakerMatchProfile,
+        threshold: float,
+        duration: float,
+        window_seconds: float = 1.8,
+        hop_seconds: float = 0.9,
+        *,
+        clean_gate: bool = False,
+        allow_raw_rescue: bool = True,
+        audit_raw_on_uvr_accept: bool = False,
+        max_channel_duration_delta: float = 0.25,
+    ) -> SpeakerMatchDecision:
+        """Path-based convenience wrapper for :meth:`verify_dual_channel_waveform`."""
+
+        return self.verify_dual_channel_waveform(
+            load_mono(uvr_candidate_path, 16000),
+            load_mono(raw_candidate_path, 16000),
+            profile,
+            threshold,
+            duration,
+            window_seconds=window_seconds,
+            hop_seconds=hop_seconds,
+            clean_gate=clean_gate,
+            allow_raw_rescue=allow_raw_rescue,
+            audit_raw_on_uvr_accept=audit_raw_on_uvr_accept,
+            max_channel_duration_delta=max_channel_duration_delta,
         )
 
     def embedding_pair(self, candidate_path: Path) -> tuple[torch.Tensor, torch.Tensor]:

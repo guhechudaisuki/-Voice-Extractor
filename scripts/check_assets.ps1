@@ -5,6 +5,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $toolRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $gptRoot = Join-Path $WorkspaceRoot 'GPT-SoVITS-v2pro-20250604'
+$modelRoot = Join-Path $toolRoot 'model'
 $python = if ($env:VOICE_EXTRACT_PYTHON) { $env:VOICE_EXTRACT_PYTHON } else { Join-Path $gptRoot 'runtime\python.exe' }
 
 function Test-Asset {
@@ -22,17 +23,17 @@ $checks = @(
     @{ Name='FFmpeg'; Path=(Join-Path $gptRoot 'runtime\ffmpeg.exe') },
     @{ Name='FFprobe'; Path=(Join-Path $gptRoot 'runtime\ffprobe.exe') },
     @{ Name='UVR5 vocals'; Path=(Join-Path $gptRoot 'tools\uvr5\uvr5_weights\HP2_all_vocals.pth') },
-    @{ Name='ERes2NetV2'; Path=(Join-Path $gptRoot 'GPT_SoVITS\pretrained_models\sv\pretrained_eres2netv2w24s4ep4.ckpt') },
-    @{ Name='Paraformer'; Path=(Join-Path $gptRoot 'tools\asr\models\speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch\model.pt') },
-    @{ Name='FSMN-VAD'; Path=(Join-Path $gptRoot 'tools\asr\models\speech_fsmn_vad_zh-cn-16k-common-pytorch\model.pt') },
-    @{ Name='CT-Punc'; Path=(Join-Path $gptRoot 'tools\asr\models\punc_ct-transformer_zh-cn-common-vocab272727-pytorch\model.pt') },
-    @{ Name='CAM++'; Path=(Join-Path $toolRoot 'models\campplus_voxceleb\campplus_voxceleb.bin') },
-    @{ Name='WavLM SV'; Path=(Join-Path $toolRoot 'models\wavlm-base-plus-sv\pytorch_model.bin') },
-    @{ Name='WavLM config'; Path=(Join-Path $toolRoot 'models\wavlm-base-plus-sv\config.json') },
-    @{ Name='WavLM preprocessor'; Path=(Join-Path $toolRoot 'models\wavlm-base-plus-sv\preprocessor_config.json') },
+    @{ Name='ERes2NetV2'; Path=(Join-Path $modelRoot 'speaker\eres2net\pretrained_eres2netv2w24s4ep4.ckpt') },
+    @{ Name='Paraformer'; Path=(Join-Path $modelRoot 'stt\speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch\model.pt') },
+    @{ Name='FSMN-VAD'; Path=(Join-Path $modelRoot 'stt\speech_fsmn_vad_zh-cn-16k-common-pytorch\model.pt') },
+    @{ Name='CT-Punc'; Path=(Join-Path $modelRoot 'stt\punc_ct-transformer_zh-cn-common-vocab272727-pytorch\model.pt') },
+    @{ Name='CAM++'; Path=(Join-Path $modelRoot 'speaker\campplus_voxceleb\campplus_voxceleb.bin') },
+    @{ Name='WavLM SV'; Path=(Join-Path $modelRoot 'speaker\wavlm-base-plus-sv\pytorch_model.bin') },
+    @{ Name='WavLM config'; Path=(Join-Path $modelRoot 'speaker\wavlm-base-plus-sv\config.json') },
+    @{ Name='WavLM preprocessor'; Path=(Join-Path $modelRoot 'speaker\wavlm-base-plus-sv\preprocessor_config.json') },
     @{
         Name='WeSpeaker ONNX'
-        Path=(Join-Path $toolRoot 'models\wespeaker-resnet34-lm\onnx\model.onnx')
+        Path=(Join-Path $modelRoot 'speaker\wespeaker-resnet34-lm\onnx\model.onnx')
         Hash='3955447B0499DC9E0A4541A895DF08B03C69098EBA4E56C02B5603E9F7F4FCBB'
     },
     @{ Name='Overlap ONNX'; Path=(Join-Path $toolRoot 'models\overlap\model.onnx') },
@@ -46,7 +47,7 @@ foreach ($item in $checks) {
 }
 if ($missing.Count -gt 0) { Write-Error ('Missing {0} asset(s). Run download_assets.ps1 or follow README.' -f $missing.Count) }
 
-$whisperSnapshots = Join-Path $WorkspaceRoot 'omnvoice\hf_cache\models--openai--whisper-large-v3-turbo\snapshots'
+$whisperSnapshots = Join-Path $modelRoot 'stt\whisper\hf_cache\models--openai--whisper-large-v3-turbo\snapshots'
 $whisperReady = (Test-Path -LiteralPath $whisperSnapshots -PathType Container) -and
     (@(Get-ChildItem -LiteralPath $whisperSnapshots -Directory -ErrorAction SilentlyContinue).Count -gt 0)
 if ($whisperReady) {

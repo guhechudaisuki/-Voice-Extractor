@@ -16,6 +16,7 @@ output/app.log
 
 # Runtime, model weights and caches (never commit these)
 models/
+model/
 work/
 output/
 runtime/
@@ -38,6 +39,7 @@ GPT-SoVITS*/
 !VoiceExtractor.spec
 
 # Audio/video inputs and generated media
+/京吹原片音频/
 *.wav
 *.mp3
 *.flac
@@ -56,6 +58,7 @@ dist/*
 versions/
 launcher/bin/
 launcher/obj/
+/vendor/bin/
 
 # OS/editor files
 .DS_Store

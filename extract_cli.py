@@ -16,6 +16,10 @@ def main() -> int:
     parser.add_argument("--reference", "-r", action="append", required=True, help="参考音频，可重复")
     parser.add_argument("--target", "-t", action="append", required=True, help="待提取音频，可重复")
     parser.add_argument(
+        "--subtitle", action="append", nargs=2, default=[], metavar=("TARGET", "SUBTITLE"),
+        help="可选字幕绑定：指定本批次中的目标路径和对应字幕路径，可重复",
+    )
+    parser.add_argument(
         "--exclude-role",
         action="append",
         nargs="+",
@@ -54,6 +58,9 @@ def main() -> int:
     parser.add_argument("--no-overlap", action="store_true", help="关闭多人重叠检测")
     parser.add_argument("--no-singing", action="store_true", help="关闭唱歌检测")
     args = parser.parse_args()
+    subtitle_targets = [Path(target).resolve() for target, _subtitle in args.subtitle]
+    if len(set(subtitle_targets)) != len(subtitle_targets):
+        parser.error("同一个目标只能绑定一份字幕")
 
     def progress(value: float, message: str) -> None:
         print(f"[{value * 100:5.1f}%] {message}", flush=True)
@@ -76,6 +83,7 @@ def main() -> int:
             [Path(item) for item in group] for group in args.exclude_role
         ],
         progress=progress,
+        subtitles=dict(args.subtitle),
     )
     accepted_count = sum(len(result.accepted) for result in batch.results)
     rejected_count = sum(len(result.rejected) for result in batch.results)

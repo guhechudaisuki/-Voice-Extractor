@@ -348,10 +348,10 @@ def ensure_assets(source_root: Path, python: Path) -> None:
     gpt_root = workspace / "GPT-SoVITS-v2pro-20250604"
     direct_paths = {
         "uvr": gpt_root / "tools" / "uvr5" / "uvr5_weights",
-        "eres": gpt_root / "GPT_SoVITS" / "pretrained_models" / "sv",
-        "camplus": source_root / "models" / "campplus_voxceleb",
-        "wavlm": source_root / "models" / "wavlm-base-plus-sv",
-        "wespeaker": source_root / "models" / "wespeaker-resnet34-lm" / "onnx",
+        "eres": source_root / "model" / "speaker" / "eres2net",
+        "camplus": source_root / "model" / "speaker" / "campplus_voxceleb",
+        "wavlm": source_root / "model" / "speaker" / "wavlm-base-plus-sv",
+        "wespeaker": source_root / "model" / "speaker" / "wespeaker-resnet34-lm" / "onnx",
         "overlap": source_root / "models" / "overlap",
         "panns": source_root / "models" / "panns",
     }
@@ -364,7 +364,7 @@ def ensure_assets(source_root: Path, python: Path) -> None:
         if not valid_file(destination, expected_hash):
             raise RuntimeError(f"Downloaded file is not usable: {destination}")
 
-    asr_root = gpt_root / "tools" / "asr" / "models"
+    asr_root = source_root / "model" / "stt"
     for name, model_id, folder_name in MODELSCOPE_ASSETS:
         destination = asr_root / folder_name
         if valid_file(destination / "model.pt"):
@@ -374,7 +374,7 @@ def ensure_assets(source_root: Path, python: Path) -> None:
         if not valid_file(destination / "model.pt"):
             raise RuntimeError(f"ModelScope model is incomplete: {destination}")
 
-    whisper_cache = workspace / "omnvoice" / "hf_cache"
+    whisper_cache = source_root / "model" / "stt" / "whisper" / "hf_cache"
     if whisper_ready(whisper_cache):
         say("[OK] Whisper large-v3-turbo")
     else:
@@ -417,7 +417,7 @@ def launch_app(source_root: Path, python: Path) -> int:
     env = os.environ.copy()
     env["PYTHONPATH"] = str(source_root) + os.pathsep + env.get("PYTHONPATH", "")
     env.setdefault("HF_HUB_OFFLINE", "1")
-    env.setdefault("MODELSCOPE_CACHE", str(source_root / "models" / "modelscope_cache"))
+    env.setdefault("MODELSCOPE_CACHE", str(source_root / "model" / "modelscope_cache"))
     env.setdefault("PYTHONUNBUFFERED", "1")
     port = _find_service_port()
     env["VOICE_EXTRACT_PORT"] = str(port)

@@ -41,6 +41,10 @@ from .speaker import (
     SpeakerProfile,
 )
 from .transcription import FunASRTools, WhisperSegmenter
+from .subtitles import SubtitleGuide, validate_subtitle_bindings
+from .subtitle_assistance import (
+    restore_subtitle_sentences, retry_subtitle_vad, split_at_subtitle_pauses,
+)
 from .types import BatchPipelineResult, CandidateSentence, PipelineResult, TimeSpan
 
 LOGGER = logging.getLogger(__name__)
@@ -66,6 +70,9 @@ class PipelineOptions:
     keep_rejected: bool = False
     use_singing_detector: bool = True
     use_overlap_detector: bool = True
+    # UVR remains authoritative.  The time-aligned original channel may only
+    # rescue a stem rejection after singing/overlap gates have passed.
+    use_raw_speaker_rescue: bool = True
     export_all_sentences: bool = False
     export_video_clips: bool = False
     cleanup_work: bool = False
@@ -125,6 +132,9 @@ class ExtractionPipeline:
         ensure_local_assets()
         self.options = options or PipelineOptions()
         self.device = device if device == "cuda" and torch.cuda.is_available() else "cpu"
+        self._raw_target_waveform: torch.Tensor | None = None
+        self._raw_blocked_spans: tuple[TimeSpan, ...] = ()
+        self._subtitle_guide: SubtitleGuide | None = None
 
     def _job_paths(self, job_id: str) -> dict[str, Path]:
         root = WORK_ROOT / job_id
@@ -133,9 +143,11 @@ class ExtractionPipeline:
             "normalized_refs": root / "references_normalized",
             "reference_stems": root / "reference_stems",
             "reference_clips": root / "reference_voice_clips",
+            "raw_reference_clips": root / "reference_original_voice_clips",
             "negative_refs": root / "negative_references_normalized",
             "negative_stems": root / "negative_reference_stems",
             "negative_clips": root / "negative_reference_voice_clips",
+            "raw_negative_clips": root / "negative_reference_original_voice_clips",
             "normalized_target": root / "target_normalized.wav",
             "singing_removed_target": root / "target_singing_removed.wav",
             "stems": root / "stems",
@@ -530,13 +542,45 @@ class ExtractionPipeline:
         profile: SpeakerMatchProfile,
         threshold: float,
     ) -> SpeakerMatchDecision:
-        return verifier.verify_waveform(
-            self._waveform_span(waveform, span),
+        stem_part = self._waveform_span(waveform, span)
+        window_seconds = min(1.8, max(1.0, span.duration))
+        hop_seconds = min(0.9, max(0.5, span.duration / 2))
+        raw_source = self._raw_target_waveform
+        raw_profile_ready = (
+            profile.raw_primary is not None and profile.raw_secondary is not None
+        )
+        if (
+            not self.options.use_raw_speaker_rescue
+            or raw_source is None
+            or not raw_profile_ready
+        ):
+            return verifier.verify_waveform(
+                stem_part,
+                profile,
+                threshold,
+                duration=span.duration,
+                window_seconds=window_seconds,
+                hop_seconds=hop_seconds,
+            )
+
+        raw_part = self._waveform_span(raw_source, span)
+        # A raw rescue may never cross an utterance rejected by the singing or
+        # overlap gates.  Small boundary rounding differences are tolerated,
+        # but any real intersection disables the rescue route.
+        clean_gate = not any(
+            min(span.end, blocked.end) - max(span.start, blocked.start) > 0.02
+            for blocked in self._raw_blocked_spans
+        )
+        return verifier.verify_dual_channel_waveform(
+            stem_part,
+            raw_part,
             profile,
             threshold,
             duration=span.duration,
-            window_seconds=min(1.8, max(1.0, span.duration)),
-            hop_seconds=min(0.9, max(0.5, span.duration / 2)),
+            window_seconds=window_seconds,
+            hop_seconds=hop_seconds,
+            clean_gate=clean_gate,
+            allow_raw_rescue=True,
         )
 
     @staticmethod
@@ -1456,7 +1500,15 @@ class ExtractionPipeline:
         """Select near-target turns and audit every long accepted turn."""
 
         secondary = match.secondary
-        if secondary is None or duration < 2.50:
+        if secondary is None:
+            return False
+        # Original-channel rescue is evidence for a separator-damaged turn,
+        # not a structural identity decision.  Even a short rescued span must
+        # pass the local boundary audit; otherwise a brief A-B switch could be
+        # exported simply because its averaged raw embedding looked strong.
+        if match.tier == "raw_rescue":
+            return duration >= 1.20
+        if duration < 2.50:
             return False
         if not match.accepted:
             return (
@@ -2891,6 +2943,10 @@ class ExtractionPipeline:
                 rejected_path = rejected_dir / f"{index:04d}_{_safe_name(candidate.reject_reason, 'rejected')}.wav"
                 write_clip(stem, rejected_path, candidate.start, candidate.end, sample_rate=16000)
 
+        subtitle_guide = getattr(self, "_subtitle_guide", None)
+        if subtitle_guide is not None:
+            for candidate in [*accepted, *rejected]:
+                subtitle_guide.annotate(candidate)
         accepted_records = [candidate.to_dict() for candidate in accepted]
         rejected_records = [candidate.to_dict() for candidate in rejected]
         records = [*accepted_records, *rejected_records]
@@ -2907,6 +2963,7 @@ class ExtractionPipeline:
                     "rejected_count": len(rejected),
                     "reject_summary": reject_summary,
                     "options": asdict(self.options),
+                    **({"subtitle_assistance": subtitle_guide.report} if subtitle_guide is not None else {}),
                     "sentences": records,
                 },
                 ensure_ascii=False,
@@ -2970,6 +3027,7 @@ class ExtractionPipeline:
         progress: ProgressCallback | None = None,
         job_id: str | None = None,
         create_archive: bool = True,
+        subtitle: str | Path | None = None,
     ) -> PipelineResult:
         progress = progress or _noop_progress
         references = [Path(path) for path in references if path]
@@ -2985,6 +3043,7 @@ class ExtractionPipeline:
             raise ValueError("请至少提供一段参考音频")
         if not target.exists():
             raise FileNotFoundError(target)
+        self._subtitle_guide = SubtitleGuide.load(Path(subtitle)) if subtitle else None
         job_id = job_id or time.strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
         paths = self._job_paths(job_id)
         paths["root"].mkdir(parents=True, exist_ok=True)
@@ -3097,7 +3156,39 @@ class ExtractionPipeline:
                 ],
                 progress=lambda value, message: progress(0.40 + 0.08 * value, message),
             )
+            if self._subtitle_guide is not None:
+                guide = self._subtitle_guide
+                guide.calibrate(vad_map.get(stem, []))
+                if guide.aligned:
+                    progress(0.48, f"字幕时间轴已对齐：偏移 {guide.offset:+.2f} 秒，{len(guide.anchors)} 个锚点")
+                    vad_map[stem] = retry_subtitle_vad(
+                        guide, vad_map.get(stem, []), target_duration, stem,
+                        paths["root"], vad_tools,
+                        progress=lambda _v, message: progress(0.48, f"字幕辅助补检：{message}"),
+                    )
+                    vad_map[stem] = split_at_subtitle_pauses(
+                        self, guide, vad_map[stem], load_mono(stem, 16000),
+                        progress=lambda _v, message: progress(0.48, message),
+                    )
+                    progress(0.48, f"字幕辅助：补检 {len(guide.report['vad_recovered_spans'])} 段，按实际停顿细分 {len(guide.report['acoustic_subtitle_splits'])} 处")
+                else:
+                    progress(0.48, "字幕与音频时间轴缺少可靠对应，已回退到原始切分流程")
             reference_clips = self._make_reference_clips(reference_stems, vad_map, paths)
+            # Build a second, time-aligned reference domain from the original
+            # normalized audio.  Reusing the UVR VAD spans keeps clip ordering
+            # and identity anchors identical while preserving spectral detail
+            # that the separator may have removed.
+            raw_reference_vad = {
+                raw_path: list(vad_map.get(stem_path, []))
+                for raw_path, stem_path in zip(normalized_refs, reference_stems)
+            }
+            raw_reference_clips = self._make_reference_clips(
+                normalized_refs,
+                raw_reference_vad,
+                paths,
+                output_dir=paths["raw_reference_clips"],
+                prefix="reference",
+            )
             negative_reference_clips = [
                 self._make_reference_clips(
                     group,
@@ -3108,6 +3199,25 @@ class ExtractionPipeline:
                 )
                 for group_index, group in enumerate(negative_stem_groups, start=1)
             ]
+            raw_negative_reference_clips: list[list[Path]] = []
+            for group_index, (raw_group, stem_group) in enumerate(
+                zip(normalized_negative_groups, negative_stem_groups),
+                start=1,
+            ):
+                raw_group_vad = {
+                    raw_path: list(vad_map.get(stem_path, []))
+                    for raw_path, stem_path in zip(raw_group, stem_group)
+                }
+                raw_negative_reference_clips.append(
+                    self._make_reference_clips(
+                        raw_group,
+                        raw_group_vad,
+                        paths,
+                        output_dir=paths["raw_negative_clips"]
+                        / f"role_{group_index:03d}",
+                        prefix="negative",
+                    )
+                )
             # Sub-lower-bound gaps are treated as VAD jitter inside one speech
             # island. Medium gaps remain separate until the existing
             # same-speaker merge approves them; larger gaps stay hard splits.
@@ -3150,18 +3260,38 @@ class ExtractionPipeline:
                 status=lambda message: progress(0.49, message),
             )
             try:
-                profile = verifier.build_profile(reference_clips, self.options.speaker_threshold)
+                profile = verifier.build_channel_profile(
+                    reference_clips,
+                    raw_reference_clips,
+                    self.options.speaker_threshold,
+                )
                 exclusion_profiles: list[ExclusionSpeakerProfile] = []
                 if negative_reference_clips:
                     progress(
                         0.49,
                         f"建立 {len(negative_reference_clips)} 个排除角色声纹边界",
                     )
-                    exclusion_profiles = verifier.build_exclusion_profiles(
+                    exclusion_profiles = verifier.build_channel_exclusion_profiles(
                         negative_reference_clips,
                         profile,
+                        raw_reference_groups=raw_negative_reference_clips,
                     )
                 target_waveform = load_mono(stem, 16000)
+                raw_target_waveform = load_mono(target_normalized, 16000)
+                # Normalize tiny decoder/resampler length differences without
+                # shifting the shared timeline.  Large mismatches remain
+                # visible to the per-span dual-channel duration guard.
+                if abs(raw_target_waveform.numel() - target_waveform.numel()) <= 1600:
+                    if raw_target_waveform.numel() < target_waveform.numel():
+                        raw_target_waveform = torch.nn.functional.pad(
+                            raw_target_waveform,
+                            (0, target_waveform.numel() - raw_target_waveform.numel()),
+                        )
+                    elif raw_target_waveform.numel() > target_waveform.numel():
+                        raw_target_waveform = raw_target_waveform[
+                            : target_waveform.numel()
+                        ]
+                self._raw_target_waveform = raw_target_waveform
                 # Filter each smallest silence-delimited island before any
                 # joining.  Otherwise one overlap elsewhere in a long merged
                 # block incorrectly deletes a clean target utterance.
@@ -3248,6 +3378,7 @@ class ExtractionPipeline:
                         transcript,
                     )
 
+                self._raw_blocked_spans = tuple(blocked_join_spans)
                 if self.options.export_all_sentences:
                     # Manual-review mode stops before target-identity scoring.
                     # It still keeps the singing/overlap filters above and only
@@ -4153,6 +4284,14 @@ class ExtractionPipeline:
                         f"补全 {boundary_expanded} 段，裁切 {boundary_cropped} 段",
                     )
 
+                if self._subtitle_guide is not None and self._subtitle_guide.aligned:
+                    restore_subtitle_sentences(
+                        self, self._subtitle_guide, accepted_turns, rejected,
+                        clean_atomic_spans, blocked_join_spans, verifier, profile,
+                        stem, target_waveform, exclusion_profiles, effective_threshold,
+                        progress=lambda _v, message: progress(0.80, message),
+                    )
+
                 progress(
                     0.80,
                     f"声纹筛选完成：保留 {len(accepted_turns)} 个目标人物回合，"
@@ -4269,6 +4408,9 @@ class ExtractionPipeline:
             progress(1.0, f"完成：保留 {len(accepted)} 句，舍弃 {len(rejected)} 句")
             return PipelineResult(job_id, paths["output"], archive, accepted, rejected, manifest, transcript)
         finally:
+            self._raw_target_waveform = None
+            self._raw_blocked_spans = ()
+            self._subtitle_guide = None
             if singing_detector is not None:
                 singing_detector.close()
             if self.options.cleanup_work:
@@ -4280,6 +4422,7 @@ class ExtractionPipeline:
         targets: Iterable[str | Path],
         negative_references: Iterable[Iterable[str | Path]] | None = None,
         progress: ProgressCallback | None = None,
+        subtitles: dict[str | Path, str | Path] | None = None,
     ) -> BatchPipelineResult:
         """Process target files sequentially and create one batch download."""
         progress = progress or _noop_progress
@@ -4299,6 +4442,7 @@ class ExtractionPipeline:
         missing = [str(path) for path in target_paths if not path.exists()]
         if missing:
             raise FileNotFoundError("待提取音频不存在：" + "，".join(missing))
+        subtitle_paths = validate_subtitle_bindings(target_paths, subtitles)
 
         batch_id = time.strftime("%Y%m%d_%H%M%S") + "_batch_" + uuid.uuid4().hex[:6]
         batch_dir = OUTPUT_ROOT / batch_id
@@ -4325,6 +4469,7 @@ class ExtractionPipeline:
                     progress=report_target,
                     job_id=child_job_id,
                     create_archive=False,
+                    subtitle=subtitle_paths.get(target.resolve()),
                 )
                 if destination.exists():
                     shutil.rmtree(destination)

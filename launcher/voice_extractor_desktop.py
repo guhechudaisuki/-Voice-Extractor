@@ -62,6 +62,7 @@ class VoiceExtractorDesktop:
 
         self.references: list[str] = []
         self.targets: list[str] = []
+        self.subtitles: dict[str, str] = {}
         self.negative_roles: list[list[str]] = []
 
         initial_install_root = suggested_install_root()
@@ -85,6 +86,7 @@ class VoiceExtractorDesktop:
         self.singing_var = tk.BooleanVar(value=True)
         self.all_sentences_var = tk.BooleanVar(value=False)
         self.video_segments_var = tk.BooleanVar(value=False)
+        self.subtitle_status_var = tk.StringVar(value="字幕：未绑定（可选）")
 
         self._configure_style()
         self.container = ttk.Frame(self.root, padding=0)
@@ -300,10 +302,33 @@ class VoiceExtractorDesktop:
 
         body = ttk.Panedwindow(self.main_page, orient="horizontal")
         body.pack(fill="both", expand=True)
-        controls = ttk.Frame(body, style="Card.TFrame", padding=16)
+        controls_panel = ttk.Frame(body, style="Card.TFrame")
+        controls_canvas = tk.Canvas(controls_panel, highlightthickness=0, background="#ffffff")
+        controls_scroll = ttk.Scrollbar(controls_panel, orient="vertical", command=controls_canvas.yview)
+        controls_canvas.configure(yscrollcommand=controls_scroll.set)
+        controls_scroll.pack(side="right", fill="y")
+        controls_canvas.pack(side="left", fill="both", expand=True)
+        controls = ttk.Frame(controls_canvas, style="Card.TFrame", padding=16)
+        controls_window = controls_canvas.create_window((0, 0), window=controls, anchor="nw")
+        controls.bind("<Configure>", lambda _e: controls_canvas.configure(scrollregion=controls_canvas.bbox("all")))
+        controls_canvas.bind("<Configure>", lambda e: controls_canvas.itemconfigure(controls_window, width=e.width))
+        self.controls_canvas = controls_canvas
+
+        def scroll_inputs(event):
+            widget = self.root.winfo_containing(event.x_root, event.y_root)
+            while widget is not None:
+                if isinstance(widget, (tk.Listbox, ttk.Spinbox)):
+                    return
+                if widget is controls_panel:
+                    controls_canvas.yview_scroll(-int(event.delta / 120), "units")
+                    return
+                widget = getattr(widget, "master", None)
+
+        self.root.bind("<MouseWheel>", scroll_inputs, add="+")
         results = ttk.Frame(body, style="Card.TFrame", padding=16)
-        body.add(controls, weight=3)
+        body.add(controls_panel, weight=3)
         body.add(results, weight=4)
+        body.bind("<Configure>", lambda event: body.sashpos(0, max(440, round(event.width * .43))))
 
         self._build_input_controls(controls)
         self._build_results_panel(results)
@@ -320,11 +345,11 @@ class VoiceExtractorDesktop:
         title_row = ttk.Frame(frame, style="Card.TFrame")
         title_row.pack(fill="x", pady=(0, 6))
         ttk.Label(title_row, text=title, style="CardTitle.TLabel").pack(side="left")
-        ttk.Button(title_row, text="添加", command=add_command).pack(side="right")
-        ttk.Button(title_row, text="移除", command=remove_command).pack(
+        ttk.Button(title_row, text="添加", width=4, command=add_command).pack(side="right")
+        ttk.Button(title_row, text="移除", width=4, command=remove_command).pack(
             side="right", padx=5
         )
-        ttk.Button(title_row, text="清空", command=clear_command).pack(side="right")
+        ttk.Button(title_row, text="清空", width=4, command=clear_command).pack(side="right")
         listbox = tk.Listbox(
             frame,
             height=4,
@@ -339,7 +364,6 @@ class VoiceExtractorDesktop:
 
     def _build_input_controls(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
-        parent.rowconfigure(3, weight=1)
         self.reference_list, ref_frame = self._list_card(
             parent,
             "参考音频（可多选）",
@@ -352,10 +376,18 @@ class VoiceExtractorDesktop:
             parent,
             "待提取音频或视频（可多选）",
             self._add_targets,
-            lambda: self._remove_selected(self.target_list, self.targets),
-            lambda: self._clear_paths(self.target_list, self.targets),
+            self._remove_targets,
+            self._clear_targets,
         )
         target_frame.grid(row=1, column=0, sticky="nsew", pady=(0, 12))
+        self.target_list.configure(exportselection=False)
+        self.target_list.bind("<<ListboxSelect>>", lambda _event: self._refresh_subtitle_status())
+        subtitle_row = ttk.Frame(target_frame, style="Card.TFrame")
+        subtitle_row.pack(fill="x", pady=(5, 0))
+        ttk.Button(subtitle_row, text="绑定字幕", command=self._bind_subtitle).pack(side="left")
+        ttk.Button(subtitle_row, text="移除字幕", command=self._remove_subtitles).pack(side="left", padx=5)
+        ttk.Label(target_frame, textvariable=self.subtitle_status_var, width=26,
+                  anchor="w").pack(fill="x", pady=(3, 0))
 
         exclusion = ttk.LabelFrame(parent, text="排除人物（可选）", padding=10)
         exclusion.grid(row=2, column=0, sticky="nsew", pady=(0, 12))
@@ -364,17 +396,17 @@ class VoiceExtractorDesktop:
         exclusion.rowconfigure(1, weight=1)
         role_buttons = ttk.Frame(exclusion, style="Card.TFrame")
         role_buttons.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
-        ttk.Button(role_buttons, text="添加人物", command=self._add_negative_role).pack(
+        ttk.Button(role_buttons, text="添加人物", width=8, command=self._add_negative_role).pack(
             side="left"
         )
         ttk.Button(
-            role_buttons, text="删除人物", command=self._delete_negative_role
+            role_buttons, text="删除人物", width=8, command=self._delete_negative_role
         ).pack(side="left", padx=6)
         ttk.Button(
-            role_buttons, text="添加该人物音频", command=self._add_negative_files
+            role_buttons, text="添加音频", width=8, command=self._add_negative_files
         ).pack(side="left")
         ttk.Button(
-            role_buttons, text="移除选中音频", command=self._remove_negative_files
+            role_buttons, text="移除音频", width=8, command=self._remove_negative_files
         ).pack(side="left", padx=6)
         self.role_list = tk.Listbox(
             exclusion,
@@ -503,14 +535,6 @@ class VoiceExtractorDesktop:
             status_box, text="中止任务", command=self._cancel_job, state="disabled"
         )
         self.cancel_button.grid(row=2, column=1, sticky="w", padx=8)
-        self.open_batch_button = ttk.Button(
-            status_box, text="打开本次结果", command=self._open_batch, state="disabled"
-        )
-        self.open_batch_button.grid(row=2, column=2, sticky="e", padx=8)
-        self.open_zip_button = ttk.Button(
-            status_box, text="查看 ZIP", command=self._open_archive, state="disabled"
-        )
-        self.open_zip_button.grid(row=2, column=3, sticky="e")
 
         ttk.Label(parent, text="运行日志", style="CardTitle.TLabel").grid(
             row=3, column=0, sticky="w", pady=(14, 6)
@@ -879,6 +903,57 @@ class VoiceExtractorDesktop:
 
     def _add_targets(self) -> None:
         self._add_paths(self.targets, self.target_list, MEDIA_TYPES)
+        self._refresh_target_list()
+
+    def _refresh_target_list(self) -> None:
+        selection = self.target_list.curselection()
+        self.target_list.delete(0, "end")
+        for path in self.targets:
+            marker = "[字幕] " if path in self.subtitles else ""
+            self.target_list.insert("end", marker + Path(path).name)
+        for index in selection:
+            if index < len(self.targets):
+                self.target_list.selection_set(index)
+        self._refresh_subtitle_status()
+
+    def _refresh_subtitle_status(self) -> None:
+        selection = self.target_list.curselection()
+        if len(selection) != 1:
+            self.subtitle_status_var.set(f"字幕：已绑定 {len(self.subtitles)}/{len(self.targets)} 个文件")
+            return
+        path = self.subtitles.get(self.targets[selection[0]])
+        name = Path(path).name if path else "未绑定（可选）"
+        self.subtitle_status_var.set("字幕：" + (name if len(name) <= 24 else name[:10] + "..." + name[-11:]))
+
+    def _bind_subtitle(self) -> None:
+        selection = self.target_list.curselection()
+        if len(selection) != 1:
+            messagebox.showinfo("选择目标文件", "请先选中一个待提取文件，再绑定对应字幕。")
+            return
+        target = self.targets[selection[0]]
+        selected = filedialog.askopenfilename(
+            title=f"绑定字幕：{Path(target).name}",
+            initialfile=Path(self.subtitles[target]).name if target in self.subtitles else "",
+            filetypes=(("字幕文件", "*.ass *.ssa *.srt *.vtt"),),
+        )
+        if selected:
+            self.subtitles[target] = str(Path(selected).resolve())
+            self._refresh_target_list()
+
+    def _remove_subtitles(self) -> None:
+        for index in self.target_list.curselection():
+            self.subtitles.pop(self.targets[index], None)
+        self._refresh_target_list()
+
+    def _remove_targets(self) -> None:
+        self._remove_subtitles()
+        self._remove_selected(self.target_list, self.targets)
+        self._refresh_subtitle_status()
+
+    def _clear_targets(self) -> None:
+        self.subtitles.clear()
+        self._clear_paths(self.target_list, self.targets)
+        self._refresh_subtitle_status()
 
     @staticmethod
     def _remove_selected(listbox: tk.Listbox, values: list[str]) -> None:
@@ -982,6 +1057,7 @@ class VoiceExtractorDesktop:
         return {
             "references": list(self.references),
             "targets": list(self.targets),
+            "subtitles": dict(self.subtitles),
             "negative_groups": [list(group) for group in self.negative_roles if group],
             "output_root": str(output_root),
             "options": {
@@ -1039,8 +1115,6 @@ class VoiceExtractorDesktop:
         self.running_job = True
         self.run_button.configure(state="disabled")
         self.cancel_button.configure(state="normal")
-        self.open_batch_button.configure(state="disabled")
-        self.open_zip_button.configure(state="disabled")
         self.job_progress.configure(value=0)
         self.main_status_var.set("任务已启动")
         self._append_job_log("开始处理……")
@@ -1109,8 +1183,6 @@ class VoiceExtractorDesktop:
             rejected = int(event.get("rejected_count", 0))
             self.job_progress.configure(value=100)
             self.main_status_var.set(f"完成：保留 {accepted} 句，舍弃 {rejected} 句")
-            self.open_batch_button.configure(state="normal")
-            self.open_zip_button.configure(state="normal")
             self._append_job_log(f"批次完成：{event.get('output_dir', '')}")
         elif event_type == "error":
             message = str(event.get("message", "未知错误"))
@@ -1146,12 +1218,6 @@ class VoiceExtractorDesktop:
     def _open_output_root(self) -> None:
         value = self.output_root_var.get().strip()
         self._open_path(value or self._default_output_root())
-
-    def _open_batch(self) -> None:
-        self._open_path(self.last_result.get("output_dir"))
-
-    def _open_archive(self) -> None:
-        self._open_path(self.last_result.get("archive_path"), select=True)
 
     def _open_selected_result(self, _event=None) -> None:
         selected = self.result_tree.selection()

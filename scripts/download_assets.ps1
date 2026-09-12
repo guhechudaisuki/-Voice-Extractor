@@ -6,6 +6,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $toolRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $gptRoot = Join-Path $WorkspaceRoot 'GPT-SoVITS-v2pro-20250604'
+$modelRoot = Join-Path $toolRoot 'model'
 
 function Fetch-File {
     param(
@@ -51,17 +52,17 @@ if (-not (Test-Path -LiteralPath $gptRoot)) {
 }
 
 Fetch-File 'https://huggingface.co/lj1995/VoiceConversionWebUI/resolve/main/uvr5_weights/HP2_all_vocals.pth?download=true' (Join-Path $gptRoot 'tools\uvr5\uvr5_weights\HP2_all_vocals.pth')
-Fetch-File 'https://huggingface.co/lj1995/GPT-SoVITS/resolve/main/sv/pretrained_eres2netv2w24s4ep4.ckpt?download=true' (Join-Path $gptRoot 'GPT_SoVITS\pretrained_models\sv\pretrained_eres2netv2w24s4ep4.ckpt')
-Fetch-File 'https://modelscope.cn/models/iic/speech_campplus_sv_zh-cn_16k-common/resolve/master/campplus_cn_common.bin' (Join-Path $toolRoot 'models\campplus_voxceleb\campplus_voxceleb.bin')
-Fetch-File 'https://huggingface.co/microsoft/wavlm-base-plus-sv/resolve/feb593a6c23c1cc3d9510425c29b0a14d2b07b1e/config.json?download=true' (Join-Path $toolRoot 'models\wavlm-base-plus-sv\config.json')
-Fetch-File 'https://huggingface.co/microsoft/wavlm-base-plus-sv/resolve/feb593a6c23c1cc3d9510425c29b0a14d2b07b1e/preprocessor_config.json?download=true' (Join-Path $toolRoot 'models\wavlm-base-plus-sv\preprocessor_config.json')
-Fetch-File 'https://huggingface.co/microsoft/wavlm-base-plus-sv/resolve/feb593a6c23c1cc3d9510425c29b0a14d2b07b1e/pytorch_model.bin?download=true' (Join-Path $toolRoot 'models\wavlm-base-plus-sv\pytorch_model.bin')
-Fetch-File 'https://huggingface.co/onnx-community/wespeaker-voxceleb-resnet34-LM/resolve/6a61a1833ff2583aabeba044f5c8221f00b67ceb/onnx/model.onnx?download=true' (Join-Path $toolRoot 'models\wespeaker-resnet34-lm\onnx\model.onnx') '3955447B0499DC9E0A4541A895DF08B03C69098EBA4E56C02B5603E9F7F4FCBB'
+Fetch-File 'https://huggingface.co/lj1995/GPT-SoVITS/resolve/main/sv/pretrained_eres2netv2w24s4ep4.ckpt?download=true' (Join-Path $modelRoot 'speaker\eres2net\pretrained_eres2netv2w24s4ep4.ckpt')
+Fetch-File 'https://modelscope.cn/models/iic/speech_campplus_sv_zh-cn_16k-common/resolve/master/campplus_cn_common.bin' (Join-Path $modelRoot 'speaker\campplus_voxceleb\campplus_voxceleb.bin')
+Fetch-File 'https://huggingface.co/microsoft/wavlm-base-plus-sv/resolve/feb593a6c23c1cc3d9510425c29b0a14d2b07b1e/config.json?download=true' (Join-Path $modelRoot 'speaker\wavlm-base-plus-sv\config.json')
+Fetch-File 'https://huggingface.co/microsoft/wavlm-base-plus-sv/resolve/feb593a6c23c1cc3d9510425c29b0a14d2b07b1e/preprocessor_config.json?download=true' (Join-Path $modelRoot 'speaker\wavlm-base-plus-sv\preprocessor_config.json')
+Fetch-File 'https://huggingface.co/microsoft/wavlm-base-plus-sv/resolve/feb593a6c23c1cc3d9510425c29b0a14d2b07b1e/pytorch_model.bin?download=true' (Join-Path $modelRoot 'speaker\wavlm-base-plus-sv\pytorch_model.bin')
+Fetch-File 'https://huggingface.co/onnx-community/wespeaker-voxceleb-resnet34-LM/resolve/6a61a1833ff2583aabeba044f5c8221f00b67ceb/onnx/model.onnx?download=true' (Join-Path $modelRoot 'speaker\wespeaker-resnet34-lm\onnx\model.onnx') '3955447B0499DC9E0A4541A895DF08B03C69098EBA4E56C02B5603E9F7F4FCBB'
 Fetch-File 'https://huggingface.co/csukuangfj/sherpa-onnx-pyannote-segmentation-3-0/resolve/main/model.onnx?download=true' (Join-Path $toolRoot 'models\overlap\model.onnx') '220AD67CA923BEF2FA91F2390C786097BF305BCEB5E261D4AF67B38E938E1079'
 Fetch-File 'https://zenodo.org/records/3987831/files/Cnn10_mAP%3D0.380.pth?download=1' (Join-Path $toolRoot 'models\panns\Cnn10_mAP=0.380.pth')
 Fetch-File 'https://storage.googleapis.com/us_audioset/youtube_corpus/v1/csv/class_labels_indices.csv' (Join-Path $toolRoot 'models\panns\class_labels_indices.csv')
 
-$whisperCache = Join-Path $WorkspaceRoot 'omnvoice\hf_cache'
+$whisperCache = Join-Path $modelRoot 'stt\whisper\hf_cache'
 $whisperSnapshots = Join-Path $whisperCache 'models--openai--whisper-large-v3-turbo\snapshots'
 $whisperReady = (Test-Path -LiteralPath $whisperSnapshots -PathType Container) -and
     (@(Get-ChildItem -LiteralPath $whisperSnapshots -Directory -ErrorAction SilentlyContinue).Count -gt 0)
@@ -82,7 +83,7 @@ if ($whisperReady) {
     }
 }
 
-$asrRoot = Join-Path $gptRoot 'tools\asr\models'
+$asrRoot = Join-Path $modelRoot 'stt'
 $funAsr = @(
     @('iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch', 'speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch'),
     @('iic/speech_fsmn_vad_zh-cn-16k-common-pytorch', 'speech_fsmn_vad_zh-cn-16k-common-pytorch'),

@@ -112,7 +112,7 @@ COMPONENTS = (
     ComponentSpec(
         "sv_model",
         "ERes2NetV2 声纹模型",
-        "models/eres2net",
+        "model/speaker/eres2net",
         "direct",
         55,
         (
@@ -126,7 +126,7 @@ COMPONENTS = (
     ComponentSpec(
         "camplus_model",
         "CAM++ 声纹模型",
-        "models/campplus_voxceleb",
+        "model/speaker/campplus_voxceleb",
         "direct",
         28,
         (
@@ -140,7 +140,7 @@ COMPONENTS = (
     ComponentSpec(
         "wavlm_model",
         "WavLM 声纹模型",
-        "models/wavlm-base-plus-sv",
+        "model/speaker/wavlm-base-plus-sv",
         "direct",
         386,
         (
@@ -162,7 +162,7 @@ COMPONENTS = (
     ComponentSpec(
         "wespeaker_model",
         "WeSpeaker 声纹复核模型",
-        "models/wespeaker-resnet34-lm/onnx",
+        "model/speaker/wespeaker-resnet34-lm/onnx",
         "direct",
         26,
         (
@@ -210,7 +210,7 @@ COMPONENTS = (
     ComponentSpec(
         "paraformer_model",
         "Paraformer 中文识别模型",
-        "models/asr/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
+        "model/stt/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
         "modelscope",
         950,
         model_id="iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
@@ -219,7 +219,7 @@ COMPONENTS = (
     ComponentSpec(
         "vad_model",
         "FSMN 语音活动检测模型",
-        "models/asr/speech_fsmn_vad_zh-cn-16k-common-pytorch",
+        "model/stt/speech_fsmn_vad_zh-cn-16k-common-pytorch",
         "modelscope",
         6,
         model_id="iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
@@ -228,7 +228,7 @@ COMPONENTS = (
     ComponentSpec(
         "punc_model",
         "CT-Punc 标点模型",
-        "models/asr/punc_ct-transformer_zh-cn-common-vocab272727-pytorch",
+        "model/stt/punc_ct-transformer_zh-cn-common-vocab272727-pytorch",
         "modelscope",
         280,
         model_id="iic/punc_ct-transformer_zh-cn-common-vocab272727-pytorch",
@@ -237,7 +237,7 @@ COMPONENTS = (
     ComponentSpec(
         "whisper_cache",
         "Whisper large-v3-turbo",
-        "models/whisper/hf_cache",
+        "model/stt/whisper/hf_cache",
         "whisper",
         1550,
         model_id="openai/whisper-large-v3-turbo",
@@ -248,6 +248,10 @@ COMPONENTS = (
 @dataclass
 class InstallLayout:
     root: Path
+
+    @property
+    def model(self) -> Path:
+        return self.root / "model"
 
     @property
     def models(self) -> Path:
@@ -284,6 +288,7 @@ class InstallLayout:
     def prepare(self) -> None:
         for path in (
             self.root,
+            self.model,
             self.models,
             self.output,
             self.work,
@@ -321,9 +326,10 @@ class BootstrapContext:
         env["PYTHONPATH"] = os.pathsep.join(python_paths)
         env["PYTHONUNBUFFERED"] = "1"
         env["HF_HUB_OFFLINE"] = "1"
-        env["MODELSCOPE_CACHE"] = str(self.layout.models / "modelscope_cache")
+        env["MODELSCOPE_CACHE"] = str(self.layout.model / "modelscope_cache")
         env["VOICE_EXTRACT_DATA_ROOT"] = str(self.layout.root)
         env["VOICE_EXTRACT_ASSET_ROOT"] = str(self.layout.root)
+        env["VOICE_EXTRACT_MODEL_ROOT"] = str(self.layout.model)
         env["VOICE_EXTRACT_WORK_ROOT"] = str(self.layout.work)
         env["VOICE_EXTRACT_OUTPUT_ROOT"] = str(output_root or self.layout.output)
         env["VOICE_EXTRACT_FFMPEG"] = str(self.ffmpeg)
@@ -440,7 +446,9 @@ def suggested_install_root() -> Path:
         return Path(str(stored)).expanduser().resolve()
     executable = current_executable()
     for candidate in (executable.parent, executable.parent.parent, Path.cwd()):
-        if (candidate / "models").is_dir() and (candidate / "output").exists():
+        if (
+            (candidate / "models").is_dir() or (candidate / "model").is_dir()
+        ) and (candidate / "output").exists():
             return candidate.resolve()
     return (
         Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
@@ -1041,9 +1049,9 @@ def _legacy_component_paths(
             "whisper_cache": gpt_root.parent / "omnvoice" / "hf_cache",
         }
         if spec.key in legacy:
-            candidates.insert(0, legacy[spec.key])
+            candidates.append(legacy[spec.key])
         sibling_tool = gpt_root.parent / "提取" / spec.relative_path
-        candidates.insert(0, sibling_tool)
+        candidates.append(sibling_tool)
     unique: list[Path] = []
     for candidate in candidates:
         try:
@@ -1241,7 +1249,7 @@ def _download_modelscope(
         "import sys; snapshot_download(sys.argv[1], local_dir=sys.argv[2])"
     )
     env = _python_probe_environment([layout.packages, source_root / "vendor"])
-    env["MODELSCOPE_CACHE"] = str(layout.models / "modelscope_cache")
+    env["MODELSCOPE_CACHE"] = str(layout.model / "modelscope_cache")
     _stream_process(
         [str(python), "-c", code, spec.model_id, str(destination)],
         env,
