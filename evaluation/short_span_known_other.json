@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "purpose": "Episode-1 development-only short other-speaker spans; not complete truth",
+  "cases": [
+    {
+      "id": "other_tail_after_introduction",
+      "span": [312.3, 312.9],
+      "evidence": "User reviewed the 21-clip candidate and reported another person after the target sentence. Boundary location is an acoustic probe, not a final hand-labelled endpoint."
+    },
+    {
+      "id": "known_change_after_target_340",
+      "span": [340.8825, 342.2625],
+      "evidence": "evaluation/join_cases.json and episode-1 stage audit"
+    }
+  ]
+}

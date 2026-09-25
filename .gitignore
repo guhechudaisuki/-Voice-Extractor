@@ -19,6 +19,9 @@ models/
 model/
 work/
 output/
+training/data/
+training/cache/
+training/checkpoints/
 runtime/
 logs/
 tools/
@@ -56,6 +59,7 @@ build/
 dist/*
 !dist/VoiceExtractor.exe
 versions/
+/提取_目标优化前_734bd07/
 launcher/bin/
 launcher/obj/
 /vendor/bin/

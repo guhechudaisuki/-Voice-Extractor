@@ -397,6 +397,81 @@ class DualChannelCompositionTests(unittest.TestCase):
             "channel_duration_mismatch",
         )
 
+    def test_local_tertiary_confirmation_preserves_raw_exclusion_evidence(self) -> None:
+        match = _match(
+            accepted=False, tier="recall", primary_score=.55,
+            secondary_score=.65, primary_max=.60, secondary_max=.65,
+            paired=.60,
+        )
+        match.raw_primary = _decision(score=.35)
+        match.raw_secondary = _decision(score=.30)
+        match.raw_tier = "rejected"
+        verifier = DualSpeakerVerifier.__new__(DualSpeakerVerifier)
+        verifier._ensure_tertiary = Mock(return_value=SimpleNamespace(acceptance_floor=.80))
+        verifier.tertiary = Mock()
+        verifier.tertiary.verify_waveform.return_value = _decision(score=.90)
+        for method in (verifier.promote_local_with_tertiary, verifier.promote_with_tertiary):
+            with self.subTest(method=method.__name__):
+                promoted = method(torch.zeros(48000), object(), match, 3.0)
+                self.assertTrue(promoted.accepted)
+                self.assertIs(promoted.raw_primary, match.raw_primary)
+                self.assertIs(promoted.raw_secondary, match.raw_secondary)
+                self.assertEqual(promoted.raw_tier, "rejected")
+                self.assertFalse(match.accepted)
+
+    def test_contrastive_tertiary_confirmation_preserves_raw_evidence(self) -> None:
+        core = _match(
+            accepted=False, tier="recall", primary_score=.65,
+            secondary_score=.70, primary_max=.65, secondary_max=.70,
+            paired=.62,
+        )
+        residual = _match(
+            accepted=False, tier="rejected", primary_score=.20,
+            secondary_score=.20, primary_max=.20, secondary_max=.20,
+            paired=.20,
+        )
+        core.raw_primary = _decision(score=.60)
+        core.raw_secondary = _decision(score=.58)
+        core.raw_tier = "recall"
+        verifier = DualSpeakerVerifier.__new__(DualSpeakerVerifier)
+        verifier._ensure_tertiary = Mock(return_value=SimpleNamespace(acceptance_floor=.80))
+        verifier.tertiary = Mock()
+        verifier.tertiary.verify_waveform.side_effect = [_decision(score=.90), _decision(score=.20)]
+        promoted = verifier.promote_contrastive_edge_with_tertiary(
+            torch.zeros(48000), torch.zeros(9600), object(), core, residual, 3.0, .60,
+        )
+        self.assertTrue(promoted.accepted)
+        self.assertIs(promoted.raw_primary, core.raw_primary)
+        self.assertIs(promoted.raw_secondary, core.raw_secondary)
+        self.assertEqual(promoted.raw_tier, "recall")
+
+
+class SttBoundaryPolicyTests(unittest.TestCase):
+    def test_whisper_fragment_count_alone_never_vetoes_identity(self) -> None:
+        candidate = SimpleNamespace(diagnostics={})
+        self.assertIsNone(
+            ExtractionPipeline._stt_fragment_identity_veto(candidate, 3)
+        )
+
+    def test_acoustic_mixed_turn_veto_survives_stt(self) -> None:
+        for key in (
+            "multi_model_anchor_excluded",
+            "multi_model_anchor_decisive_boundary",
+            "final_same_speaker_internal_discard",
+            "final_identity_boundary_discard",
+        ):
+            with self.subTest(key=key):
+                candidate = SimpleNamespace(diagnostics={key: True})
+                self.assertIsNotNone(
+                    ExtractionPipeline._stt_fragment_identity_veto(candidate, 2)
+                )
+
+    def test_single_whisper_fragment_has_no_identity_veto(self) -> None:
+        candidate = SimpleNamespace(diagnostics={"multi_model_anchor_excluded": True})
+        self.assertIsNone(
+            ExtractionPipeline._stt_fragment_identity_veto(candidate, 1)
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

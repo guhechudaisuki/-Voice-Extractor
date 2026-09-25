@@ -158,6 +158,7 @@ class SubtitleCompletionTests(unittest.TestCase):
         self.verifier = Mock()
         self.verifier.SHORT_MIN_DURATION = .55
         self.verifier.exclusion_audit.return_value = None
+        self.verifier.promote_local_with_tertiary.return_value = None
         self.verifier._tertiary_pair.return_value = (SimpleNamespace(_embeddings_from_waveforms=lambda _p: torch.tensor([[1., 0.], [1., 0.]])), object())
         self.pipeline = Mock()
         self.pipeline.options = PipelineOptions()
@@ -180,10 +181,54 @@ class SubtitleCompletionTests(unittest.TestCase):
         self.assertEqual((self.accepted[0].start, self.accepted[0].end), (1, 3.5))
         self.assertTrue(self.accepted[0].diagnostics["subtitle_completion"])
 
+    def test_subtitle_can_recover_without_core_only_with_tertiary_confirmation(self):
+        self.accepted.clear()
+        self.pipeline._verify_speaker_span.side_effect = (
+            lambda _v, _w, _span, _p, _t: SimpleNamespace(accepted=False)
+        )
+        self.verifier.promote_local_with_tertiary.side_effect = (
+            lambda _waveform, _profile, _match, duration:
+            SimpleNamespace(accepted=True, secondary=object(), primary=object(), tier="tertiary")
+            if duration >= .75 else None
+        )
+        self.assertEqual(self.restore(), 1)
+        self.assertEqual((self.accepted[0].start, self.accepted[0].end), (1, 4))
+        self.assertTrue(self.accepted[0].diagnostics["subtitle_only_completion"])
+        self.assertEqual(self.guide.report["completion_identity_checks"], {
+            "verified_spans": 3, "tertiary_attempts": 3,
+            "tertiary_confirmed_spans": 3, "tertiary_exclusion_vetoes": 0,
+        })
+
     def test_neighbor_cannot_borrow_core_identity(self):
         self.pipeline._verify_speaker_span.side_effect = lambda _v, _w, span, _p, _t: SimpleNamespace(accepted=span.start < 2.7)
         self.assertEqual(self.restore(), 0)
         self.assertIs(self.accepted[0], self.core)
+
+    def test_no_core_still_requires_independent_identity(self):
+        self.accepted.clear()
+        self.pipeline._verify_speaker_span.return_value = SimpleNamespace(accepted=False)
+        self.assertEqual(self.restore(), 0)
+        self.assertEqual(self.accepted, [])
+
+    def test_tertiary_recovery_does_not_bypass_stricter_exclusion(self):
+        self.pipeline._verify_speaker_span.return_value = SimpleNamespace(accepted=False)
+        self.verifier.promote_local_with_tertiary.return_value = SimpleNamespace(accepted=True)
+        self.verifier.exclusion_audit.side_effect = (
+            lambda *_args, tertiary_recovery=False: {
+                "excluded_role_rejected": tertiary_recovery,
+            }
+        )
+        self.assertEqual(self.restore(), 0)
+        self.assertIs(self.accepted[0], self.core)
+        self.assertEqual(self.guide.report["completion_identity_checks"]["tertiary_exclusion_vetoes"], 1)
+
+    def test_individually_verified_parts_still_require_speaker_continuity(self):
+        self.accepted.clear()
+        self.pipeline._merge_short_silence_same_speaker.return_value = self.parts
+        self.assertEqual(self.restore(), 0)
+        self.assertEqual(self.accepted, [])
+        self.assertEqual(self.guide.report["completion_proposals"][0]["result"],
+                         "speaker_continuity_rejected")
 
     def test_overlap_singing_and_known_rejection_are_not_crossed(self):
         self.assertEqual(self.restore([TimeSpan(2.55, 2.65)]), 0)
@@ -195,6 +240,7 @@ class SubtitleCompletionTests(unittest.TestCase):
         self.verifier.exclusion_audit.return_value = {"excluded_role_rejected": True}
         self.assertEqual(self.restore(), 0)
         self.assertIs(self.accepted[0], self.core)
+        self.verifier.promote_local_with_tertiary.assert_not_called()
 
     def test_internal_speaker_switch_veto(self):
         self.splitter.detect_multiscale_speaker_boundaries.return_value = [SimpleNamespace(time=3)]

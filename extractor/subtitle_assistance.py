@@ -126,8 +126,13 @@ def restore_subtitle_sentences(
     audit = []
     guide.report["completion_proposals"] = audit
     guide.report["completed_sentences"] = 0
-    if not accepted:
-        return 0
+    identity_stats = {
+        "verified_spans": 0,
+        "tertiary_attempts": 0,
+        "tertiary_confirmed_spans": 0,
+        "tertiary_exclusion_vetoes": 0,
+    }
+    guide.report["completion_identity_checks"] = identity_stats
     forbidden = [*blocked, *[
         TimeSpan(c.start, c.end) for c in rejected
         if any(c.diagnostics.get(key) for key in (
@@ -140,7 +145,7 @@ def restore_subtitle_sentences(
     for index, (cue, parts) in enumerate(proposals):
         span = TimeSpan(parts[0].start, parts[-1].end)
         cores = [c for c in accepted if _intersection(span, TimeSpan(c.start, c.end)) > .02]
-        if not cores or any(c.start < span.start - .001 or c.end > span.end + .001 for c in cores):
+        if any(c.start < span.start - .001 or c.end > span.end + .001 for c in cores):
             continue
         if len(cores) == 1 and abs(cores[0].start - span.start) < .001 and abs(cores[0].end - span.end) < .001:
             continue
@@ -155,8 +160,13 @@ def restore_subtitle_sentences(
             continue
         core_spans = [TimeSpan(c.start, c.end) for c in cores]
         additions = [extra for part in parts for extra in _uncovered(part, core_spans)]
+        identity_parts = [*parts, *additions]
+        if not cores:
+            # No accepted core is allowed only through independent local
+            # confirmation.  The subtitle supplies timing, never identity.
+            identity_parts = list(parts)
         # Do not pad a too-short addition with target speech to make it pass.
-        if any(extra.duration < verifier.SHORT_MIN_DURATION for extra in additions):
+        if any(part.duration < verifier.SHORT_MIN_DURATION for part in identity_parts):
             record["result"] = "unverifiable_short_edge"
             continue
 
@@ -165,13 +175,40 @@ def restore_subtitle_sentences(
         def verify(part):
             key = (part.start, part.end)
             if key not in checked:
+                identity_stats["verified_spans"] += 1
                 match = pipeline._verify_speaker_span(verifier, waveform, part, profile, threshold)
                 exclusion = verifier.exclusion_audit(match, profile, exclusion_profiles)
+                if (
+                    not match.accepted
+                    and not (exclusion and exclusion.get("excluded_role_rejected"))
+                ):
+                    identity_stats["tertiary_attempts"] += 1
+                    rescued = verifier.promote_local_with_tertiary(
+                        pipeline._waveform_span(waveform, part),
+                        profile,
+                        match,
+                        part.duration,
+                    )
+                    if rescued is not None:
+                        identity_stats["tertiary_confirmed_spans"] += 1
+                        record.setdefault("tertiary_confirmed_spans", []).append(list(key))
+                        match = rescued
+                        exclusion = verifier.exclusion_audit(
+                            match,
+                            profile,
+                            exclusion_profiles,
+                            tertiary_recovery=True,
+                        )
+                        if exclusion and exclusion.get("excluded_role_rejected"):
+                            identity_stats["tertiary_exclusion_vetoes"] += 1
                 checked[key] = (match, exclusion)
-            match, exclusion = checked[key]
+            return checked[key]
+
+        def independently_accepted(part):
+            match, exclusion = verify(part)
             return match.accepted and not (exclusion and exclusion.get("excluded_role_rejected"))
 
-        if not all(verify(part) for part in [*parts, *additions]):
+        if not all(independently_accepted(part) for part in identity_parts):
             record["result"] = "independent_identity_rejected"
             continue
         if len(parts) > 1:
@@ -183,18 +220,27 @@ def restore_subtitle_sentences(
             if len(merged) != 1:
                 record["result"] = "speaker_continuity_rejected"
                 continue
-        if additions:
+        continuity_spans = core_spans or parts
+        continuity_anchor = max(continuity_spans, key=lambda p: p.duration)
+        continuity_parts = additions if core_spans else [
+            part for part in parts if part != continuity_anchor
+        ]
+        if continuity_parts:
             tertiary, tertiary_profile = verifier._tertiary_pair(profile)
-            anchor = max(core_spans, key=lambda p: p.duration)
             embeddings = tertiary._embeddings_from_waveforms([
-                pipeline._waveform_span(waveform, part) for part in [anchor, *additions]
+                pipeline._waveform_span(waveform, part)
+                for part in [continuity_anchor, *continuity_parts]
             ])
             floor = pipeline._wavlm_same_speaker_floor(tertiary_profile)
             if any(float(embeddings[0] @ embedding) < floor for embedding in embeddings[1:]):
                 record["result"] = "edge_continuity_rejected"
                 continue
-        if not verify(span):
+        whole_match, whole_exclusion = verify(span)
+        if not whole_match.accepted:
             record["result"] = "whole_sentence_rejected"
+            continue
+        if whole_exclusion and whole_exclusion.get("excluded_role_rejected"):
+            record["result"] = "whole_sentence_excluded"
             continue
         if splitter is None:
             verifier._ensure_secondary(profile)
@@ -207,7 +253,11 @@ def restore_subtitle_sentences(
             continue
 
         replacement = CandidateSentence(span.start, span.end, "")
-        replacement.diagnostics.update(deepcopy(max(cores, key=lambda c: c.duration).diagnostics))
+        if cores:
+            replacement.diagnostics.update(
+                deepcopy(max(cores, key=lambda c: c.duration).diagnostics)
+            )
+        replacement.diagnostics["subtitle_only_completion"] = not cores
         match, exclusion = checked[(span.start, span.end)]
         pipeline._apply_speaker_match(replacement, match, profile, threshold)
         if exclusion:

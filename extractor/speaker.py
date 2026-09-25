@@ -1562,6 +1562,12 @@ class DualSpeakerVerifier:
             merge_only=False,
             paired_reference_median=match.paired_reference_median,
             diagnostics=diagnostics,
+            # Keep original-channel evidence attached to a promoted
+            # decision.  Exclusion-role audits run after promotion and must
+            # see the same raw evidence that was available before recovery.
+            raw_primary=match.raw_primary,
+            raw_secondary=match.raw_secondary,
+            raw_tier=match.raw_tier,
         )
 
     def promote_local_with_tertiary(
@@ -1628,6 +1634,9 @@ class DualSpeakerVerifier:
             merge_only=False,
             paired_reference_median=match.paired_reference_median,
             diagnostics=diagnostics,
+            raw_primary=match.raw_primary,
+            raw_secondary=match.raw_secondary,
+            raw_tier=match.raw_tier,
         )
 
     def promote_contrastive_edge_with_tertiary(
@@ -1743,6 +1752,9 @@ class DualSpeakerVerifier:
             merge_only=False,
             paired_reference_median=promoted.paired_reference_median,
             diagnostics=diagnostics,
+            raw_primary=promoted.raw_primary,
+            raw_secondary=promoted.raw_secondary,
+            raw_tier=promoted.raw_tier,
         )
 
     def verify(
