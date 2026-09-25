@@ -604,27 +604,29 @@ class ExtractionPipeline:
         candidate: CandidateSentence,
         fragment_count: int,
     ) -> str | None:
-        """Use only the acoustic stage to veto a mixed-speaker turn.
+        """Do not relax legacy export unless local identity was verified.
 
-        Whisper may split one speaker's complete sentence at a pause. Its
-        fragment count is transcription evidence, not speaker identity. A
-        fragment count can still accompany a turn that the acoustic stage has
-        already marked as internally mixed; that earlier verdict remains the
-        authority here.
+        No veto is not positive evidence of a pure speaker. The legacy
+        multi-fragment hold remains for unresolved turns until acoustic
+        certification is available. It is not a claim that Whisper detected
+        another speaker. A certificate belongs to one exact audio interval.
         """
-
-        if fragment_count < 2:
-            return None
         diagnostics = candidate.diagnostics
-        if diagnostics.get("multi_model_anchor_excluded"):
-            return "pre_stt_internal_speaker_change"
         if diagnostics.get("multi_model_anchor_decisive_boundary"):
             return "pre_stt_decisive_speaker_boundary"
-        if diagnostics.get("final_same_speaker_internal_discard"):
-            return "pre_stt_internal_speaker_change"
-        if diagnostics.get("final_identity_boundary_discard"):
-            return "pre_stt_internal_speaker_change"
-        return None
+        if any(diagnostics.get(key) for key in (
+            "structural_hard_reject", "excluded_role_rejected",
+            "final_same_speaker_internal_discard", "final_identity_boundary_discard",
+        )):
+            return "pre_stt_acoustic_veto"
+        # Exclusion as a recovery prototype is NOT evidence of another person.
+        audit = diagnostics.get("local_identity_audit", {})
+        if (isinstance(audit, dict) and audit.get("passed") is True
+                and audit.get("span") == [candidate.start, candidate.end]):
+            return None
+        if fragment_count < 2 or diagnostics.get("post_target_silence_merge"):
+            return None
+        return "local_identity_unverified"
 
     @staticmethod
     def _wavlm_same_speaker_floor(profile) -> float:
@@ -4407,7 +4409,11 @@ class ExtractionPipeline:
                         fragment_count,
                     )
                     if stt_identity_veto is not None:
-                        turn.reject_reason = "身份阶段已确认内部换人"
+                        turn.reject_reason = (
+                            "局部身份尚未确认，暂不解除多片段导出保护"
+                            if stt_identity_veto == "local_identity_unverified"
+                            else "声学身份复核未通过"
+                        )
                         turn.diagnostics["stt_fragment_count"] = fragment_count
                         turn.diagnostics["stt_identity_veto"] = stt_identity_veto
                         rejected.append(turn)

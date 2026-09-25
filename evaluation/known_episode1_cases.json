@@ -3,6 +3,15 @@
   "purpose": "Narrow episode-1 regression checks, not a complete ground-truth transcript",
   "cases": [
     {
+      "id": "reviewed_mixed_prefix_525",
+      "kind": "must_not_cover_reviewed_mixed_clip",
+      "span": [525.31, 528.61],
+      "evidence": ["User listened to 20260925_104500_stt_policy_candidate and confirmed only the last text fragment is target speech."],
+      "non_target_text": ["え?", "UFO?"],
+      "target_text": "UFOじゃなくてUFO",
+      "note": "Whole clip is human-confirmed mixed. 526.81 is only an acoustic probe boundary, not a human-labelled exact transition. Text and times here are evaluation data, never production identity rules."
+    },
+    {
       "id": "introduction_short_target_tail",
       "kind": "must_cover_target_tail",
       "target_core": [337.87, 340.17],

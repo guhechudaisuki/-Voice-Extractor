@@ -268,6 +268,14 @@ def restore_subtitle_sentences(
             subtitle_added_spans=[[p.start, p.end] for p in additions],
             post_target_silence_merge=len(parts) > 1,
         )
+        # Issued only after each added part, the whole span, exclusions,
+        # continuity and internal change checks have succeeded above. A later
+        # boundary change must not inherit this certificate for new audio.
+        replacement.diagnostics["local_identity_audit"] = {
+            "span": [span.start, span.end], "passed": True,
+            "method": "subtitle_acoustic_completion",
+            "verified_spans": [list(key) for key in checked],
+        }
         core_ids = {id(c) for c in cores}
         accepted[:] = [c for c in accepted if id(c) not in core_ids]
         accepted.append(replacement)

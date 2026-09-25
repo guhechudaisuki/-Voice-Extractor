@@ -28,7 +28,15 @@ def assess(manifest: dict, cases: dict) -> list[dict]:
     results = []
     for case in cases["cases"]:
         kind = case["kind"]
-        if kind == "must_cover_target_tail":
+        if kind == "must_not_cover_reviewed_mixed_clip":
+            mixed_start, mixed_end = case["span"]
+            containing = [
+                (start, end) for start, end in spans
+                if start <= mixed_start + 0.02 and end >= mixed_end - 0.02
+            ]
+            passed = not containing
+            evidence = {"containing_mixed_clip": containing, "reviewed_span": case["span"]}
+        elif kind == "must_cover_target_tail":
             core_start, core_end = case["target_core"]
             tail_start, tail_end = case["tail_probe"]
             next_start = case["next_speaker_starts_no_earlier_than"]

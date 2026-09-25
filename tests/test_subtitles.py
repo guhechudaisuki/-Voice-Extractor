@@ -180,6 +180,10 @@ class SubtitleCompletionTests(unittest.TestCase):
         self.assertEqual(self.restore(), 1)
         self.assertEqual((self.accepted[0].start, self.accepted[0].end), (1, 3.5))
         self.assertTrue(self.accepted[0].diagnostics["subtitle_completion"])
+        certificate = self.accepted[0].diagnostics["local_identity_audit"]
+        self.assertTrue(certificate["passed"])
+        self.assertEqual(certificate["span"], [1, 3.5])
+        self.assertIsNone(ExtractionPipeline._stt_fragment_identity_veto(self.accepted[0], 3))
 
     def test_subtitle_can_recover_without_core_only_with_tertiary_confirmation(self):
         self.accepted.clear()
@@ -203,6 +207,7 @@ class SubtitleCompletionTests(unittest.TestCase):
         self.pipeline._verify_speaker_span.side_effect = lambda _v, _w, span, _p, _t: SimpleNamespace(accepted=span.start < 2.7)
         self.assertEqual(self.restore(), 0)
         self.assertIs(self.accepted[0], self.core)
+        self.assertNotIn("local_identity_audit", self.core.diagnostics)
 
     def test_no_core_still_requires_independent_identity(self):
         self.accepted.clear()

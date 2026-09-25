@@ -13,9 +13,20 @@ from build_review_queue import build_queue  # noqa: E402
 from check_join_cases import assess as assess_join_cases  # noqa: E402
 from probe_adjacent_pairs import parse_pair  # noqa: E402
 from replay_subtitle_completion import parse_window  # noqa: E402
+from check_known_episode1 import assess as assess_known_cases  # noqa: E402
 
 
 class EvaluationToolTests(unittest.TestCase):
+    def test_reviewed_mixed_clip_is_not_a_recall_gain(self):
+        cases = {"cases": [{"id": "mixed", "kind": "must_not_cover_reviewed_mixed_clip",
+                             "span": [10, 13.3]}]}
+        contaminated = {"sentences": [{"start": 10, "end": 13.3, "accepted": True}]}
+        clean_candidate = {"sentences": [{"start": 11.5, "end": 13.3, "accepted": True}]}
+        self.assertFalse(assess_known_cases(contaminated, cases)[0]["passed"])
+        # This only excludes the known whole-clip error; it does NOT certify
+        # the partial candidate's exact start or identity.
+        self.assertTrue(assess_known_cases(clean_candidate, cases)[0]["passed"])
+
     def test_local_replay_window_rejects_invalid_ranges(self):
         window = parse_window("303:308")
         self.assertEqual((window.start, window.end), (303, 308))

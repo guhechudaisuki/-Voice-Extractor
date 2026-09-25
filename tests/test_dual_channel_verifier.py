@@ -23,6 +23,7 @@ from extractor.speaker import (  # noqa: E402
     SpeakerProfile,
 )
 from extractor.pipeline import ExtractionPipeline  # noqa: E402
+from extractor.types import CandidateSentence  # noqa: E402
 
 
 def _decision(
@@ -447,29 +448,65 @@ class DualChannelCompositionTests(unittest.TestCase):
 
 
 class SttBoundaryPolicyTests(unittest.TestCase):
-    def test_whisper_fragment_count_alone_never_vetoes_identity(self) -> None:
-        candidate = SimpleNamespace(diagnostics={})
-        self.assertIsNone(
+    def test_absent_veto_is_not_a_local_identity_certificate(self) -> None:
+        candidate = CandidateSentence(1, 4, "", diagnostics={"speaker_tier": "strong"})
+        self.assertEqual(
+            ExtractionPipeline._stt_fragment_identity_veto(candidate, 3),
+            "local_identity_unverified",
+        )
+
+    def test_user_reported_prefix_does_not_pass_on_whole_span_score(self) -> None:
+        # Same pattern as the reviewed 525-second clip: the whole turn is
+        # strong while a local part is rejected. No episode timestamp is used.
+        candidate = CandidateSentence(10, 13.3, "", diagnostics={
+            "speaker_tier": "strong", "multi_model_anchor_decisive_boundary": False,
+            "target_locator_recovery": True,
+        })
+        self.assertIsNotNone(
             ExtractionPipeline._stt_fragment_identity_veto(candidate, 3)
         )
 
     def test_acoustic_mixed_turn_veto_survives_stt(self) -> None:
         for key in (
-            "multi_model_anchor_excluded",
             "multi_model_anchor_decisive_boundary",
+            "structural_hard_reject",
+            "excluded_role_rejected",
             "final_same_speaker_internal_discard",
             "final_identity_boundary_discard",
         ):
             with self.subTest(key=key):
-                candidate = SimpleNamespace(diagnostics={key: True})
+                candidate = CandidateSentence(1, 4, "", diagnostics={key: True})
                 self.assertIsNotNone(
                     ExtractionPipeline._stt_fragment_identity_veto(candidate, 2)
                 )
+                self.assertIsNotNone(
+                    ExtractionPipeline._stt_fragment_identity_veto(candidate, 1)
+                )
 
-    def test_single_whisper_fragment_has_no_identity_veto(self) -> None:
-        candidate = SimpleNamespace(diagnostics={"multi_model_anchor_excluded": True})
+    def test_anchor_exclusion_is_not_a_confirmed_other_speaker(self) -> None:
+        candidate = CandidateSentence(1, 4, "", diagnostics={
+            "multi_model_anchor_excluded": True,
+            "local_identity_audit": {"span": [1, 4], "passed": True},
+        })
         self.assertIsNone(
-            ExtractionPipeline._stt_fragment_identity_veto(candidate, 1)
+            ExtractionPipeline._stt_fragment_identity_veto(candidate, 3)
+        )
+
+    def test_changed_boundary_invalidates_local_identity_certificate(self) -> None:
+        candidate = CandidateSentence(1, 5, "", diagnostics={
+            "local_identity_audit": {"span": [1, 4], "passed": True},
+        })
+        self.assertEqual(
+            ExtractionPipeline._stt_fragment_identity_veto(candidate, 3),
+            "local_identity_unverified",
+        )
+
+    def test_existing_silence_merge_and_single_text_behavior_is_preserved(self) -> None:
+        candidate = CandidateSentence(1, 4, "")
+        self.assertIsNone(ExtractionPipeline._stt_fragment_identity_veto(candidate, 1))
+        candidate.diagnostics["post_target_silence_merge"] = True
+        self.assertIsNone(
+            ExtractionPipeline._stt_fragment_identity_veto(candidate, 3)
         )
 
 
