@@ -1636,6 +1636,117 @@ class ExtractionPipeline:
                 removed += 1
         return removed
 
+    def _extend_target_clip_over_tail_sliver(
+        self,
+        accepted_turns: list[CandidateSentence],
+        rejected: list[CandidateSentence],
+        verifier: DualSpeakerVerifier,
+        profile: SpeakerMatchProfile,
+        stem_waveform: torch.Tensor,
+        exclusion_profiles: list[ExclusionSpeakerProfile],
+        threshold: float,
+        progress: ProgressCallback,
+    ) -> int:
+        """Absorb an unscorable edge sliver and its quiet gap into the
+        adjacent accepted clip.
+
+        A sliver shorter than 0.25 s cannot be scored by any identity tooling
+        in this project, so the binding evidence is: the sliver sits directly
+        against the accepted clip, a quiet gap bounds it on the far side, the
+        joined span passes formal dual-model verification, and the exclusion
+        audit does not reject the joined span.  The quiet gap is the natural
+        sentence edge, so the other speaker's speech beyond it is never
+        absorbed.
+        """
+        if not accepted_turns or not rejected:
+            return 0
+        from .nextgen.internal_pauses import locate_quiet_gaps
+
+        extended_count = 0
+        for candidate in list(rejected):
+            if candidate.diagnostics.get("structural_hard_reject"):
+                continue
+            span = TimeSpan(candidate.start, candidate.end)
+            samples = self._waveform_span(
+                stem_waveform, span
+            ).detach().cpu().numpy()
+            if samples.size == 0:
+                continue
+            gaps = list(locate_quiet_gaps(
+                samples,
+                16000,
+                lower_seconds=self.options.silence_min_seconds,
+                upper_seconds=self.options.silence_split_seconds,
+            ))
+            if not gaps:
+                continue
+            head_neighbors = [
+                item for item in accepted_turns
+                if abs(item.end - span.start) <= 0.05
+            ]
+            tail_neighbors = [
+                item for item in accepted_turns
+                if abs(span.end - item.start) <= 0.05
+            ]
+            if head_neighbors:
+                neighbor = head_neighbors[0]
+                head_side = True
+            elif tail_neighbors:
+                neighbor = tail_neighbors[0]
+                head_side = False
+            else:
+                continue
+            boundary = gaps[0] if head_side else gaps[-1]
+            if head_side:
+                sliver_seconds = boundary.start / 16000.0
+            else:
+                sliver_seconds = span.duration - boundary.end / 16000.0
+            if sliver_seconds > 0.25:
+                continue
+            if head_side:
+                extension_end = span.start + boundary.end / 16000.0
+                extended = TimeSpan(neighbor.start, extension_end)
+            else:
+                extension_start = span.start + boundary.start / 16000.0
+                extended = TimeSpan(extension_start, neighbor.end)
+            if extended.duration > self.options.max_sentence_seconds:
+                continue
+            extended_match = self._verify_speaker_span(
+                verifier,
+                stem_waveform,
+                extended,
+                profile,
+                threshold,
+                audit_raw=True,
+            )
+            if not extended_match.accepted:
+                continue
+            extended_exclusion = verifier.exclusion_audit(
+                extended_match, profile, exclusion_profiles,
+            ) or {}
+            if extended_exclusion.get("excluded_role_rejected"):
+                continue
+            neighbor.start, neighbor.end = extended.start, extended.end
+            neighbor.diagnostics["tail_sliver_extension"] = {
+                "source_turn": [span.start, span.end],
+                "sliver_seconds": round(sliver_seconds, 3),
+                "extended_span": [extended.start, extended.end],
+            }
+            if head_side:
+                remainder_start = extended.end
+                if candidate.end - remainder_start > 0.01:
+                    candidate.start = remainder_start
+                else:
+                    rejected.remove(candidate)
+            else:
+                remainder_end = extended.start
+                if remainder_end - candidate.start > 0.01:
+                    candidate.end = remainder_end
+                else:
+                    rejected.remove(candidate)
+            extended_count += 1
+        return extended_count
+
     @staticmethod
     def _wavlm_same_speaker_floor(profile) -> float:
         """Calibrate edge continuity from the reference speaker itself."""
@@ -5508,6 +5619,22 @@ class ExtractionPipeline:
                         0.80,
                         "完整句边界修复："
                         f"补全 {boundary_expanded} 段，裁切 {boundary_cropped} 段",
+                    )
+
+                tail_extended = self._extend_target_clip_over_tail_sliver(
+                    accepted_turns,
+                    rejected,
+                    verifier,
+                    profile,
+                    target_waveform,
+                    exclusion_profiles,
+                    effective_threshold,
+                    progress=lambda _value, message: progress(0.80, message),
+                )
+                if tail_extended:
+                    progress(
+                        0.80,
+                        f"尾音延展：恢复 {tail_extended} 段贴边尾音",
                     )
 
                 if self.options.experimental_adjacent_domain_rescue:

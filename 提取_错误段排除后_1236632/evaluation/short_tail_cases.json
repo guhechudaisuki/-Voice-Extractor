@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "purpose": "Development probes for short target and other-speaker tails, not independent truth",
+  "cases": [
+    {
+      "id": "reported_other_tail_312",
+      "left": [309.985, 312.06],
+      "right": [312.3, 312.9],
+      "same_target": false
+    },
+    {
+      "id": "known_other_after_340",
+      "left": [337.87, 340.5725],
+      "right": [340.8825, 342.2625],
+      "same_target": false
+    },
+    {
+      "id": "historical_target_join_303",
+      "left": [303.38, 304.885],
+      "right": [305.575, 307.79],
+      "same_target": true
+    },
+    {
+      "id": "historical_target_join_643",
+      "left": [643.55, 644.75],
+      "right": [645.2, 647.03],
+      "same_target": true
+    },
+    {
+      "id": "historical_target_microtail_643",
+      "left": [645.2, 646.43],
+      "right": [646.43, 647.03],
+      "same_target": null
+    },
+    {
+      "id": "historical_target_microtail_1241",
+      "left": [1241.17, 1242.17],
+      "right": [1242.17, 1242.64],
+      "same_target": null
+    }
+  ]
+}

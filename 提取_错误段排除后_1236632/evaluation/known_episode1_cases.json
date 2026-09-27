@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "purpose": "Narrow episode-1 regression checks, not a complete ground-truth transcript",
+  "cases": [
+    {
+      "id": "reviewed_mixed_prefix_525",
+      "kind": "must_not_cover_reviewed_mixed_clip",
+      "span": [525.31, 528.61],
+      "evidence": ["User listened to 20260925_104500_stt_policy_candidate and confirmed only the last text fragment is target speech."],
+      "non_target_text": ["え?", "UFO?"],
+      "target_text": "UFOじゃなくてUFO",
+      "note": "Whole clip is human-confirmed mixed. 526.81 is only an acoustic probe boundary, not a human-labelled exact transition. Text and times here are evaluation data, never production identity rules."
+    },
+    {
+      "id": "introduction_short_target_tail",
+      "kind": "must_cover_target_tail",
+      "target_core": [337.87, 340.17],
+      "tail_probe": [340.35, 340.5725],
+      "next_speaker_starts_no_earlier_than": 340.81,
+      "evidence": [
+        "test_logs/episode_01_20260825_174500/README.md",
+        "work/subtitle_identity_probe.json",
+        "work/subtitle_stt_probe.json"
+      ],
+      "note": "The historical output omitted a short target tail. The probe interval is an acoustic candidate, not an independently audited final endpoint."
+    },
+    {
+      "id": "known_internal_speaker_change",
+      "kind": "must_not_cross_change",
+      "change_time": 977.88,
+      "left_context": 0.1,
+      "right_context": 0.1,
+      "evidence": ["work/subtitle_identity_probe.json"],
+      "note": "The full 975.78-980.58 second turn passed whole-span identity but contains a detected speaker change."
+    }
+  ]
+}

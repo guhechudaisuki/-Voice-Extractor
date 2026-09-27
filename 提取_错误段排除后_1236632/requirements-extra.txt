@@ -1,0 +1,3 @@
+# Installed into 提取/vendor only. Do not install or upgrade torch/CUDA.
+torchlibrosa==0.1.0
+panns-inference==0.1.1

@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "warning": "Development-only acoustic counterexample, not a human-confirmed complete truth set. Never load this file in production inference.",
+  "cases": [
+    {
+      "id": "short_other_after_internal_pause_1245",
+      "other_audio_span": [1245.23, 1245.46],
+      "evidence": "0.34 s UVR energy gap before this short voice; frozen char/va stem+raw classified an extended 1245.23-1245.50 analysis window as other_supported; subtitle cue changes nearby",
+      "minimum_contaminated_seconds": 0.15
+    }
+  ]
+}
