@@ -7,10 +7,31 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "evaluation"))
 
-from evaluate_utterance_lattice import assess_reachability
+from evaluate_utterance_lattice import assess_reachability  # noqa: E402
+from build_utterance_lattice import build_report  # noqa: E402
 
 
 class LatticeEvaluationTests(unittest.TestCase):
+    def test_disagreeing_channel_edges_remain_complete_alternatives(self):
+        stage = {"stages": {
+            "clean_speech_islands": {"spans": [[10.0, 11.5], [11.8, 13.2]]},
+        }}
+        provenance = {"inputs_sha256": {"target": "a" * 64}}
+        stem = {"cases": [{"boundaries": [{"time": 12.72, "confidence": 0.98}]}]}
+        raw = {"cases": [{"boundaries": [{"time": 12.62, "confidence": 0.82}]}]}
+        lattice = build_report(
+            stage, provenance, max_gap_seconds=0.85, max_utterance_seconds=45,
+            stem_boundary_report=stem, raw_boundary_report=raw,
+        )
+        ranges = {(row["start_sample"], row["end_sample"])
+                  for row in lattice["proposals"]}
+        self.assertIn((160000, round(12.67 * 16000)), ranges)
+        self.assertIn((160000, round(12.72 * 16000)), ranges)
+        self.assertIn((160000, round(12.62 * 16000)), ranges)
+        # The original uncut island and its alternative remain available too.
+        self.assertIn((round(11.8 * 16000), round(13.2 * 16000)), ranges)
+        self.assertNotIn((round(12.62 * 16000), round(12.67 * 16000)), ranges)
+
     def test_known_change_candidate_is_counted_as_risk_not_a_success(self):
         cases = {"cases": [
             {"id": "target", "left": [1.0, 1.5], "right": [1.8, 2.4],

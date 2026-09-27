@@ -94,7 +94,10 @@ def build_utterance_lattice(
                     break
                 if start > previous_end:
                     gaps.append((previous_end, start))
-            if end - atoms[first][0] > max_duration:
+            # The duration cap limits *joins*, not an indivisible VAD island.
+            # Dropping an overlong atom here makes every utterance inside it
+            # unreachable before identity or boundary review can split it.
+            if last > first and end - atoms[first][0] > max_duration:
                 break
             speech.append((start, end))
             cue_indexes = tuple(
@@ -117,3 +120,70 @@ def build_utterance_lattice(
                 )
             )
     return proposals
+
+
+def propose_raw_vad_subturns(
+    stem_turns: Iterable[TimeSpan],
+    raw_speech: Iterable[TimeSpan],
+    target_regions: Iterable[TimeSpan],
+    *,
+    minimum_gap_seconds: float,
+    minimum_candidate_seconds: float,
+    edge_snap_seconds: float = 0.12,
+) -> list[TimeSpan]:
+    """Propose raw-channel subturns hidden inside a continuous UVR VAD turn.
+
+    Original-channel VAD can find an inter-speaker pause obscured by the UVR
+    stem. It is only a candidate source: its gaps are *not* certified silence,
+    and callers must still perform exact-span identity, exclusion, overlap,
+    boundary and completeness review before exporting anything. Locator overlap
+    restricts work, but never lends its identity to the candidate's extra audio.
+    """
+
+    if minimum_gap_seconds <= 0 or minimum_candidate_seconds <= 0:
+        raise ValueError("Raw VAD proposal durations must be positive")
+    if not 0 <= edge_snap_seconds <= 0.25:
+        raise ValueError("Invalid raw VAD edge snap distance")
+    turns = sorted(stem_turns, key=lambda span: (span.start, span.end))
+    raw = sorted(raw_speech, key=lambda span: (span.start, span.end))
+    targets = sorted(target_regions, key=lambda span: (span.start, span.end))
+    for span in [*turns, *raw, *targets]:
+        if not 0 <= span.start < span.end:
+            raise ValueError("Invalid raw/stem VAD interval")
+    proposals: dict[tuple[float, float], TimeSpan] = {}
+    for turn in turns:
+        clipped = [
+            TimeSpan(max(turn.start, span.start), min(turn.end, span.end))
+            for span in raw
+            if min(turn.end, span.end) > max(turn.start, span.start)
+        ]
+        groups: list[TimeSpan] = []
+        for span in clipped:
+            if groups and span.start - groups[-1].end < minimum_gap_seconds:
+                groups[-1] = TimeSpan(groups[-1].start, max(groups[-1].end, span.end))
+            else:
+                groups.append(span)
+        # A single raw interval merely differs in edge placement; without an
+        # internal gap it cannot explain a multi-speaker continuous stem turn.
+        if len(groups) < 2:
+            continue
+        for group in groups:
+            if group.duration < minimum_candidate_seconds:
+                continue
+            if not any(
+                min(group.end, target.end) - max(group.start, target.start)
+                >= min(0.35, group.duration * 0.25)
+                for target in targets
+            ):
+                continue
+            start = (turn.start if group.start - turn.start <= edge_snap_seconds
+                     else group.start)
+            end = (turn.end if turn.end - group.end <= edge_snap_seconds
+                   else group.end)
+            if end - start < minimum_candidate_seconds:
+                continue
+            candidate = TimeSpan(start, end)
+            if candidate == turn:
+                continue
+            proposals[(round(start, 5), round(end, 5))] = candidate
+    return sorted(proposals.values(), key=lambda span: (span.start, span.end))

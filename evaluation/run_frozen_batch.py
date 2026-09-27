@@ -13,6 +13,7 @@ import json
 import subprocess
 import sys
 import time
+from dataclasses import asdict
 from pathlib import Path
 
 
@@ -37,6 +38,23 @@ def main() -> int:
     parser.add_argument("--request", required=True, type=Path)
     parser.add_argument("--target", required=True, type=Path)
     parser.add_argument("--subtitle", type=Path)
+    parser.add_argument(
+        "--experimental-adjacent-domain-rescue", action="store_true",
+        help="Research-only local identity join; never changes desktop defaults",
+    )
+    parser.add_argument(
+        "--experimental-internal-reassembly", action="store_true",
+        help="Research-only review of a short other-voice tail after an internal pause",
+    )
+    parser.add_argument(
+        "--experimental-final-island-consensus", action="store_true",
+        help="Research-only local other-voice abstention and exact child recheck",
+    )
+    parser.add_argument(
+        "--exclude-spans", type=Path,
+        help="JSON file with [start, end] seconds the user marked as wrong; "
+             "overlapping exports are deleted before STT",
+    )
     args = parser.parse_args()
     request = json.loads(args.request.read_text(encoding="utf-8"))
     references = [Path(value) for value in request["references"]]
@@ -46,10 +64,24 @@ def main() -> int:
     all_inputs = [*references, *(item for group in negatives for item in group), target]
     if subtitle:
         all_inputs.append(subtitle)
+    if args.exclude_spans:
+        all_inputs.append(args.exclude_spans)
     missing = [str(item) for item in all_inputs if not item.is_file()]
     if missing:
         parser.error("Missing input files: " + ", ".join(missing))
-    options = PipelineOptions(**request["options"])
+    effective_options = dict(request["options"])
+    if args.exclude_spans:
+        marked = json.loads(args.exclude_spans.read_text(encoding="utf-8"))
+        if isinstance(marked, dict):
+            marked = marked.get("spans", [])
+        effective_options["user_excluded_spans"] = marked
+    if args.experimental_adjacent_domain_rescue:
+        effective_options["experimental_adjacent_domain_rescue"] = True
+    if args.experimental_internal_reassembly:
+        effective_options["experimental_internal_reassembly"] = True
+    if args.experimental_final_island_consensus:
+        effective_options["experimental_final_island_consensus"] = True
+    options = PipelineOptions(**effective_options)
     code_hashes = {str(path.relative_to(ROOT)): sha256(path)
                    for path in sorted((ROOT / "extractor").glob("*.py"))}
     commit = subprocess.check_output(
@@ -87,7 +119,12 @@ def main() -> int:
         "code_sha256_at_start": code_hashes,
         "request_sha256": sha256(args.request),
         "inputs_sha256": inputs,
-        "options": request["options"],
+        "options": asdict(options),
+        "cli_overrides": {
+            "experimental_adjacent_domain_rescue": args.experimental_adjacent_domain_rescue,
+            "experimental_internal_reassembly": args.experimental_internal_reassembly,
+            "experimental_final_island_consensus": args.experimental_final_island_consensus,
+        },
         "accepted_count": len(result.accepted),
         "rejected_count": len(result.rejected),
         "elapsed_seconds": round(time.monotonic() - started, 2),

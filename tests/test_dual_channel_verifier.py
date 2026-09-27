@@ -22,8 +22,8 @@ from extractor.speaker import (  # noqa: E402
     SpeakerMatchProfile,
     SpeakerProfile,
 )
-from extractor.pipeline import ExtractionPipeline  # noqa: E402
-from extractor.types import CandidateSentence  # noqa: E402
+from extractor.pipeline import ExtractionPipeline, PipelineOptions  # noqa: E402
+from extractor.types import CandidateSentence, TimeSpan  # noqa: E402
 
 
 def _decision(
@@ -260,6 +260,79 @@ class DualChannelCompositionTests(unittest.TestCase):
         self.assertEqual(result.diagnostics["raw_rescue_reason"], "uvr_accepted")
         self.assertIsNotNone(result.raw_primary)
         self.assertEqual(verifier._verify_channel_waveform.call_count, 2)
+
+    def test_short_uvr_acceptance_still_runs_requested_raw_audit(self) -> None:
+        uvr = _match(
+            accepted=True, tier="strong", primary_score=0.78,
+            secondary_score=0.76, primary_max=0.80,
+            secondary_max=0.78, paired=0.76,
+        )
+        raw = _match(
+            accepted=False, tier="rejected", primary_score=0.35,
+            secondary_score=0.30, primary_max=0.40,
+            secondary_max=0.35, paired=0.32,
+        )
+        verifier = self._verifier(uvr, raw)
+        result = verifier.verify_dual_channel_waveform(
+            torch.zeros(8000),
+            torch.zeros(8000),
+            self._profile(),
+            0.70,
+            0.5,
+            clean_gate=True,
+            audit_raw_on_uvr_accept=True,
+        )
+        self.assertFalse(result.diagnostics["raw_channel_skipped"])
+        self.assertIsNotNone(result.raw_primary)
+        self.assertEqual(verifier._verify_channel_waveform.call_count, 2)
+
+    def test_explicit_raw_audit_collects_evidence_without_rescuing_weak_uvr(self) -> None:
+        uvr = _match(
+            accepted=False, tier="rejected", primary_score=0.20,
+            secondary_score=0.18, primary_max=0.25,
+            secondary_max=0.22, paired=0.20,
+        )
+        raw = _match(
+            accepted=True, tier="strong", primary_score=0.82,
+            secondary_score=0.80, primary_max=0.84,
+            secondary_max=0.82, paired=0.80,
+        )
+        verifier = self._verifier(uvr, raw)
+        result = verifier.verify_dual_channel_waveform(
+            torch.zeros(48000),
+            torch.zeros(48000),
+            self._profile(),
+            0.70,
+            3.0,
+            clean_gate=True,
+            audit_raw_channel=True,
+        )
+        self.assertFalse(result.accepted)
+        self.assertFalse(result.diagnostics["raw_channel_skipped"])
+        self.assertIsNotNone(result.raw_primary)
+        self.assertEqual(verifier._verify_channel_waveform.call_count, 2)
+
+    def test_final_span_can_request_raw_identity_evidence(self) -> None:
+        pipeline = ExtractionPipeline.__new__(ExtractionPipeline)
+        pipeline.options = PipelineOptions()
+        pipeline._raw_target_waveform = torch.zeros(48000)
+        pipeline._raw_blocked_spans = ()
+        verifier = Mock()
+        verifier.verify_dual_channel_waveform.return_value = object()
+        result = pipeline._verify_speaker_span(
+            verifier,
+            torch.zeros(48000),
+            TimeSpan(0.0, 3.0),
+            self._profile(),
+            0.70,
+            audit_raw=True,
+        )
+        self.assertIs(result, verifier.verify_dual_channel_waveform.return_value)
+        self.assertTrue(
+            verifier.verify_dual_channel_waveform.call_args.kwargs[
+                "audit_raw_on_uvr_accept"
+            ]
+        )
 
     def test_raw_can_rescue_only_with_uvr_partial_evidence(self) -> None:
         uvr = _match(
@@ -507,6 +580,36 @@ class SttBoundaryPolicyTests(unittest.TestCase):
         candidate.diagnostics["post_target_silence_merge"] = True
         self.assertIsNone(
             ExtractionPipeline._stt_fragment_identity_veto(candidate, 3)
+        )
+
+    def test_final_acoustic_certificate_allows_multiple_stt_fragments(self) -> None:
+        candidate = CandidateSentence(1, 4, "", diagnostics={
+            "target_locator_recovery": True,
+            "target_coverage": 1.0,
+            "speech_ratio": 1.0,
+            "locator_boundary_count": 2,
+            "boundary_suppressed_recovery": False,
+        })
+        self.assertTrue(
+            ExtractionPipeline._install_acoustic_identity_certificate(candidate)
+        )
+        self.assertIsNone(
+            ExtractionPipeline._stt_fragment_identity_veto(candidate, 3)
+        )
+
+    def test_unresolved_boundary_cannot_receive_final_acoustic_certificate(self) -> None:
+        candidate = CandidateSentence(1, 4, "", diagnostics={
+            "target_locator_recovery": True,
+            "target_coverage": 1.0,
+            "speech_ratio": 1.0,
+            "boundary_suppressed_recovery": True,
+        })
+        self.assertFalse(
+            ExtractionPipeline._install_acoustic_identity_certificate(candidate)
+        )
+        self.assertEqual(
+            ExtractionPipeline._stt_fragment_identity_veto(candidate, 3),
+            "local_identity_unverified",
         )
 
 

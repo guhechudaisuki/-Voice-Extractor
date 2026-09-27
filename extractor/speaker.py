@@ -2353,6 +2353,7 @@ class DualSpeakerVerifier:
         clean_gate: bool = False,
         allow_raw_rescue: bool = True,
         audit_raw_on_uvr_accept: bool = False,
+        audit_raw_channel: bool = False,
         max_channel_duration_delta: float = 0.25,
     ) -> SpeakerMatchDecision:
         """Verify a stem and its time-aligned original waveform together.
@@ -2364,6 +2365,8 @@ class DualSpeakerVerifier:
         cannot itself determine whether music or singing remains in the raw
         waveform.  Accepted UVR decisions skip raw inference by default;
         ``audit_raw_on_uvr_accept=True`` enables it for diagnostic A/B runs.
+        ``audit_raw_channel=True`` also collects evidence after a failed UVR
+        result without bypassing the separate rescue decision gate.
         """
 
         secondary_profile = self._ensure_secondary(profile)
@@ -2392,6 +2395,7 @@ class DualSpeakerVerifier:
                 "raw_clean_gate": bool(clean_gate),
                 "raw_rescue_enabled": bool(allow_raw_rescue),
                 "raw_audit_on_uvr_accept": bool(audit_raw_on_uvr_accept),
+                "raw_explicit_audit": bool(audit_raw_channel),
                 "raw_channel_skipped": False,
             }
         )
@@ -2400,7 +2404,9 @@ class DualSpeakerVerifier:
         # Running it for a clean UVR acceptance roughly doubles the speaker
         # inference cost without changing the decision.  Diagnostic A/B runs
         # can opt in explicitly when both-channel scores are needed.
-        if uvr_match.accepted and not audit_raw_on_uvr_accept:
+        if uvr_match.accepted and not (
+            audit_raw_on_uvr_accept or audit_raw_channel
+        ):
             diagnostics["raw_rescue_reason"] = "skipped_uvr_accepted"
             diagnostics["raw_channel_skipped"] = True
             return replace(
@@ -2421,19 +2427,23 @@ class DualSpeakerVerifier:
                 raw_tier=None,
             )
 
-        possible, prefilter_reason = self._raw_rescue_prefilter(
-            uvr_match,
-            threshold,
-            duration,
-        )
-        if not possible:
-            diagnostics["raw_rescue_reason"] = prefilter_reason
-            diagnostics["raw_channel_skipped"] = True
-            return replace(
+        # This floor belongs to rescuing a failed stem, not to auditing an
+        # accepted stem.  Short accepted turns still need the original-channel
+        # evidence when a final exclusion-person review explicitly asks for it.
+        if not uvr_match.accepted and not audit_raw_channel:
+            possible, prefilter_reason = self._raw_rescue_prefilter(
                 uvr_match,
-                diagnostics=diagnostics,
-                raw_tier=None,
+                threshold,
+                duration,
             )
+            if not possible:
+                diagnostics["raw_rescue_reason"] = prefilter_reason
+                diagnostics["raw_channel_skipped"] = True
+                return replace(
+                    uvr_match,
+                    diagnostics=diagnostics,
+                    raw_tier=None,
+                )
 
         if raw_waveform is None:
             diagnostics["raw_rescue_reason"] = (
@@ -2589,6 +2599,7 @@ class DualSpeakerVerifier:
         clean_gate: bool = False,
         allow_raw_rescue: bool = True,
         audit_raw_on_uvr_accept: bool = False,
+        audit_raw_channel: bool = False,
         max_channel_duration_delta: float = 0.25,
     ) -> SpeakerMatchDecision:
         """Path-based convenience wrapper for :meth:`verify_dual_channel_waveform`."""
@@ -2604,6 +2615,7 @@ class DualSpeakerVerifier:
             clean_gate=clean_gate,
             allow_raw_rescue=allow_raw_rescue,
             audit_raw_on_uvr_accept=audit_raw_on_uvr_accept,
+            audit_raw_channel=audit_raw_channel,
             max_channel_duration_delta=max_channel_duration_delta,
         )
 

@@ -7,8 +7,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from extractor.candidate_lattice import build_utterance_lattice
-from extractor.types import TimeSpan
+from extractor.candidate_lattice import build_utterance_lattice  # noqa: E402
+from extractor.types import TimeSpan  # noqa: E402
 
 
 SOURCE_HASH = "a" * 64
@@ -61,6 +61,19 @@ class UtteranceLatticeTests(unittest.TestCase):
             max_utterance_seconds=45, max_islands_per_proposal=3,
         )
         self.assertEqual(len(result), 100 + 99 + 98)
+
+    def test_single_long_island_is_kept_but_never_joined_past_cap(self):
+        result = build_utterance_lattice(
+            SOURCE_HASH,
+            [TimeSpan(1.0, 21.0), TimeSpan(21.3, 22.0)],
+            max_gap_seconds=0.85,
+            max_utterance_seconds=16.0,
+        )
+        self.assertEqual(
+            [(item.start_sample, item.end_sample) for item in result],
+            [(16000, 336000), (340800, 352000)],
+        )
+        self.assertTrue(all(len(item.island_indexes) == 1 for item in result))
 
 
 if __name__ == "__main__":

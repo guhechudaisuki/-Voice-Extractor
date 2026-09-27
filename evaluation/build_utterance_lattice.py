@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import json
 import sys
 from pathlib import Path
@@ -61,6 +62,7 @@ def build_report(
         subtitle_cues=cues,
     )
     boundary_rows: list[dict] = []
+    boundary_partition_variants = 0
     if stem_boundary_report is not None and raw_boundary_report is not None:
         cuts = propose_cross_channel_boundaries(
             islands,
@@ -75,19 +77,35 @@ def build_report(
             include_unmatched_stem=True,
         )
         boundary_rows = [cut.to_dict() for cut in cuts]
-        refined = build_utterance_lattice(
-            source_hash,
-            subdivide_islands(islands, cuts),
-            max_gap_seconds=max_gap_seconds,
-            max_utterance_seconds=max_utterance_seconds,
-            blocked=blocked,
-            subtitle_cues=cues,
-        )
         seen = {item.source_id for item in proposals}
-        for item in refined:
-            if item.source_id not in seen:
-                proposals.append(item)
-                seen.add(item.source_id)
+        # Two channels agreeing within tolerance do not locate the change at
+        # the exact midpoint. Keep the center partition plus each observed
+        # endpoint as a separate proposal. Never put all three cuts in one
+        # partition: doing so invents 50 ms phonetic fragments.
+        partitions = [cuts]
+        for index, cut in enumerate(cuts):
+            if cut.raw_time is None:
+                continue
+            for edge in (cut.stem_time, cut.raw_time):
+                if round(edge * 16000) != round(cut.time * 16000):
+                    partitions.append([
+                        replace(row, time=edge) if position == index else row
+                        for position, row in enumerate(cuts)
+                    ])
+        boundary_partition_variants = len(partitions)
+        for partition in partitions:
+            refined = build_utterance_lattice(
+                source_hash,
+                subdivide_islands(islands, partition),
+                max_gap_seconds=max_gap_seconds,
+                max_utterance_seconds=max_utterance_seconds,
+                blocked=blocked,
+                subtitle_cues=cues,
+            )
+            for item in refined:
+                if item.source_id not in seen:
+                    proposals.append(item)
+                    seen.add(item.source_id)
     return {
         "schema_version": 1,
         "warning": (
@@ -99,6 +117,7 @@ def build_report(
         "atomic_island_count": len(islands),
         "proposal_count": len(proposals),
         "internal_boundary_proposal_count": len(boundary_rows),
+        "boundary_partition_variants": boundary_partition_variants,
         "internal_boundary_proposals": boundary_rows,
         "max_gap_seconds": max_gap_seconds,
         "max_utterance_seconds": max_utterance_seconds,

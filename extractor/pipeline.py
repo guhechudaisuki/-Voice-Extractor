@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import csv
-import gc
 import json
 import logging
 import re
@@ -28,7 +27,8 @@ from .audio import (
     has_video_stream,
     write_video_clip,
 )
-from .config import OUTPUT_ROOT, WORK_ROOT, ensure_local_assets
+from .candidate_lattice import propose_raw_vad_subturns
+from .config import ASSET_ROOT, OUTPUT_ROOT, WORK_ROOT, ensure_local_assets
 from .filters import OverlapDetector, SingingDetector
 from .speaker import (
     CAMPlusProfile,
@@ -76,6 +76,17 @@ class PipelineOptions:
     export_all_sentences: bool = False
     export_video_clips: bool = False
     cleanup_work: bool = False
+    # Research switch only.  Keep the shipped one-click rules unchanged until
+    # short-scene and independent human reviews establish a real improvement.
+    experimental_internal_reassembly: bool = False
+    experimental_adjacent_domain_rescue: bool = False
+    # The island-level identity review blocks whole turns whose local
+    # islands carry other-speaker evidence. It abstains without exclusion
+    # references or anime models.
+    experimental_final_island_consensus: bool = True
+    # Time spans the user marked as wrong while listening. Any accepted turn
+    # overlapping one is deleted before STT.
+    user_excluded_spans: tuple[tuple[float, float], ...] = ()
 
     def __post_init__(self) -> None:
         if self.silence_max_seconds is None:
@@ -87,6 +98,11 @@ class PipelineOptions:
             raise ValueError("静音下限不能小于 0 秒")
         if self.silence_split_seconds < self.silence_min_seconds:
             raise ValueError("静音下限不能大于静音上限")
+        self.user_excluded_spans = tuple(
+            (float(span[0]), float(span[1]))
+            for span in self.user_excluded_spans
+            if float(span[1]) > float(span[0])
+        )
 
 
 ProgressCallback = Callable[[float, str], None]
@@ -102,10 +118,13 @@ def _safe_name(value: str, fallback: str = "sentence") -> str:
 
 
 def _language_from_text(text: str, current: str) -> str:
-    if current in {"zh", "ja", "en", "ko"}:
-        return current
+    # Whisper can report Chinese for a short Japanese sentence even while its
+    # own transcript contains kana.  Prefer the observed script before routing
+    # to the Chinese-only refinement model, which would overwrite that text.
     if re.search(r"[\u3040-\u30ff]", text):
         return "ja"
+    if current in {"zh", "ja", "en", "ko"}:
+        return current
     if re.search(r"[\u4e00-\u9fff]", text):
         return "zh"
     return current or "auto"
@@ -136,6 +155,8 @@ class ExtractionPipeline:
         self._raw_blocked_spans: tuple[TimeSpan, ...] = ()
         self._subtitle_guide: SubtitleGuide | None = None
         self._stage_audit: dict | None = None
+        self._verified_fallback_registry: dict[int, list[CandidateSentence]] = {}
+        self._verified_fallback_anchors: list[CandidateSentence] = []
 
     def _trace_spans(
         self,
@@ -165,6 +186,7 @@ class ExtractionPipeline:
             "negative_clips": root / "negative_reference_voice_clips",
             "raw_negative_clips": root / "negative_reference_original_voice_clips",
             "normalized_target": root / "target_normalized.wav",
+            "raw_vad_target": root / "target_original_vad_16k.wav",
             "singing_removed_target": root / "target_singing_removed.wav",
             "stems": root / "stems",
             "candidate_clips": root / "candidate_clips",
@@ -445,16 +467,24 @@ class ExtractionPipeline:
         primary_same_floor: float = 0.76,
         secondary_same_floor: float = 0.64,
         forbidden_joins: Iterable[TimeSpan] = (),
+        strict_flags: list[bool] | None = None,
     ) -> list[TimeSpan]:
         """Merge a short silent gap only when both speaker models agree.
 
         The returned span covers the original gap, so the short silence is
-        retained in exported training audio exactly as requested.
+        retained in exported training audio exactly as requested.  When both
+        neighbors are strictly accepted target turns, their own formal
+        verification is the same-speaker evidence and the fragment-to-fragment
+        floor is redundant; the joined span is verified again by the caller
+        before anything is exported.  Weak (recall-edge) neighbors still need
+        the floor, so an unresolved fragment can never borrow a core's score.
         """
 
         spans = sorted(spans, key=lambda item: (item.start, item.end))
         if len(spans) < 2:
             return spans
+        if strict_flags is not None and len(strict_flags) != len(spans):
+            raise ValueError("strict_flags must align with spans")
         parts = [self._waveform_span(waveform, span) for span in spans]
         progress(0.0, f"短静音声纹核验：ERes2Net 0/{len(parts)}")
         primary_embeddings = verifier.primary._embeddings_from_waveforms(
@@ -493,11 +523,21 @@ class ExtractionPipeline:
                 )
                 for blocked in forbidden_joins
             )
+            both_strict = (
+                strict_flags is not None
+                and bool(strict_flags[index - 1])
+                and bool(strict_flags[index])
+            )
             same_speaker = (
                 gap <= maximum_silence_seconds
                 and not blocked_join
-                and primary_similarity >= primary_same_floor
-                and secondary_similarity >= secondary_same_floor
+                and (
+                    both_strict
+                    or (
+                        primary_similarity >= primary_same_floor
+                        and secondary_similarity >= secondary_same_floor
+                    )
+                )
             )
             if same_speaker:
                 output[-1] = TimeSpan(output[-1].start, current.end)
@@ -557,6 +597,8 @@ class ExtractionPipeline:
         span: TimeSpan,
         profile: SpeakerMatchProfile,
         threshold: float,
+        *,
+        audit_raw: bool = False,
     ) -> SpeakerMatchDecision:
         stem_part = self._waveform_span(waveform, span)
         window_seconds = min(1.8, max(1.0, span.duration))
@@ -566,7 +608,7 @@ class ExtractionPipeline:
             profile.raw_primary is not None and profile.raw_secondary is not None
         )
         if (
-            not self.options.use_raw_speaker_rescue
+            (not self.options.use_raw_speaker_rescue and not audit_raw)
             or raw_source is None
             or not raw_profile_ready
         ):
@@ -596,8 +638,724 @@ class ExtractionPipeline:
             window_seconds=window_seconds,
             hop_seconds=hop_seconds,
             clean_gate=clean_gate,
-            allow_raw_rescue=True,
+            allow_raw_rescue=self.options.use_raw_speaker_rescue,
+            audit_raw_on_uvr_accept=audit_raw,
+            audit_raw_channel=audit_raw,
         )
+
+    def _experimental_audit_final_islands(
+        self,
+        accepted_turns: list[CandidateSentence],
+        rejected: list[CandidateSentence],
+        verifier: DualSpeakerVerifier,
+        profile: SpeakerMatchProfile,
+        stem_waveform: torch.Tensor,
+        stem_path: Path,
+        raw_path: Path,
+        threshold: float,
+        target_reference_clips: list[Path],
+        raw_reference_clips: list[Path],
+        negative_reference_clips: list[list[Path]],
+        raw_negative_reference_clips: list[list[Path]],
+        exclusion_profiles: list[ExclusionSpeakerProfile],
+        blocked_spans: Iterable[TimeSpan],
+        progress: ProgressCallback,
+    ) -> tuple[int, int]:
+        """Research-only final local conflict review before STT.
+
+        A parent's high speaker score cannot supply identity to a separate
+        short speech island. Independently conflicting islands withdraw the
+        parent. Only exact target-supported child spans can be reintroduced.
+        No supplied exclusion voices means this prototype abstains entirely.
+        """
+        if (not accepted_turns or not negative_reference_clips
+                or self._raw_target_waveform is None):
+            return 0, 0
+        from .nextgen.anime_embedding import AnimeSpeakerOnnx
+        from .nextgen.domain_identity import DomainReferenceBank, ReferenceAudio
+        from .nextgen.internal_pauses import (
+            locate_quiet_gaps, locate_terminal_short_tail_gap,
+        )
+        from .nextgen.purity_consensus import (
+            eligible_identity_island, local_other_witnesses, target_runs,
+            whole_identity_conflict,
+        )
+        # Default-on now, so a missing optional asset must abstain instead of
+        # failing the one-click run.
+        if not all(
+            (ASSET_ROOT / "models" / name).is_file()
+            for name in (
+                "anime-speaker-char/anime_speaker_char_ecapa.onnx",
+                "anime-speaker-va/anime_speaker_va_ecapa.onnx",
+            )
+        ):
+            return 0, 0
+
+        raw_waveform = self._raw_target_waveform
+        references: list[ReferenceAudio] = []
+
+        def add_references(role: str, stems: list[Path], raws: list[Path]) -> None:
+            by_stem = {path.name: path for path in stems}
+            by_raw = {path.name: path for path in raws}
+            if not by_stem or by_stem.keys() != by_raw.keys():
+                raise ValueError("局部身份终审需要成对的原音/UVR 参考音频")
+            for name in sorted(by_stem):
+                references.append(ReferenceAudio(
+                    role=role,
+                    stem=load_mono(by_stem[name], 16000),
+                    raw=load_mono(by_raw[name], 16000),
+                    sample_rate=16000,
+                ))
+
+        add_references("target", target_reference_clips, raw_reference_clips)
+        if len(negative_reference_clips) != len(raw_negative_reference_clips):
+            raise ValueError("局部身份终审的排除人物参考组未对齐")
+        for index, (stems, raws) in enumerate(zip(
+            negative_reference_clips, raw_negative_reference_clips,
+        ), 1):
+            add_references(f"role_{index:03d}", stems, raws)
+        bank = DomainReferenceBank(
+            {
+                variant: AnimeSpeakerOnnx(ASSET_ROOT / "models", variant)
+                for variant in ("char", "va")
+            },
+            references,
+        )
+        blocked = tuple(blocked_spans)
+
+        def domain_for(span: TimeSpan):
+            if not eligible_identity_island(span.start, span.end):
+                return None
+            try:
+                return bank.score(
+                    stem=self._waveform_span(stem_waveform, span),
+                    raw=self._waveform_span(raw_waveform, span),
+                    sample_rate=16000,
+                )
+            except ValueError:
+                return None
+
+        def alternate_audio(path: Path, span: TimeSpan) -> torch.Tensor:
+            # Resampling after bounded source decoding is a legitimate second
+            # preprocessing view. It is used only to *abstain* when the main
+            # character-stem sign is unstable and the production verifier is
+            # already near an exclusion tie.
+            import librosa
+            import soundfile as sf
+
+            with sf.SoundFile(path) as source:
+                rate = source.samplerate
+                source.seek(round(span.start * rate))
+                samples = source.read(
+                    round(span.duration * rate), dtype="float32", always_2d=True,
+                ).mean(axis=1)
+            if rate != 16000:
+                samples = librosa.resample(
+                    samples, orig_sr=rate, target_sr=16000,
+                )
+            return torch.from_numpy(samples.copy())
+
+        def margins(verdict) -> dict[str, float | None]:
+            return {
+                f"{variant}_{channel}": verdict.score(variant, channel).margin
+                for variant in ("char", "va")
+                for channel in ("stem", "raw")
+            }
+
+        total = len(accepted_turns)
+        withheld = 0
+        rescued = 0
+        for index, candidate in enumerate(list(accepted_turns), 1):
+            parent = TimeSpan(candidate.start, candidate.end)
+            whole_domain = domain_for(parent)
+            whole_match = self._verify_speaker_span(
+                verifier, stem_waveform, parent, profile, threshold, audit_raw=True,
+            )
+            whole_exclusion = verifier.exclusion_audit(
+                whole_match, profile, exclusion_profiles,
+            ) or {}
+            whole_margins = (
+                margins(whole_domain) if whole_domain is not None else None
+            )
+            alternate_margins = None
+            direct_margin = whole_exclusion.get(
+                "excluded_primary_direct_margin"
+            )
+            if (whole_domain is not None and direct_margin is not None
+                    and float(direct_margin) <= 0.02):
+                try:
+                    alternate = bank.score(
+                        stem=alternate_audio(stem_path, parent),
+                        raw=alternate_audio(raw_path, parent),
+                        sample_rate=16000,
+                    )
+                    alternate_margins = margins(alternate)
+                except ValueError:
+                    pass
+            whole_conflict = bool(
+                whole_margins is not None and alternate_margins is not None
+                and whole_identity_conflict(
+                    whole_margins, alternate_margins, direct_margin,
+                )
+            )
+            samples = self._waveform_span(stem_waveform, parent).detach().cpu().numpy()
+            gaps = list(locate_quiet_gaps(
+                samples, 16000,
+                lower_seconds=self.options.silence_min_seconds,
+                upper_seconds=self.options.silence_split_seconds,
+            ))
+            terminal_gap = locate_terminal_short_tail_gap(
+                samples, 16000,
+                lower_seconds=self.options.silence_min_seconds,
+                upper_seconds=self.options.silence_split_seconds,
+            )
+            if terminal_gap is not None and not any(
+                terminal_gap.start < gap.end and gap.start < terminal_gap.end
+                for gap in gaps
+            ):
+                gaps.append(terminal_gap)
+                gaps.sort(key=lambda gap: gap.start)
+            else:
+                terminal_gap = None
+            terminal_tail_start = (
+                candidate.start + terminal_gap.end / 16000.0
+                if terminal_gap is not None else None
+            )
+            island_spans: list[TimeSpan] = []
+            cursor = candidate.start
+            for gap in gaps:
+                gap_start = candidate.start + gap.start / 16000.0
+                gap_end = candidate.start + gap.end / 16000.0
+                if gap_start > cursor:
+                    island_spans.append(TimeSpan(cursor, gap_start))
+                cursor = gap_end
+            if cursor < candidate.end:
+                island_spans.append(TimeSpan(cursor, candidate.end))
+
+            island_rows: list[dict] = []
+            suspect_spans: set[tuple[float, float]] = set()
+            for island in island_spans:
+                terminal_tail = (
+                    terminal_tail_start is not None
+                    and abs(island.start - terminal_tail_start) <= 0.02
+                    and abs(island.end - candidate.end) <= 0.02
+                )
+                domain = None if terminal_tail else domain_for(island)
+                state = (
+                    "unresolved_terminal_short_tail" if terminal_tail
+                    else domain.state if domain is not None else "unresolved_short"
+                )
+                witnesses: tuple[str, ...] = ()
+                local_exclusion: dict = {}
+                local_margins = margins(domain) if domain is not None else None
+                if domain is not None:
+                    local_match = self._verify_speaker_span(
+                        verifier, stem_waveform, island, profile, threshold,
+                        audit_raw=True,
+                    )
+                    local_exclusion = verifier.exclusion_audit(
+                        local_match, profile, exclusion_profiles,
+                    ) or {}
+                    witnesses = local_other_witnesses(
+                        local_margins, local_exclusion,
+                    )
+                if witnesses:
+                    suspect_spans.add((island.start, island.end))
+                if terminal_tail:
+                    # A terminal syllable shorter than the acoustic flank
+                    # cannot inherit the earlier speaker's identity. It may
+                    # be the target or somebody else; neither is presumed.
+                    suspect_spans.add((island.start, island.end))
+                island_rows.append({
+                    "span": [island.start, island.end],
+                    "state": state,
+                    "domain_margins": local_margins,
+                    "excluded_role": local_exclusion.get("excluded_role"),
+                    "excluded_primary_margin": local_exclusion.get(
+                        "excluded_primary_margin"
+                    ),
+                    "excluded_role_rejected": local_exclusion.get(
+                        "excluded_role_rejected", False
+                    ),
+                    "other_witnesses": list(witnesses),
+                    "terminal_tail_unresolved": terminal_tail,
+                })
+            candidate.diagnostics["experimental_final_island_evidence"] = {
+                "whole_domain_margins": whole_margins,
+                "whole_alternate_margins": alternate_margins,
+                "whole_excluded_primary_direct_margin": whole_exclusion.get(
+                    "excluded_primary_direct_margin"
+                ),
+                "whole_conflict": whole_conflict,
+                "islands": island_rows,
+                "terminal_short_tail_gap": (
+                    [candidate.start + terminal_gap.start / 16000.0,
+                     candidate.start + terminal_gap.end / 16000.0]
+                    if terminal_gap is not None else None
+                ),
+            }
+            if not whole_conflict and not suspect_spans:
+                continue
+
+            accepted_turns.remove(candidate)
+            candidate.reject_reason = "最终局部身份冲突，原混合片段已撤回"
+            candidate.diagnostics["experimental_final_island_consensus"] = {
+                "whole_conflict": whole_conflict,
+                "suspect_islands": [list(span) for span in sorted(suspect_spans)],
+            }
+            rejected.append(candidate)
+            withheld += 1
+            if whole_conflict and not suspect_spans:
+                continue
+
+            for left, right in target_runs(
+                island_rows, suspect_spans,
+                maximum_gap_seconds=self.options.silence_split_seconds,
+            ):
+                child_span = TimeSpan(left, right)
+                child = CandidateSentence(left, right, "")
+                child.diagnostics["final_purity_parent_span"] = [
+                    candidate.start, candidate.end,
+                ]
+                if child_span.duration < self.options.min_output_seconds:
+                    child.reject_reason = "局部目标子句短于当前导出下限"
+                elif any(
+                    min(child_span.end, mask.end)
+                    - max(child_span.start, mask.start) > 0.01
+                    for mask in blocked
+                ):
+                    child.reject_reason = "局部目标子句跨越歌声或多人遮罩"
+                elif any(
+                    min(child_span.end, other.end)
+                    - max(child_span.start, other.start) > 0.10
+                    for other in accepted_turns
+                ):
+                    child.reject_reason = "局部目标子句与已保留回合重叠"
+                else:
+                    child_match = self._verify_speaker_span(
+                        verifier, stem_waveform, child_span, profile, threshold,
+                        audit_raw=True,
+                    )
+                    child_exclusion = verifier.exclusion_audit(
+                        child_match, profile, exclusion_profiles,
+                    ) or {}
+                    child_domain = domain_for(child_span)
+                    if (not child_match.accepted
+                            or child_exclusion.get("excluded_role_rejected")
+                            or child_domain is None
+                            or child_domain.state != "target_supported"):
+                        child.reject_reason = "局部目标子句身份未获独立确认"
+                    else:
+                        self._apply_speaker_match(
+                            child, child_match, profile, threshold,
+                        )
+                        child.diagnostics.update(child_exclusion)
+                        child.diagnostics["local_identity_audit"] = {
+                            "span": [left, right],
+                            "passed": True,
+                            "method": "experimental_island_consensus_child",
+                        }
+                        child.diagnostics["experimental_purity_child"] = True
+                        accepted_turns.append(child)
+                        rescued += 1
+                if child.reject_reason:
+                    rejected.append(child)
+            progress(0.80, f"实验性局部身份终审：{index}/{total}")
+        accepted_turns.sort(key=lambda item: (item.start, item.end))
+        return withheld, rescued
+
+    def _experimental_reassemble_internal_other_tails(
+        self,
+        accepted_turns: list[CandidateSentence],
+        rejected: list[CandidateSentence],
+        verifier: DualSpeakerVerifier,
+        profile: SpeakerMatchProfile,
+        stem_waveform: torch.Tensor,
+        threshold: float,
+        target_reference_clips: list[Path],
+        raw_reference_clips: list[Path],
+        negative_reference_clips: list[list[Path]],
+        raw_negative_reference_clips: list[list[Path]],
+        exclusion_profiles: list[ExclusionSpeakerProfile],
+        blocked_spans: Iterable[TimeSpan],
+    ) -> tuple[int, int]:
+        """Research-only local reassembly after a VAD-missed short other voice.
+
+        An energy trough only proposes a boundary.  Both sides are checked by
+        independent frozen char/va models on stem and original audio.  A
+        replacement is exported only after the exact new span passes the
+        ordinary full verifier and supplied exclusion-person audit.  With no
+        exclusion references the witness abstains and this path does nothing.
+        """
+        if not negative_reference_clips or self._raw_target_waveform is None:
+            return 0, 0
+        from .nextgen.anime_embedding import AnimeSpeakerOnnx
+        from .nextgen.domain_identity import DomainReferenceBank, ReferenceAudio
+        from .nextgen.internal_pauses import locate_quiet_gaps
+
+        raw_waveform = self._raw_target_waveform
+        blocked = tuple(blocked_spans)
+        possible: list[tuple[CandidateSentence, float, float, float]] = []
+        for candidate in accepted_turns:
+            span = TimeSpan(candidate.start, candidate.end)
+            samples = self._waveform_span(stem_waveform, span).detach().cpu().numpy()
+            for gap in locate_quiet_gaps(
+                samples, 16000,
+                lower_seconds=self.options.silence_min_seconds,
+                upper_seconds=self.options.silence_split_seconds,
+            ):
+                gap_start = candidate.start + gap.start / 16000.0
+                gap_end = candidate.start + gap.end / 16000.0
+                tail_seconds = candidate.end - gap_end
+                if 0.20 <= tail_seconds <= 0.80:
+                    possible.append((candidate, gap_start, gap_end, gap.length / 16000.0))
+        if not possible:
+            return 0, 0
+
+        def add_references(
+            destination: list[ReferenceAudio], role: str,
+            stem_paths: list[Path], raw_paths: list[Path],
+        ) -> None:
+            stems = {path.name: path for path in stem_paths}
+            raws = {path.name: path for path in raw_paths}
+            if not stems or stems.keys() != raws.keys():
+                raise ValueError("Anime local audit needs paired raw/stem reference clips")
+            for name in sorted(stems):
+                destination.append(ReferenceAudio(
+                    role=role,
+                    stem=load_mono(stems[name], 16000),
+                    raw=load_mono(raws[name], 16000),
+                    sample_rate=16000,
+                ))
+
+        references: list[ReferenceAudio] = []
+        add_references(references, "target", target_reference_clips, raw_reference_clips)
+        if len(negative_reference_clips) != len(raw_negative_reference_clips):
+            raise ValueError("Anime local audit negative reference groups are mispaired")
+        for index, (stem_group, raw_group) in enumerate(
+            zip(negative_reference_clips, raw_negative_reference_clips), 1,
+        ):
+            add_references(references, f"role_{index:03d}", stem_group, raw_group)
+        bank = DomainReferenceBank(
+            {
+                variant: AnimeSpeakerOnnx(ASSET_ROOT / "models", variant)
+                for variant in ("char", "va")
+            },
+            references,
+        )
+
+        def local_state(span: TimeSpan) -> str:
+            try:
+                return bank.score(
+                    stem=self._waveform_span(stem_waveform, span),
+                    raw=self._waveform_span(raw_waveform, span),
+                    sample_rate=16000,
+                ).state
+            except ValueError:
+                return "unresolved"
+
+        replaced = 0
+        withheld = 0
+        for candidate, gap_start, gap_end, gap_seconds in possible:
+            if not any(item is candidate for item in accepted_turns):
+                continue
+            left = TimeSpan(candidate.start, gap_start)
+            analysis_end = min(
+                raw_waveform.numel() / 16000.0,
+                candidate.end + 0.12,
+                max(candidate.end, gap_end + 0.28),
+            )
+            if analysis_end - gap_end < 0.20:
+                continue
+            tail = TimeSpan(gap_end, analysis_end)
+            if local_state(left) != "target_supported" or local_state(tail) != "other_supported":
+                continue
+
+            # Try the clean cropped core first, then an independently
+            # target-supported neighboring rejected speech island.  No weak
+            # side inherits identity merely from a high-scoring whole clip.
+            choices: list[tuple[TimeSpan, CandidateSentence | None]] = []
+            predecessors = sorted(
+                (
+                    edge for edge in rejected
+                    if edge.reject_reason == "声纹匹配不足"
+                    and self.options.silence_min_seconds
+                    <= candidate.start - edge.end
+                    <= self.options.silence_split_seconds
+                    and edge.start < candidate.start
+                ),
+                key=lambda edge: edge.end,
+                reverse=True,
+            )
+            for edge in predecessors:
+                edge_span = TimeSpan(edge.start, edge.end)
+                if local_state(edge_span) == "target_supported":
+                    choices.append((TimeSpan(edge.start, gap_start), edge))
+            choices.append((left, None))
+
+            replacement: CandidateSentence | None = None
+            used_edge: CandidateSentence | None = None
+            for proposed, edge in choices:
+                if proposed.duration < self.options.min_output_seconds:
+                    continue
+                if any(
+                    min(proposed.end, blocked_span.end)
+                    - max(proposed.start, blocked_span.start) > 0.01
+                    for blocked_span in blocked
+                ):
+                    continue
+                if any(
+                    (item.diagnostics.get("excluded_role_rejected")
+                     or item.diagnostics.get("structural_hard_reject"))
+                    and min(proposed.end, item.end) - max(proposed.start, item.start) > 0.08
+                    for item in rejected if item is not edge
+                ):
+                    continue
+                if any(
+                    item is not candidate
+                    and min(proposed.end, item.end) - max(proposed.start, item.start) > 0.10
+                    for item in accepted_turns
+                ):
+                    continue
+                match = self._verify_speaker_span(
+                    verifier, stem_waveform, proposed, profile, threshold,
+                    audit_raw=True,
+                )
+                if not match.accepted:
+                    continue
+                exclusion = verifier.exclusion_audit(match, profile, exclusion_profiles)
+                if exclusion and exclusion.get("excluded_role_rejected"):
+                    continue
+                replacement = CandidateSentence(proposed.start, proposed.end, "")
+                replacement.diagnostics.update(candidate.diagnostics)
+                self._apply_speaker_match(replacement, match, profile, threshold)
+                replacement.diagnostics.update({
+                    "experimental_internal_reassembly": True,
+                    "internal_pause_parent_span": [candidate.start, candidate.end],
+                    "internal_pause_gap_span": [round(gap_start, 5), round(gap_end, 5)],
+                    "internal_pause_gap_seconds": round(gap_seconds, 5),
+                    "internal_pause_tail_analysis_span": [round(tail.start, 5), round(tail.end, 5)],
+                    "internal_pause_predecessor_span": ([edge.start, edge.end] if edge else None),
+                    "local_identity_audit": {"span": [proposed.start, proposed.end], "passed": True,
+                                             "method": "char_va_local_parts_plus_whole_verifier"},
+                })
+                if exclusion is not None:
+                    replacement.diagnostics.update(exclusion)
+                used_edge = edge
+                break
+
+            accepted_turns.remove(candidate)
+            candidate.reject_reason = "内部停顿后短音支持其他人物，原混合片段已撤回"
+            rejected.append(candidate)
+            if replacement is None:
+                withheld += 1
+                continue
+            accepted_turns.append(replacement)
+            if used_edge is not None:
+                rejected[:] = [item for item in rejected if item is not used_edge]
+            rejected.append(CandidateSentence(
+                gap_end, candidate.end, "",
+                reject_reason="内部停顿后短音支持其他人物，未并入目标句",
+                diagnostics={"internal_pause_tail_other_supported": True,
+                             "parent_span": [candidate.start, candidate.end]},
+            ))
+            replaced += 1
+        accepted_turns.sort(key=lambda item: (item.start, item.end))
+        return replaced, withheld
+
+    def _experimental_rescue_adjacent_domain_sides(
+        self,
+        accepted_turns: list[CandidateSentence],
+        rejected: list[CandidateSentence],
+        verifier: DualSpeakerVerifier,
+        profile: SpeakerMatchProfile,
+        stem_waveform: torch.Tensor,
+        stem_path: Path,
+        raw_path: Path,
+        threshold: float,
+        target_reference_clips: list[Path],
+        raw_reference_clips: list[Path],
+        negative_reference_clips: list[list[Path]],
+        raw_negative_reference_clips: list[list[Path]],
+        exclusion_profiles: list[ExclusionSpeakerProfile],
+        blocked_spans: Iterable[TimeSpan],
+        vad_spans: list[TimeSpan],
+    ) -> int:
+        """Research-only recovery of a rejected side next to an audited core.
+
+        The former's identity is checked on its *own exact audio*. Neither the
+        core nor the high-scoring concatenation can lend it target identity.
+        Multiscale changes, singing/overlap and final exclusion still veto.
+        """
+        if (not negative_reference_clips or self._raw_target_waveform is None
+                or verifier.secondary is None):
+            return 0
+        from tempfile import TemporaryDirectory
+        from .anime_identity import AnimeDomainWitness
+
+        edges = [
+            item for item in rejected
+            if item.reject_reason == "声纹匹配不足"
+            and item.duration >= 0.85
+            and not item.diagnostics.get("excluded_role_rejected")
+            and not item.diagnostics.get("structural_hard_reject")
+        ]
+        pairs: list[tuple[CandidateSentence, CandidateSentence, TimeSpan]] = []
+        queued: set[tuple[int, int]] = set()
+
+        def queue_adjacent_edges(core: CandidateSentence) -> None:
+            if not self._install_acoustic_identity_certificate(core):
+                return
+            for edge in edges:
+                gap = (core.start - edge.end if edge.end <= core.start
+                       else edge.start - core.end if core.end <= edge.start
+                       else -1.0)
+                if not 0 <= gap <= self.options.silence_split_seconds:
+                    continue
+                proposed = TimeSpan(min(core.start, edge.start),
+                                    max(core.end, edge.end))
+                if proposed.duration > min(20.0, self.options.max_sentence_seconds):
+                    continue
+                key = (id(core), id(edge))
+                if key in queued:
+                    continue
+                queued.add(key)
+                pairs.append((core, edge, proposed))
+
+        for core in tuple(accepted_turns):
+            queue_adjacent_edges(core)
+        if not pairs:
+            return 0
+        models_root = ASSET_ROOT / "models"
+        if not all((models_root / name).is_file() for name in (
+            "anime-speaker-char/anime_speaker_char_ecapa.onnx",
+            "anime-speaker-va/anime_speaker_va_ecapa.onnx",
+        )):
+            return 0
+        witness = AnimeDomainWitness(
+            models_root, target_reference_clips, raw_reference_clips,
+            negative_reference_clips, raw_negative_reference_clips,
+        )
+        splitter = LocalSpeakerTurnSplitter(
+            verifier.primary, secondary=verifier.secondary,
+        )
+        raw_waveform = self._raw_target_waveform
+        forbidden = tuple(blocked_spans)
+        rescued = 0
+        with TemporaryDirectory(prefix="adjacent_domain_", dir=WORK_ROOT) as directory:
+            temporary = Path(directory)
+            for pair_index, (core, edge, proposed) in enumerate(pairs, 1):
+                if core not in accepted_turns or edge not in rejected:
+                    continue
+                # A whole-span embedding can hide a third short voice.  Do
+                # not join across speech in the *gap* between two independently
+                # checked sides. Rejections wholly inside the audited core may
+                # be alternate proposals, not a third physical speech island.
+                gap = (TimeSpan(edge.end, core.start) if edge.end <= core.start
+                       else TimeSpan(core.end, edge.start))
+                if any(
+                    min(gap.end, island.end) - max(gap.start, island.start) > 0.03
+                    for island in vad_spans
+                ):
+                    continue
+                if any(
+                    item is not edge and item.reject_reason
+                    and min(gap.end, item.end)
+                    - max(gap.start, item.start) > 0.03
+                    for item in rejected
+                ):
+                    continue
+                if any(
+                    min(proposed.end, block.end)
+                    - max(proposed.start, block.start) > 0.01
+                    for block in forbidden
+                ):
+                    continue
+                if any(
+                    item is not core and
+                    min(proposed.end, item.end)
+                    - max(proposed.start, item.start) > 0.10
+                    for item in accepted_turns
+                ):
+                    continue
+                if any(
+                    item is not edge
+                    and (item.diagnostics.get("excluded_role_rejected")
+                         or item.diagnostics.get("structural_hard_reject")
+                         or item.reject_reason in ("检测到有人唱歌", "检测到多人同时发声"))
+                    and min(proposed.end, item.end)
+                    - max(proposed.start, item.start) > 0.01
+                    for item in rejected
+                ):
+                    continue
+                try:
+                    side_states = tuple(
+                        witness.score(
+                            self._waveform_span(stem_waveform, part),
+                            self._waveform_span(raw_waveform, part),
+                        ).state
+                        for part in (
+                            TimeSpan(edge.start, edge.end),
+                            TimeSpan(core.start, core.end),
+                        )
+                    )
+                except ValueError as error:
+                    if str(error) not in (
+                        "Silent audio cannot provide speaker identity evidence",
+                        "Expected at least 0.2 s of finite mono audio at 16 kHz",
+                    ):
+                        raise
+                    continue
+                if side_states != ("target_supported", "target_supported"):
+                    continue
+                match = self._verify_speaker_span(
+                    verifier, stem_waveform, proposed, profile, threshold,
+                    audit_raw=True,
+                )
+                if not match.accepted:
+                    continue
+                exclusion = verifier.exclusion_audit(
+                    match, profile, exclusion_profiles,
+                )
+                if exclusion and exclusion.get("excluded_role_rejected"):
+                    continue
+                stem_clip = temporary / f"{pair_index:04d}_stem.wav"
+                raw_clip = temporary / f"{pair_index:04d}_raw.wav"
+                write_clip(stem_path, stem_clip, proposed.start, proposed.end,
+                           sample_rate=16000)
+                write_clip(raw_path, raw_clip, proposed.start, proposed.end,
+                           sample_rate=16000)
+                local_span = [TimeSpan(0.0, proposed.duration)]
+                if (splitter.detect_multiscale_speaker_boundaries(stem_clip, local_span)
+                        or splitter.detect_multiscale_speaker_boundaries(raw_clip, local_span)):
+                    continue
+                merged = CandidateSentence(proposed.start, proposed.end, "")
+                self._apply_speaker_match(merged, match, profile, threshold)
+                merged.diagnostics.update({
+                    "experimental_adjacent_domain_rescue": True,
+                    "rescued_side_span": [edge.start, edge.end],
+                    "audited_core_span": [core.start, core.end],
+                    "local_identity_audit": {
+                        "span": [proposed.start, proposed.end],
+                        "passed": True,
+                        "method": "char_va_both_sides_plus_multiscale_change_review",
+                    },
+                    "speech_ratio": round(
+                        speech_ratio(vad_spans, proposed.start, proposed.end), 5,
+                    ),
+                })
+                merged.diagnostics["speech_seconds"] = round(
+                    merged.duration * merged.diagnostics["speech_ratio"], 5,
+                )
+                if exclusion is not None:
+                    merged.diagnostics.update(exclusion)
+                accepted_turns.remove(core)
+                accepted_turns.append(merged)
+                rejected.remove(edge)
+                rescued += 1
+                queue_adjacent_edges(merged)
+        accepted_turns.sort(key=lambda item: (item.start, item.end))
+        return rescued
 
     @staticmethod
     def _stt_fragment_identity_veto(
@@ -624,9 +1382,259 @@ class ExtractionPipeline:
         if (isinstance(audit, dict) and audit.get("passed") is True
                 and audit.get("span") == [candidate.start, candidate.end]):
             return None
+        acoustic_audit = diagnostics.get("acoustic_identity_audit", {})
+        if (isinstance(acoustic_audit, dict)
+                and acoustic_audit.get("passed") is True
+                and acoustic_audit.get("span") == [candidate.start, candidate.end]):
+            return None
         if fragment_count < 2 or diagnostics.get("post_target_silence_merge"):
             return None
         return "local_identity_unverified"
+
+    @staticmethod
+    def _install_acoustic_identity_certificate(candidate: CandidateSentence) -> bool:
+        """Certify an exact pre-STT span after the acoustic gates have run.
+
+        STT may return multiple text chunks for one clean utterance.  This
+        certificate is deliberately narrower than a generic speaker match: it
+        is issued only by paths that performed a final local/boundary audit and
+        have no unresolved change or exclusion evidence.  It never expands a
+        candidate or treats transcript segmentation as speaker evidence.
+        """
+        diagnostics = candidate.diagnostics
+        hard_vetoes = (
+            "structural_hard_reject",
+            "excluded_role_rejected",
+            "final_same_speaker_internal_discard",
+            "final_identity_boundary_discard",
+            "multi_model_anchor_decisive_boundary",
+        )
+        if any(diagnostics.get(key) for key in hard_vetoes):
+            return False
+        if diagnostics.get("boundary_suppressed_recovery"):
+            return False
+        existing = diagnostics.get("local_identity_audit")
+        if (isinstance(existing, dict) and existing.get("passed") is True
+                and existing.get("span") == [candidate.start, candidate.end]):
+            return True
+
+        method: str | None = None
+        if diagnostics.get("post_target_silence_merge"):
+            method = "verified_target_silence_merge"
+        elif diagnostics.get("final_identity_boundary_crop"):
+            method = "verified_identity_boundary_crop"
+        elif diagnostics.get("target_locator_recovery"):
+            # Locator recovery is accepted here only when the whole exact span
+            # passed the formal verifier and the local scan did not produce an
+            # unresolved boundary-suppressed candidate.
+            if (
+                float(diagnostics.get("target_coverage", 0.0)) >= 0.80
+                and float(diagnostics.get("speech_ratio", 0.0)) >= 0.80
+            ):
+                method = "target_locator_full_span_acoustic_review"
+        elif diagnostics.get("local_boundary_recovery") and not diagnostics.get(
+            "local_edge_only"
+        ):
+            # A recovery part bounded by confirmed change cuts and verified on
+            # its own exact audio has completed the local/boundary audit. Its
+            # recorded evidence must cover exactly this span and contain no
+            # unresolved or exclusion state.
+            all_entries = [
+                entry
+                for entry in diagnostics.get("local_identity_evidence") or []
+                if isinstance(entry, dict)
+            ]
+            target_entries = [
+                entry
+                for entry in all_entries
+                if entry.get("state") == "target"
+                and isinstance(entry.get("span"), (list, tuple))
+                and len(entry["span"]) == 2
+            ]
+            if target_entries and len(target_entries) == len(all_entries):
+                start = min(float(entry["span"][0]) for entry in target_entries)
+                end = max(float(entry["span"][1]) for entry in target_entries)
+                if (
+                    start >= candidate.start - 0.02
+                    and start <= candidate.start + 0.02
+                    and end >= candidate.end - 0.02
+                    and end <= candidate.end + 0.02
+                ):
+                    method = "verified_boundary_part"
+        elif diagnostics.get("boundary_audit") == "clean":
+            method = "clean_local_boundary_audit"
+
+        if method is None:
+            return False
+        diagnostics["acoustic_identity_audit"] = {
+            "span": [candidate.start, candidate.end],
+            "passed": True,
+            "method": method,
+        }
+        return True
+
+    def _attach_verified_fallbacks(
+        self,
+        evicting: CandidateSentence,
+        evicted: Iterable[CandidateSentence],
+    ) -> None:
+        """Remember verified spans that a wider accepted candidate replaces.
+
+        The wider candidate takes over export duty, but if it later fails the
+        final multi-fragment review, the exact spans that already passed the
+        acoustic gates must not be lost with it.  Anchors are kept alive so
+        id()-keyed registry entries cannot be reused by other objects.
+        """
+        items = [item for item in evicted if item is not evicting]
+        if not items:
+            return
+        self._verified_fallback_anchors.append(evicting)
+        bucket = self._verified_fallback_registry.setdefault(id(evicting), [])
+        for item in items:
+            if all(item is not existing for existing in bucket):
+                bucket.append(item)
+
+    def _collect_verified_fallbacks(
+        self,
+        accepted_turns: list[CandidateSentence],
+    ) -> int:
+        """Queue evicted verified sub-spans as independent pre-STT turns.
+
+        Each fallback is transcribed on its own exact interval.  It is only
+        exported when its wider parent is withheld; the post-STT dedup removes
+        it when the parent survives, so this never duplicates an export.
+        """
+        if not self._verified_fallback_registry:
+            return 0
+        added = 0
+        accepted_ids = {id(candidate) for candidate in accepted_turns}
+        worklist: list[tuple[CandidateSentence, CandidateSentence, frozenset[int]]] = [
+            (candidate, candidate, frozenset({id(candidate)}))
+            for candidate in accepted_turns
+        ]
+        # Parents withheld after registration (e.g. by the final island
+        # consensus) stay in the rejected ledger.  Their verified sub-spans
+        # are exactly the children the consensus wants to keep, so they must
+        # not be lost together with the parent.  Anchors are scan sources
+        # only: they must not occupy the seen set, or the normal eviction
+        # chain would lose its ancestor context.
+        for anchor in self._verified_fallback_anchors:
+            if id(anchor) not in accepted_ids:
+                worklist.append((anchor, anchor, frozenset({id(anchor)})))
+        seen = set(accepted_ids)
+        index = 0
+        while index < len(worklist):
+            parent, source, chain = worklist[index]
+            index += 1
+            for evicted in self._verified_fallback_registry.get(id(source), []):
+                if id(evicted) in seen:
+                    continue
+                if id(source) not in accepted_ids and not (
+                    evicted.start >= source.start + 0.05
+                    or evicted.end <= source.end - 0.05
+                ):
+                    # The withheld parent's final-review evidence covers this
+                    # exact audio; only a genuinely narrower verified child
+                    # may survive it.
+                    continue
+                # Overlap with the candidate's own eviction chain is expected
+                # (each fallback sits inside the parent it backs up).  Only
+                # unrelated accepted turns may veto the rescue.
+                if any(
+                    min(evicted.end, existing.end)
+                    - max(evicted.start, existing.start) > 0.10
+                    and id(existing) not in chain
+                    for existing in accepted_turns
+                ):
+                    continue
+                fallback = CandidateSentence(evicted.start, evicted.end, "")
+                fallback.speaker_score = evicted.speaker_score
+                fallback.window_min_score = evicted.window_min_score
+                fallback.window_p20_score = evicted.window_p20_score
+                fallback.speaker_vote_ratio = evicted.speaker_vote_ratio
+                fallback.window_vote_ratio = evicted.window_vote_ratio
+                fallback.speaker_threshold = evicted.speaker_threshold
+                fallback.overlap_score = evicted.overlap_score
+                fallback.singing_score = evicted.singing_score
+                fallback.speech_score = evicted.speech_score
+                fallback.diagnostics = dict(evicted.diagnostics)
+                fallback.diagnostics["verified_subspan_fallback"] = True
+                fallback.diagnostics["fallback_parent_span"] = [
+                    parent.start,
+                    parent.end,
+                ]
+                accepted_turns.append(fallback)
+                seen.add(id(fallback))
+                worklist.append(
+                    (
+                        fallback,
+                        evicted,
+                        chain | {id(fallback), id(evicted)},
+                    )
+                )
+                added += 1
+        return added
+
+    @staticmethod
+    def _dedup_verified_fallback_exports(
+        accepted: list[CandidateSentence],
+        rejected: list[CandidateSentence],
+    ) -> int:
+        """Keep a fallback export only when its wider parent was withheld."""
+        kept: list[CandidateSentence] = []
+        removed = 0
+        for sentence in accepted:
+            if sentence.diagnostics.get("verified_subspan_fallback"):
+                parent_start, parent_end = (
+                    sentence.diagnostics.get("fallback_parent_span")
+                    or [sentence.start, sentence.end]
+                )
+                parent_alive = any(
+                    existing is not sentence
+                    and not existing.diagnostics.get("verified_subspan_fallback")
+                    and existing.start <= float(parent_start) + 0.25
+                    and existing.end >= float(parent_end) - 0.25
+                    for existing in accepted
+                )
+                if parent_alive:
+                    sentence.accepted = False
+                    sentence.reject_reason = "完整父回合已通过复核，后备子回合不再重复导出"
+                    rejected.append(sentence)
+                    removed += 1
+                    continue
+            kept.append(sentence)
+        if removed:
+            accepted[:] = kept
+        return removed
+
+    @staticmethod
+    def _apply_user_marked_exclusions(
+        accepted_turns: list[CandidateSentence],
+        rejected: list[CandidateSentence],
+        excluded_spans: Iterable[TimeSpan],
+    ) -> int:
+        """Delete accepted turns that overlap spans the user marked as wrong.
+
+        The marks are user input for the current request (like the reference
+        audio). They are applied as one final gate after every recovery and
+        review path, so nothing overlapping a marked span can reach STT.
+        """
+        spans = [span for span in excluded_spans if span.end > span.start]
+        if not spans:
+            return 0
+        removed = 0
+        for candidate in list(accepted_turns):
+            if any(
+                min(candidate.end, span.end) - max(candidate.start, span.start)
+                > 0.05
+                for span in spans
+            ):
+                accepted_turns.remove(candidate)
+                candidate.reject_reason = "用户标记排除区间，已按标记删除"
+                candidate.diagnostics["user_marked_exclusion"] = True
+                rejected.append(candidate)
+                removed += 1
+        return removed
 
     @staticmethod
     def _wavlm_same_speaker_floor(profile) -> float:
@@ -1332,6 +2340,30 @@ class ExtractionPipeline:
         )
         if len(pool) < 2:
             return 0
+        # A single VAD island may still contain several speaker turns.  The
+        # island-wide join blocker is intentionally ignored when it encloses
+        # both selected parts, so separately rejected speech inside their gap
+        # must be represented explicitly or the final whole-span score can
+        # hide a brief third voice.
+        pool_ids = {id(candidate) for candidate in pool}
+        unselected_gap_speech: list[TimeSpan] = []
+        for previous, current in zip(pool, pool[1:]):
+            if current.start <= previous.end + 0.01:
+                continue
+            for candidate in rejected:
+                if (
+                    id(candidate) in pool_ids
+                    or candidate.reject_reason == "有效讲话不足或接近空段"
+                ):
+                    continue
+                if (
+                    min(candidate.end, current.start)
+                    - max(candidate.start, previous.end)
+                    > 0.01
+                ):
+                    unselected_gap_speech.append(
+                        TimeSpan(candidate.start, candidate.end)
+                    )
         merged_spans = self._merge_short_silence_same_speaker(
             [TimeSpan(candidate.start, candidate.end) for candidate in pool],
             verifier,
@@ -1339,7 +2371,8 @@ class ExtractionPipeline:
             waveform,
             progress,
             maximum_silence_seconds=self.options.silence_split_seconds,
-            forbidden_joins=forbidden_joins,
+            forbidden_joins=[*forbidden_joins, *unselected_gap_speech],
+            strict_flags=[id(candidate) in accepted_ids for candidate in pool],
         )
 
         output: list[CandidateSentence] = []
@@ -1579,6 +2612,10 @@ class ExtractionPipeline:
         progress: ProgressCallback,
         recovery_index: int,
         recovery_count: int,
+        *,
+        scored_parts: list[
+            tuple[TimeSpan, CandidateSentence, SpeakerMatchDecision | None]
+        ] | None = None,
     ) -> tuple[list[tuple[CandidateSentence, SpeakerMatchDecision]], list[CandidateSentence]] | None:
         """Split a suspicious turn at every confirmed boundary and rescore it.
 
@@ -1671,6 +2708,19 @@ class ExtractionPipeline:
                 f"局部换人复核 {recovery_index}/{recovery_count}，"
                 f"片段 {part_index}/{len(parts)}",
             )
+            # Keep scoped evidence independently of later candidate replacement.
+            # A failed target match is unresolved, not proof of another person.
+            candidate.diagnostics["local_identity_evidence"] = [{
+                "span": [part.start, part.end],
+                "state": (
+                    "other" if candidate.diagnostics.get("excluded_role_rejected")
+                    else "unresolved" if candidate.reject_reason else "target"
+                ),
+                "method": "boundary_part_verification",
+                "parent_span": [span.start, span.end],
+            }]
+            if scored_parts is not None:
+                scored_parts.append((part, candidate, match))
             if candidate.reject_reason:
                 rejected.append(candidate)
             else:
@@ -1702,6 +2752,7 @@ class ExtractionPipeline:
                 profile,
                 threshold,
             )
+            joined_candidate: CandidateSentence | None = None
             joined_exclusion = verifier.exclusion_audit(
                 joined_match,
                 profile,
@@ -1727,22 +2778,37 @@ class ExtractionPipeline:
                 joined_exclusion
                 and joined_exclusion.get("excluded_role_rejected")
             ):
-                joined = CandidateSentence(joined_span.start, joined_span.end, "")
-                self._apply_speaker_match(joined, joined_match, profile, threshold)
-                joined.diagnostics.update(
+                joined_candidate = CandidateSentence(
+                    joined_span.start, joined_span.end, ""
+                )
+                self._apply_speaker_match(
+                    joined_candidate, joined_match, profile, threshold
+                )
+                joined_candidate.diagnostics.update(
                     {
                         "local_boundary_recovery": True,
                         "original_turn_start": span.start,
                         "original_turn_end": span.end,
                         "local_target_parts_merged": len(group),
                         "recovery_boundaries": candidates,
+                        "local_identity_evidence": [
+                            evidence for item, _match in group
+                            for evidence in item.diagnostics["local_identity_evidence"]
+                        ],
                     }
                 )
                 if joined_exclusion is not None:
-                    joined.diagnostics.update(joined_exclusion)
-                merged_accepted.append((joined, joined_match))
+                    joined_candidate.diagnostics.update(joined_exclusion)
+                merged_accepted.append((joined_candidate, joined_match))
             else:
                 merged_accepted.extend(group)
+
+            if scored_parts is not None and joined_candidate is not None:
+                # The merged sentence is the candidate that later recovery
+                # stages should use as a domain-matched anchor. Keep its
+                # independently rescored match instead of forcing those
+                # stages to use the original mixed parent turn.
+                scored_parts.append((joined_span, joined_candidate, joined_match))
         accepted = merged_accepted
 
         if not accepted:
@@ -1756,7 +2822,9 @@ class ExtractionPipeline:
                     "recovery_boundaries": candidates,
                 }
             )
-            return [], [discarded]
+            # The parent summary cannot replace its local evidence. A later
+            # recovery may overlap only one of these parts.
+            return [], [*rejected, discarded]
         return accepted, rejected
 
     @staticmethod
@@ -2744,6 +3812,7 @@ class ExtractionPipeline:
                 - max(candidate.start, existing.start)
                 > 0.10
             ]
+            self._attach_verified_fallbacks(candidate, overlapping)
             for existing in overlapping:
                 accepted_turns.remove(existing)
             candidate.reject_reason = ""
@@ -3203,14 +4272,30 @@ class ExtractionPipeline:
 
             progress(0.40, "UVR 完成：按每一段静音检测最小讲话片段")
             vad_tools = FunASRTools(self.device)
+            # Run original-channel VAD on the same 16 kHz mono timeline used
+            # by the independent scene adapter. Direct VAD on the 44.1 kHz
+            # stereo source can conceal short internal pauses.
+            raw_vad_target = None
+            if not self.options.export_all_sentences:
+                raw_vad_target = normalize_audio(
+                    target_for_separator, paths["raw_vad_target"],
+                    sample_rate=16000, stereo=False,
+                )
+                trim_audio_in_place(raw_vad_target, target_duration)
             vad_map = vad_tools.vad_many(
                 [
                     *reference_stems,
                     *(item for group in negative_stem_groups for item in group),
                     stem,
+                    *([raw_vad_target] if raw_vad_target is not None else []),
                 ],
                 progress=lambda value, message: progress(0.40 + 0.08 * value, message),
             )
+            raw_target_vad = (
+                list(vad_map.get(raw_vad_target, []))
+                if raw_vad_target is not None else []
+            )
+            self._trace_spans("raw_initial_vad", raw_target_vad)
             self._trace_spans("initial_vad", vad_map.get(stem, []))
             if self._subtitle_guide is not None:
                 guide = self._subtitle_guide
@@ -3310,6 +4395,8 @@ class ExtractionPipeline:
                     transcript,
                 )
 
+            self._verified_fallback_registry = {}
+            self._verified_fallback_anchors = []
             accepted_turns: list[CandidateSentence] = []
             rejected: list[CandidateSentence] = []
             overlap_detector = OverlapDetector() if self.options.use_overlap_detector else None
@@ -3617,6 +4704,14 @@ class ExtractionPipeline:
                     progress=lambda value, message: progress(0.70 + 0.03 * value, message),
                 )
                 self._trace_spans("target_locator_proposals", target_spans)
+                raw_vad_subturns = propose_raw_vad_subturns(
+                    split_result,
+                    raw_target_vad,
+                    target_spans,
+                    minimum_gap_seconds=self.options.silence_min_seconds,
+                    minimum_candidate_seconds=self.options.min_sentence_seconds,
+                )
+                self._trace_spans("raw_vad_subturn_proposals", raw_vad_subturns)
                 progress(0.73, f"换人切分完成：得到 {len(split_result)} 个独立说话回合")
                 effective_threshold = max(
                     self.options.speaker_threshold,
@@ -3710,6 +4805,9 @@ class ExtractionPipeline:
 
                 recovery_lookup = {id(candidate): index for index, (_span, candidate, _match) in enumerate(recovery_turns, start=1)}
                 local_exclusion_spans: list[TimeSpan] = []
+                recovery_scored_parts: list[
+                    tuple[TimeSpan, CandidateSentence, SpeakerMatchDecision | None]
+                ] = []
                 for span, candidate, match in scored_turns:
                     recovery_index = recovery_lookup.get(id(candidate))
                     if recovery_index is not None and match is not None:
@@ -3729,6 +4827,7 @@ class ExtractionPipeline:
                             progress,
                             recovery_index,
                             len(recovery_turns),
+                            scored_parts=recovery_scored_parts,
                         )
                         if recovered is not None:
                             accepted_candidates, discarded = recovered
@@ -3788,6 +4887,13 @@ class ExtractionPipeline:
                     else:
                         accepted_turns.append(candidate)
 
+                if recovery_scored_parts:
+                    # Local rescoring is evidence for the exact subspan. Make
+                    # it visible to later multi-model recovery and boundary
+                    # repair; the original parent remains in the ledger for
+                    # auditability but is never used as a substitute.
+                    scored_turns.extend(recovery_scored_parts)
+
                 def install_recovered_target(candidate: CandidateSentence) -> bool:
                     overlapping = [
                         existing
@@ -3802,6 +4908,7 @@ class ExtractionPipeline:
                         for existing in overlapping
                     ):
                         return False
+                    self._attach_verified_fallbacks(candidate, overlapping)
                     for existing in overlapping:
                         accepted_turns.remove(existing)
                     accepted_turns.append(candidate)
@@ -3913,10 +5020,15 @@ class ExtractionPipeline:
                 locator_bases = sorted(
                     {
                         (round(item.start, 5), round(item.end, 5)): item
-                        for item in [*raw_locator_bases, *locator_bases]
+                        for item in [*raw_locator_bases, *locator_bases,
+                                     *raw_vad_subturns]
                     }.values(),
                     key=lambda item: (item.start, item.duration),
                 )
+                raw_vad_subturn_keys = {
+                    (round(item.start, 5), round(item.end, 5))
+                    for item in raw_vad_subturns
+                }
                 locator_recovered = 0
                 locator_rejected: list[
                     tuple[TimeSpan, SpeakerMatchDecision, float]
@@ -4046,6 +5158,9 @@ class ExtractionPipeline:
                     recovered_candidate.diagnostics.update(
                         {
                             "target_locator_recovery": True,
+                            "raw_vad_subturn_proposal": (
+                                base_key in raw_vad_subturn_keys
+                            ),
                             "tertiary_locator_recovery": (
                                 recovered_match.tier == "tertiary"
                             ),
@@ -4305,6 +5420,23 @@ class ExtractionPipeline:
                             TimeSpan(candidate.start, candidate.end),
                             profile,
                             effective_threshold,
+                            audit_raw=True,
+                        )
+                        # Keep this final review separate from the candidate's
+                        # earlier verification fields.  The original match may
+                        # legitimately have skipped raw inference, while the
+                        # final exclusion review explicitly requested it.
+                        candidate.diagnostics.update(
+                            {
+                                "final_exclusion_raw_audit_requested": True,
+                                "final_exclusion_raw_available": bool(
+                                    audit_match.raw_primary is not None
+                                    and audit_match.raw_secondary is not None
+                                ),
+                                "final_exclusion_raw_channel_skipped": bool(
+                                    audit_match.diagnostics.get("raw_channel_skipped", False)
+                                ),
+                            }
                         )
                         exclusion = verifier.exclusion_audit(
                             audit_match,
@@ -4331,6 +5463,30 @@ class ExtractionPipeline:
                         )
                     accepted_turns = retained_turns
 
+                # Reassemble a short post-pause tail before final boundary
+                # repair.  Boundary repair may crop an already mixed parent;
+                # running this afterward would make the tail invisible and
+                # leave STT with an uncertified partial span.
+                if self.options.experimental_internal_reassembly:
+                    repaired, withheld = self._experimental_reassemble_internal_other_tails(
+                        accepted_turns,
+                        rejected,
+                        verifier,
+                        profile,
+                        target_waveform,
+                        effective_threshold,
+                        reference_clips,
+                        raw_reference_clips,
+                        negative_reference_clips,
+                        raw_negative_reference_clips,
+                        exclusion_profiles,
+                        blocked_join_spans,
+                    )
+                    progress(
+                        0.80,
+                        f"实验性内部停顿复核：重组 {repaired} 段，保守撤回 {withheld} 段",
+                    )
+
                 boundary_expanded, boundary_cropped = (
                     self._repair_final_sentence_boundaries(
                         accepted_turns,
@@ -4354,12 +5510,107 @@ class ExtractionPipeline:
                         f"补全 {boundary_expanded} 段，裁切 {boundary_cropped} 段",
                     )
 
+                if self.options.experimental_adjacent_domain_rescue:
+                    adjacent_rescued = self._experimental_rescue_adjacent_domain_sides(
+                        accepted_turns,
+                        rejected,
+                        verifier,
+                        profile,
+                        target_waveform,
+                        stem,
+                        target_normalized,
+                        effective_threshold,
+                        reference_clips,
+                        raw_reference_clips,
+                        negative_reference_clips,
+                        raw_negative_reference_clips,
+                        exclusion_profiles,
+                        [*blocked_join_spans, *pre_singing_spans,
+                         *residual_singing, *overlap_evidence],
+                        vad_spans,
+                    )
+                    progress(
+                        0.80,
+                        f"实验性邻接目标回合复核：恢复 {adjacent_rescued} 段",
+                    )
+
                 if self._subtitle_guide is not None and self._subtitle_guide.aligned:
                     restore_subtitle_sentences(
                         self, self._subtitle_guide, accepted_turns, rejected,
                         clean_atomic_spans, blocked_join_spans, verifier, profile,
                         stem, target_waveform, exclusion_profiles, effective_threshold,
                         progress=lambda _v, message: progress(0.80, message),
+                    )
+                # Subtitle completion and the late rescue paths run after the
+                # first short-silence merge, so their independently verified
+                # turns never saw the join.  Re-apply the same merge under the
+                # same guards; strict pairs join without the fragment floor and
+                # the joined span must still pass formal verification.
+                post_completion_merges = self._merge_verified_target_turns(
+                    accepted_turns,
+                    rejected,
+                    verifier,
+                    profile,
+                    target_waveform,
+                    effective_threshold,
+                    target_spans,
+                    vad_spans,
+                    [*blocked_join_spans, *clean_atomic_spans],
+                    progress=lambda value, message: progress(
+                        0.80 + 0.005 * value,
+                        message,
+                    ),
+                )
+                if post_completion_merges:
+                    progress(
+                        0.80,
+                        f"补全后短静音合并：形成 {post_completion_merges} 个完整句",
+                    )
+                if self.options.experimental_final_island_consensus:
+                    withheld, rescued = self._experimental_audit_final_islands(
+                        accepted_turns, rejected, verifier, profile,
+                        target_waveform, stem, target_normalized,
+                        effective_threshold,
+                        reference_clips, raw_reference_clips,
+                        negative_reference_clips, raw_negative_reference_clips,
+                        exclusion_profiles,
+                        [*blocked_join_spans, *pre_singing_spans,
+                         *residual_singing, *overlap_evidence],
+                        progress,
+                    )
+                    progress(
+                        0.80,
+                        "实验性局部身份终审："
+                        f"撤回 {withheld} 个混合/身份未决父句，复核保留 {rescued} 个子句",
+                    )
+                fallback_added = self._collect_verified_fallbacks(accepted_turns)
+                if fallback_added:
+                    progress(
+                        0.80,
+                        f"已验证子回合后备：登记 {fallback_added} 段，"
+                        "父回合未通过最终复核时保留已验证核心",
+                    )
+                excluded_marked = self._apply_user_marked_exclusions(
+                    accepted_turns,
+                    rejected,
+                    (
+                        TimeSpan(start, end)
+                        for start, end in self.options.user_excluded_spans
+                    ),
+                )
+                if excluded_marked:
+                    progress(
+                        0.80,
+                        f"用户标记排除：删除 {excluded_marked} 个重叠回合",
+                    )
+                certified = sum(
+                    self._install_acoustic_identity_certificate(candidate)
+                    for candidate in accepted_turns
+                )
+                if certified:
+                    progress(
+                        0.80,
+                        f"最终声学身份证书：确认 {certified} 段，STT 不再按文本片段误删",
                     )
                 self._trace_spans("identity_accepted_before_stt", accepted_turns)
 
@@ -4455,6 +5706,16 @@ class ExtractionPipeline:
                         }
                     )
                     accepted.append(sentence)
+                fallback_deduped = self._dedup_verified_fallback_exports(
+                    accepted,
+                    rejected,
+                )
+                if fallback_deduped:
+                    progress(
+                        0.92,
+                        f"后备子回合去重：{fallback_deduped} 段由完整父回合覆盖，"
+                        "不重复导出",
+                    )
                 chinese_candidates = [candidate for candidate in accepted if candidate.language == "zh"]
                 if chinese_candidates:
                     chinese_paths: list[Path] = []
