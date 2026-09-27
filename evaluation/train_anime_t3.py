@@ -19,7 +19,7 @@ sys.path.insert(0, str(ROOT))
 
 from extractor.audio import load_mono  # noqa: E402
 
-BATCH = "20260927_182743_batch_b382e7"
+BATCH = "20260927_210928_batch_09de17"
 WORK = ROOT / "work" / f"{BATCH}_001"
 STEM = WORK / "stems" / "target_vocals.wav"
 
@@ -107,7 +107,16 @@ def main():
             pieces.append((cursor, a[1]))
         return pieces
 
+    # 2026-09-27 listening feedback on the rescued clips: 20/22 wrong person,
+    # 39 instrument sound (user clip numbers 20, 22, 39).  Remove them from
+    # the positives BEFORE computing any negatives, or the subtraction
+    # cancels the feedback spans themselves.
+    feedback_negatives = [(494.90, 496.90), (539.75, 542.98), (1146.17, 1148.11)]
+    positives = [span for span in positives if not any(
+        min(span[1], n[1]) - max(span[0], n[0]) > 0.10 for n in feedback_negatives
+    )]
     flagged_clean = [piece for span in flagged for piece in subtract(span, baseline_spans + positives)]
+    flagged_clean += [piece for span in feedback_negatives for piece in subtract(span, baseline_spans + positives)]
     print("flagged negative pieces after removing verified overlap:", len(flagged_clean))
 
     from transformers import Wav2Vec2FeatureExtractor, WavLMForXVector

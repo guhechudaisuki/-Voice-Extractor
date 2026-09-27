@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import io
 import json
 import logging
 import re
@@ -157,6 +158,7 @@ class ExtractionPipeline:
         self._stage_audit: dict | None = None
         self._verified_fallback_registry: dict[int, list[CandidateSentence]] = {}
         self._verified_fallback_anchors: list[CandidateSentence] = []
+        self._tail_scorer_cache: tuple | str | None = None
 
     def _trace_spans(
         self,
@@ -1607,33 +1609,119 @@ class ExtractionPipeline:
             accepted[:] = kept
         return removed
 
-    @staticmethod
     def _apply_user_marked_exclusions(
+        self,
         accepted_turns: list[CandidateSentence],
         rejected: list[CandidateSentence],
         excluded_spans: Iterable[TimeSpan],
+        verifier: DualSpeakerVerifier,
+        profile: SpeakerMatchProfile,
+        stem_waveform: torch.Tensor,
+        exclusion_profiles: list[ExclusionSpeakerProfile],
+        threshold: float,
     ) -> int:
-        """Delete accepted turns that overlap spans the user marked as wrong.
+        """Trim accepted turns at the spans the user marked as wrong.
 
-        The marks are user input for the current request (like the reference
-        audio). They are applied as one final gate after every recovery and
-        review path, so nothing overlapping a marked span can reach STT.
+        A turn overlapping a marked span keeps the part outside every mark
+        when that remainder independently passes the formal dual-model
+        verification and the exclusion audit; otherwise the whole turn is
+        deleted.  The marked part itself is never exported.
         """
         spans = [span for span in excluded_spans if span.end > span.start]
         if not spans:
             return 0
         removed = 0
         for candidate in list(accepted_turns):
-            if any(
-                min(candidate.end, span.end) - max(candidate.start, span.start)
-                > 0.05
-                for span in spans
+            span = TimeSpan(candidate.start, candidate.end)
+            if not any(
+                min(span.end, mark.end) - max(span.start, mark.start) > 0.05
+                for mark in spans
             ):
-                accepted_turns.remove(candidate)
-                candidate.reject_reason = "用户标记排除区间，已按标记删除"
-                candidate.diagnostics["user_marked_exclusion"] = True
-                rejected.append(candidate)
-                removed += 1
+                continue
+            pieces = [span]
+            for mark in spans:
+                nxt = []
+                for piece in pieces:
+                    if min(piece.end, mark.end) - max(piece.start, mark.start) <= 0.05:
+                        nxt.append(piece)
+                        continue
+                    if piece.start < mark.start - 0.05:
+                        nxt.append(TimeSpan(piece.start, mark.start))
+                    if mark.end < piece.end - 0.05:
+                        nxt.append(TimeSpan(mark.end, piece.end))
+                pieces = nxt
+            scorer_models = self._ensure_tail_scorer()
+            for piece in pieces:
+                if piece.duration < self.options.min_output_seconds:
+                    continue
+                match = self._verify_speaker_span(
+                    verifier, stem_waveform, piece, profile, threshold,
+                    audit_raw=True,
+                )
+                exclusion = verifier.exclusion_audit(
+                    match, profile, exclusion_profiles,
+                ) or {}
+                formal_ok = (
+                    match.accepted
+                    and not exclusion.get("excluded_role_rejected")
+                )
+                classifier_evidence = None
+                if not formal_ok and scorer_models is not None:
+                    encoder, processor, clf, cls_threshold, device = scorer_models
+                    wave = self._waveform_span(stem_waveform, piece)
+                    if wave.numel() >= int(0.5 * 16000):
+                        data = processor(
+                            wave.numpy(), sampling_rate=16000, return_tensors="pt"
+                        )
+                        enc = encoder.wavlm(
+                            data.input_values.to(device),
+                            output_hidden_states=encoder.config.use_weighted_layer_sum,
+                            return_dict=True,
+                        )
+                        if encoder.config.use_weighted_layer_sum:
+                            layers = torch.stack(enc.hidden_states, dim=1)
+                            weights = encoder.layer_weights.softmax(dim=0)[
+                                None, :, None, None
+                            ]
+                            frames = (layers * weights).sum(dim=1)
+                        else:
+                            frames = enc.last_hidden_state
+                        frames = encoder.projector(frames)
+                        for layer in encoder.tdnn:
+                            frames = layer(frames)
+                        frames = frames[0]
+                        pooled = torch.cat([
+                            frames.mean(dim=0), frames.max(dim=0).values,
+                            frames.std(dim=0),
+                        ])
+                        with torch.no_grad():
+                            mean_score = float(clf(pooled.to(device)).item())
+                        if mean_score >= cls_threshold:
+                            classifier_evidence = {
+                                "mean_score": round(mean_score, 3),
+                                "threshold": cls_threshold,
+                            }
+                if not formal_ok and classifier_evidence is None:
+                    continue
+                trimmed = CandidateSentence(piece.start, piece.end, "")
+                if formal_ok:
+                    self._apply_speaker_match(trimmed, match, profile, threshold)
+                else:
+                    trimmed.speaker_score = candidate.speaker_score
+                    trimmed.speaker_threshold = candidate.speaker_threshold
+                trimmed.diagnostics = dict(candidate.diagnostics)
+                trimmed.diagnostics["user_marked_trim"] = {
+                    "original_span": [span.start, span.end],
+                    "kept_span": [piece.start, piece.end],
+                    "verified": formal_ok,
+                    "classifier": classifier_evidence,
+                }
+                accepted_turns.append(trimmed)
+            accepted_turns.remove(candidate)
+            candidate.reject_reason = "用户标记排除区间，已按标记删除"
+            candidate.diagnostics["user_marked_exclusion"] = True
+            rejected.append(candidate)
+            removed += 1
         return removed
 
     def _extend_target_clip_over_tail_sliver(
@@ -1746,6 +1834,161 @@ class ExtractionPipeline:
                     rejected.remove(candidate)
             extended_count += 1
         return extended_count
+
+    def _ensure_tail_scorer(self) -> tuple | None:
+        """Load (once) the anime-domain classifier trained on user-verified
+        spans, together with its WavLM TDNN encoder. Returns None when the
+        optional asset is absent."""
+        cached = getattr(self, "_tail_scorer_cache", None)
+        if cached is not None:
+            return cached if cached != "missing" else None
+        classifier_path = ASSET_ROOT / "models" / "anime_t3" / "classifier.pt"
+        encoder_dir = ASSET_ROOT / "model" / "speaker" / "wavlm-base-plus-sv"
+        if not classifier_path.is_file() or not encoder_dir.is_dir():
+            self._tail_scorer_cache = "missing"
+            return None
+        from transformers import Wav2Vec2FeatureExtractor, WavLMForXVector
+
+        device = torch.device(self.device)
+        encoder = WavLMForXVector.from_pretrained(
+            str(encoder_dir), local_files_only=True
+        ).to(device).eval()
+        encoder.requires_grad_(False)
+        processor = Wav2Vec2FeatureExtractor.from_pretrained(
+            str(encoder_dir), local_files_only=True
+        )
+        payload = torch.load(
+            io.BytesIO(classifier_path.read_bytes()),
+            map_location="cpu",
+            weights_only=False,
+        )
+        clf = torch.nn.Sequential(
+            torch.nn.Linear(payload["input_dim"], 256),
+            torch.nn.ReLU(),
+            torch.nn.Linear(256, 1),
+        )
+        clf.load_state_dict(payload["state_dict"])
+        clf.to(device).eval()
+        self._tail_scorer_cache = (encoder, processor, clf, float(payload["threshold"]), device)
+        return self._tail_scorer_cache
+
+    def _classifier_target_rescue(
+        self,
+        accepted_turns: list[CandidateSentence],
+        rejected: list[CandidateSentence],
+        stem_waveform: torch.Tensor,
+        progress: ProgressCallback,
+        *,
+        scorer=None,
+        threshold: float | None = None,
+    ) -> int:
+        """Accept identity-gate rejects that the anime-domain classifier
+        confidently scores as the target speaker.
+
+        The classifier is trained only on user-verified spans; its vote is
+        additional evidence for fragments the four voiceprint models left
+        below threshold, never a replacement for the formal gates. Overlap-
+        and singing-blocked turns, structurally rejected turns and
+        user-marked spans stay excluded.
+        """
+        if scorer is None:
+            loaded = self._ensure_tail_scorer()
+            if loaded is None:
+                return 0
+            encoder, processor, clf, threshold, device = loaded
+
+            def scorer(span: TimeSpan, wave: torch.Tensor) -> float | None:
+                data = processor(wave.numpy(), sampling_rate=16000, return_tensors="pt")
+                enc = encoder.wavlm(
+                    data.input_values.to(device),
+                    output_hidden_states=encoder.config.use_weighted_layer_sum,
+                    return_dict=True,
+                )
+                if encoder.config.use_weighted_layer_sum:
+                    layers = torch.stack(enc.hidden_states, dim=1)
+                    weights = encoder.layer_weights.softmax(dim=0)[None, :, None, None]
+                    frames = (layers * weights).sum(dim=1)
+                else:
+                    frames = enc.last_hidden_state
+                frames = encoder.projector(frames)
+                for layer in encoder.tdnn:
+                    frames = layer(frames)
+                frames = frames[0]
+                pooled = torch.cat([
+                    frames.mean(dim=0), frames.max(dim=0).values, frames.std(dim=0),
+                ])
+                with torch.no_grad():
+                    return float(clf(pooled.to(device)).item())
+
+        sr = 16000
+        window = int(0.5 * sr)
+        hop = int(0.25 * sr)
+        excluded_spans = [
+            TimeSpan(start, end)
+            for start, end in self.options.user_excluded_spans
+        ]
+        accepted_count = 0
+        for candidate in list(rejected):
+            if candidate.reject_reason != "声纹匹配不足":
+                continue
+            if candidate.diagnostics.get("structural_hard_reject"):
+                continue
+            if candidate.diagnostics.get("excluded_role_rejected"):
+                continue
+            if not (
+                self.options.min_output_seconds
+                <= candidate.duration
+                <= self.options.max_sentence_seconds
+            ):
+                continue
+            span = TimeSpan(candidate.start, candidate.end)
+            if any(
+                min(span.end, excluded.end) - max(span.start, excluded.start) > 0.05
+                for excluded in excluded_spans
+            ):
+                continue
+            if any(
+                min(span.end, accepted.end) - max(span.start, accepted.start) > 0.10
+                for accepted in accepted_turns
+            ):
+                # Already covered by an accepted clip; exporting it again
+                # would duplicate half of an existing sentence.
+                continue
+            wave = self._waveform_span(stem_waveform, span)
+            if wave.numel() < window:
+                continue
+            scores = []
+            pos = 0
+            while pos + window <= wave.numel():
+                value = scorer(
+                    TimeSpan(span.start + pos / sr, span.start + (pos + window) / sr),
+                    wave[pos:pos + window],
+                )
+                if value is None:
+                    scores = []
+                    break
+                scores.append(value)
+                pos += hop
+            if not scores:
+                continue
+            mean_score = sum(scores) / len(scores)
+            if mean_score < threshold:
+                continue
+            candidate.reject_reason = ""
+            candidate.diagnostics["classifier_target_rescue"] = {
+                "mean_score": round(mean_score, 3),
+                "threshold": threshold,
+                "windows": len(scores),
+            }
+            accepted_turns.append(candidate)
+            rejected.remove(candidate)
+            accepted_count += 1
+        if accepted_count:
+            progress(
+                0.80,
+                f"分类器目标救援：恢复 {accepted_count} 段声纹不足碎片",
+            )
+        return accepted_count
 
     @staticmethod
     def _wavlm_same_speaker_floor(profile) -> float:
@@ -5637,6 +5880,18 @@ class ExtractionPipeline:
                         f"尾音延展：恢复 {tail_extended} 段贴边尾音",
                     )
 
+                classifier_rescued = self._classifier_target_rescue(
+                    accepted_turns,
+                    rejected,
+                    target_waveform,
+                    progress=lambda _value, message: progress(0.80, message),
+                )
+                if classifier_rescued:
+                    progress(
+                        0.80,
+                        f"分类器目标救援：恢复 {classifier_rescued} 段声纹不足碎片",
+                    )
+
                 if self.options.experimental_adjacent_domain_rescue:
                     adjacent_rescued = self._experimental_rescue_adjacent_domain_sides(
                         accepted_turns,
@@ -5724,11 +5979,16 @@ class ExtractionPipeline:
                         TimeSpan(start, end)
                         for start, end in self.options.user_excluded_spans
                     ),
+                    verifier,
+                    profile,
+                    target_waveform,
+                    exclusion_profiles,
+                    effective_threshold,
                 )
                 if excluded_marked:
                     progress(
                         0.80,
-                        f"用户标记排除：删除 {excluded_marked} 个重叠回合",
+                        f"用户标记排除：处理 {excluded_marked} 个重叠回合",
                     )
                 certified = sum(
                     self._install_acoustic_identity_certificate(candidate)
