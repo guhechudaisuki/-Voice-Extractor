@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 
-APP_VERSION = "2026.08.25-desktop-3"
+APP_VERSION = "2.00"
 APP_NAME = "Voice Extractor"
 CACHE_SCHEMA_VERSION = 1
 GLOBAL_SETTINGS = (
