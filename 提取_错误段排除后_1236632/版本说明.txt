@@ -1,6 +1,0 @@
-提取程序冻结：错误段排除版本（提取_错误段排除后_1236632）。
-对应输出：output/20260927_150901_batch_64a965.zip（24 段，用户标记的 9 个错误区间零残留）。
-源代码冻结提交：12366326fc494ed05f6d3d3bb9f84b1418ab073f（本副本由该提交 git archive 导出，共 237 个文件）。
-相对 提取_目标优化前_734bd07 的主要变化：局部身份终审默认开启；新增用户标记排除区间输入（--exclude-spans）；短静音合并占用修复；日语 STT 语言路由修复；已验证子回合后备机制。
-按用户要求未复制可复用且不再改动的内容：模型（model/ models/）、工作缓存（work/ 大部分）、versions/、京吹原片音频/ 均未包含，运行时经 voice_extractor_installation.json 使用主目录资源；复跑同一批次所需的请求与用户标记排除 JSON 在 work/desktop_requests/。
-启动：双击本目录里的 Start Voice Extractor.bat（已含 VOICE_EXTRACT_INSTALL_ROOT，与旧快照一致）。
