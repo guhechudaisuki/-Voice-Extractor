@@ -159,6 +159,9 @@ class ExtractionPipeline:
         self._verified_fallback_registry: dict[int, list[CandidateSentence]] = {}
         self._verified_fallback_anchors: list[CandidateSentence] = []
         self._tail_scorer_cache: tuple | str | None = None
+        self._reference_sha256: list[str] = []
+        self._local_identity_reject_threshold: float | None = None
+        self._local_identity_model_sha256 = ""
 
     def _trace_spans(
         self,
@@ -1627,6 +1630,8 @@ class ExtractionPipeline:
         verification and the exclusion audit; otherwise the whole turn is
         deleted.  The marked part itself is never exported.
         """
+        from copy import deepcopy
+
         spans = [span for span in excluded_spans if span.end > span.start]
         if not spans:
             return 0
@@ -1650,7 +1655,6 @@ class ExtractionPipeline:
                     if mark.end < piece.end - 0.05:
                         nxt.append(TimeSpan(mark.end, piece.end))
                 pieces = nxt
-            scorer_models = self._ensure_tail_scorer()
             for piece in pieces:
                 if piece.duration < self.options.min_output_seconds:
                     continue
@@ -1665,59 +1669,23 @@ class ExtractionPipeline:
                     match.accepted
                     and not exclusion.get("excluded_role_rejected")
                 )
-                classifier_evidence = None
-                if not formal_ok and scorer_models is not None:
-                    encoder, processor, clf, cls_threshold, device = scorer_models
-                    wave = self._waveform_span(stem_waveform, piece)
-                    if wave.numel() >= int(0.5 * 16000):
-                        data = processor(
-                            wave.numpy(), sampling_rate=16000, return_tensors="pt"
-                        )
-                        enc = encoder.wavlm(
-                            data.input_values.to(device),
-                            output_hidden_states=encoder.config.use_weighted_layer_sum,
-                            return_dict=True,
-                        )
-                        if encoder.config.use_weighted_layer_sum:
-                            layers = torch.stack(enc.hidden_states, dim=1)
-                            weights = encoder.layer_weights.softmax(dim=0)[
-                                None, :, None, None
-                            ]
-                            frames = (layers * weights).sum(dim=1)
-                        else:
-                            frames = enc.last_hidden_state
-                        frames = encoder.projector(frames)
-                        for layer in encoder.tdnn:
-                            frames = layer(frames)
-                        frames = frames[0]
-                        pooled = torch.cat([
-                            frames.mean(dim=0), frames.max(dim=0).values,
-                            frames.std(dim=0),
-                        ])
-                        with torch.no_grad():
-                            mean_score = float(clf(pooled.to(device)).item())
-                        if mean_score >= cls_threshold:
-                            classifier_evidence = {
-                                "mean_score": round(mean_score, 3),
-                                "threshold": cls_threshold,
-                            }
-                if not formal_ok and classifier_evidence is None:
+                if not formal_ok:
                     continue
                 trimmed = CandidateSentence(piece.start, piece.end, "")
-                if formal_ok:
-                    self._apply_speaker_match(trimmed, match, profile, threshold)
-                else:
-                    trimmed.speaker_score = candidate.speaker_score
-                    trimmed.speaker_threshold = candidate.speaker_threshold
-                trimmed.diagnostics = dict(candidate.diagnostics)
+                self._apply_speaker_match(trimmed, match, profile, threshold)
+                trimmed.diagnostics.update(exclusion)
                 trimmed.diagnostics["user_marked_trim"] = {
                     "original_span": [span.start, span.end],
                     "kept_span": [piece.start, piece.end],
                     "verified": formal_ok,
-                    "classifier": classifier_evidence,
+                    "provenance": {"diagnostics": deepcopy(candidate.diagnostics)},
                 }
                 accepted_turns.append(trimmed)
             accepted_turns.remove(candidate)
+            candidate.accepted = False
+            candidate.audio_file = ""
+            candidate.text_file = ""
+            candidate.video_file = ""
             candidate.reject_reason = "用户标记排除区间，已按标记删除"
             candidate.diagnostics["user_marked_exclusion"] = True
             rejected.append(candidate)
@@ -1843,10 +1811,30 @@ class ExtractionPipeline:
         if cached is not None:
             return cached if cached != "missing" else None
         classifier_path = ASSET_ROOT / "models" / "anime_t3" / "classifier.pt"
+        reviewed_path = classifier_path.with_name("classifier_v2.pt")
+        if reviewed_path.is_file():
+            classifier_path = reviewed_path
         encoder_dir = ASSET_ROOT / "model" / "speaker" / "wavlm-base-plus-sv"
         if not classifier_path.is_file() or not encoder_dir.is_dir():
             self._tail_scorer_cache = "missing"
             return None
+        payload = torch.load(
+            io.BytesIO(classifier_path.read_bytes()),
+            map_location="cpu",
+            weights_only=False,
+        )
+        if classifier_path == reviewed_path:
+            from .nextgen.features import file_digest
+
+            if (
+                payload.get("calibration_status") != "passed"
+                or not self._reference_sha256
+                or sorted(payload.get("reference_sha256", [])) != self._reference_sha256
+            ):
+                self._tail_scorer_cache = "missing"
+                return None
+            self._local_identity_reject_threshold = float(payload["reject_threshold"])
+            self._local_identity_model_sha256 = file_digest(classifier_path)
         from transformers import Wav2Vec2FeatureExtractor, WavLMForXVector
 
         device = torch.device(self.device)
@@ -1856,11 +1844,6 @@ class ExtractionPipeline:
         encoder.requires_grad_(False)
         processor = Wav2Vec2FeatureExtractor.from_pretrained(
             str(encoder_dir), local_files_only=True
-        )
-        payload = torch.load(
-            io.BytesIO(classifier_path.read_bytes()),
-            map_location="cpu",
-            weights_only=False,
         )
         clf = torch.nn.Sequential(
             torch.nn.Linear(payload["input_dim"], 256),
@@ -1895,34 +1878,17 @@ class ExtractionPipeline:
             loaded = self._ensure_tail_scorer()
             if loaded is None:
                 return 0
-            encoder, processor, clf, threshold, device = loaded
+            from .local_identity_classifier import score_window
+
+            threshold = loaded[3]
 
             def scorer(span: TimeSpan, wave: torch.Tensor) -> float | None:
-                data = processor(wave.numpy(), sampling_rate=16000, return_tensors="pt")
-                enc = encoder.wavlm(
-                    data.input_values.to(device),
-                    output_hidden_states=encoder.config.use_weighted_layer_sum,
-                    return_dict=True,
-                )
-                if encoder.config.use_weighted_layer_sum:
-                    layers = torch.stack(enc.hidden_states, dim=1)
-                    weights = encoder.layer_weights.softmax(dim=0)[None, :, None, None]
-                    frames = (layers * weights).sum(dim=1)
-                else:
-                    frames = enc.last_hidden_state
-                frames = encoder.projector(frames)
-                for layer in encoder.tdnn:
-                    frames = layer(frames)
-                frames = frames[0]
-                pooled = torch.cat([
-                    frames.mean(dim=0), frames.max(dim=0).values, frames.std(dim=0),
-                ])
-                with torch.no_grad():
-                    return float(clf(pooled.to(device)).item())
+                return score_window(loaded, wave)
+
+        from .local_identity_classifier import window_starts
 
         sr = 16000
         window = int(0.5 * sr)
-        hop = int(0.25 * sr)
         excluded_spans = [
             TimeSpan(start, end)
             for start, end in self.options.user_excluded_spans
@@ -1958,8 +1924,7 @@ class ExtractionPipeline:
             if wave.numel() < window:
                 continue
             scores = []
-            pos = 0
-            while pos + window <= wave.numel():
+            for pos in window_starts(wave.numel()):
                 value = scorer(
                     TimeSpan(span.start + pos / sr, span.start + (pos + window) / sr),
                     wave[pos:pos + window],
@@ -1968,7 +1933,6 @@ class ExtractionPipeline:
                     scores = []
                     break
                 scores.append(value)
-                pos += hop
             if not scores:
                 continue
             mean_score = sum(scores) / len(scores)
@@ -1989,6 +1953,25 @@ class ExtractionPipeline:
                 f"分类器目标救援：恢复 {accepted_count} 段声纹不足碎片",
             )
         return accepted_count
+
+    def _deduplicate_content_clips(
+        self,
+        accepted_turns: list[CandidateSentence],
+        stem_waveform: torch.Tensor,
+        progress: ProgressCallback,
+        *,
+        rejected: list[CandidateSentence] | None = None,
+    ) -> int:
+        from .content_dedup import deduplicate_content
+
+        removed = deduplicate_content(
+            accepted_turns, stem_waveform.detach().cpu().numpy(),
+        )
+        if rejected is not None:
+            rejected.extend(removed)
+        if removed:
+            progress(0.93, f"音频去重：移除 {len(removed)} 个重复片段，保留完整句边界")
+        return len(removed)
 
     @staticmethod
     def _wavlm_same_speaker_floor(profile) -> float:
@@ -4518,6 +4501,14 @@ class ExtractionPipeline:
             raise ValueError("请至少提供一段参考音频")
         if not target.exists():
             raise FileNotFoundError(target)
+        from .nextgen.features import file_digest
+
+        reference_sha256 = sorted(file_digest(path) for path in references)
+        if reference_sha256 != getattr(self, "_reference_sha256", None):
+            self._tail_scorer_cache = None
+            self._local_identity_reject_threshold = None
+            self._local_identity_model_sha256 = ""
+            self._reference_sha256 = reference_sha256
         self._subtitle_guide = SubtitleGuide.load(Path(subtitle)) if subtitle else None
         self._stage_audit = {"schema_version": 1, "stages": {}}
         job_id = job_id or time.strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
@@ -5948,6 +5939,19 @@ class ExtractionPipeline:
                         0.80,
                         f"补全后短静音合并：形成 {post_completion_merges} 个完整句",
                     )
+                # Fallback sub-spans must join the accepted set BEFORE the
+                # final island review.  Their verification dates from earlier
+                # stages and predates the island evidence; registering them
+                # afterwards let evicted children bypass the very review that
+                # withheld their parent and re-export confirmed non-target
+                # islands.
+                fallback_added = self._collect_verified_fallbacks(accepted_turns)
+                if fallback_added:
+                    progress(
+                        0.80,
+                        f"已验证子回合后备：登记 {fallback_added} 段，"
+                        "父回合未通过最终复核时保留已验证核心",
+                    )
                 if self.options.experimental_final_island_consensus:
                     withheld, rescued = self._experimental_audit_final_islands(
                         accepted_turns, rejected, verifier, profile,
@@ -5964,13 +5968,6 @@ class ExtractionPipeline:
                         0.80,
                         "实验性局部身份终审："
                         f"撤回 {withheld} 个混合/身份未决父句，复核保留 {rescued} 个子句",
-                    )
-                fallback_added = self._collect_verified_fallbacks(accepted_turns)
-                if fallback_added:
-                    progress(
-                        0.80,
-                        f"已验证子回合后备：登记 {fallback_added} 段，"
-                        "父回合未通过最终复核时保留已验证核心",
                     )
                 excluded_marked = self._apply_user_marked_exclusions(
                     accepted_turns,
@@ -5990,6 +5987,17 @@ class ExtractionPipeline:
                         0.80,
                         f"用户标记排除：处理 {excluded_marked} 个重叠回合",
                     )
+                local_models = self._ensure_tail_scorer()
+                if local_models is not None and self._local_identity_reject_threshold is not None:
+                    from .local_identity_classifier import audit_candidates, score_window
+
+                    local_rejected = audit_candidates(
+                        accepted_turns, rejected, target_waveform,
+                        lambda wave: score_window(local_models, wave),
+                        self._local_identity_reject_threshold,
+                        model_sha256=self._local_identity_model_sha256,
+                    )
+                    progress(0.80, f"局部模型复核：撤回 {local_rejected} 个含持续非目标声音的回合")
                 certified = sum(
                     self._install_acoustic_identity_certificate(candidate)
                     for candidate in accepted_turns
@@ -6103,6 +6111,11 @@ class ExtractionPipeline:
                         f"后备子回合去重：{fallback_deduped} 段由完整父回合覆盖，"
                         "不重复导出",
                     )
+                self._deduplicate_content_clips(
+                    accepted, target_waveform,
+                    progress=lambda _value, message: progress(0.92, message),
+                    rejected=rejected,
+                )
                 chinese_candidates = [candidate for candidate in accepted if candidate.language == "zh"]
                 if chinese_candidates:
                     chinese_paths: list[Path] = []

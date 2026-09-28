@@ -5,8 +5,11 @@ from dataclasses import asdict
 import json
 from pathlib import Path
 from types import SimpleNamespace
+import sys
 import tempfile
 import unittest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import numpy as np
 import soundfile as sf
