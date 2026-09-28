@@ -117,6 +117,7 @@ def audit_candidates(
                 "source": candidate,
                 "span": proposal["span"],
                 "parent_span": [candidate.start, candidate.end],
+                "windows": proposal["windows"],
             })
     return removed, proposals
 
