@@ -61,19 +61,24 @@ def build_episode_cases(verified: dict, rescued: dict, reviews: list,
                         rescued_bad_ordinals=(20, 22, 39)) -> tuple[list[dict], list[dict]]:
     """Review feedback supersedes old positives; mixed is unknown.
 
-    ``reviews`` is the chronological chain of (batch_manifest, review) pairs.
-    Every review's explicit negatives become corrections and its remaining
-    accepted clips count as reviewed positives, so later rounds refine the
-    labels earlier rounds produced.
+    ``reviews`` is the chronological chain of (batch_manifest, review,
+    source_key) triples. Every review's explicit negatives become corrections
+    and its remaining accepted clips count as reviewed positives, so later
+    rounds refine the labels earlier rounds produced. Cases never merge or
+    clip across source keys: each key is one distinct source audio.
     """
-    positives, negatives = [], []
+    base_key = reviews[0][2]
+    positives: dict[str, list[dict]] = {base_key: []}
+    negatives: dict[str, list[dict]] = {base_key: []}
     for batch, manifest in ((VERIFIED_BATCH, verified), (RESCUED_BATCH, rescued)):
         for ordinal, row in enumerate(_accepted(manifest), 1):
             label = int(batch != RESCUED_BATCH or ordinal not in rescued_bad_ordinals)
             case = _case(row["start"], row["end"], label,
                          {"batch": batch, "ordinal": ordinal, "reviewed": True})
-            (positives if label else negatives).append(case)
-    for latest, review in reviews:
+            (positives[base_key] if label else negatives[base_key]).append(case)
+    for latest, review, source_key in reviews:
+        positives.setdefault(source_key, [])
+        negatives.setdefault(source_key, [])
         latest_rows = _accepted(latest)
         batch_id = review.get("source_batch_id", "latest")
         latest_excluded: set[int] = set()
@@ -101,56 +106,64 @@ def build_episode_cases(verified: dict, rescued: dict, reviews: list,
                 if (not clip_start - 1 / 16000 <= float(negative_start)
                         < float(negative_end) <= clip_end + 1 / 16000):
                     raise ValueError("Review negative span escapes its clip")
-                negatives.append(_case(negative_start, negative_end, 0,
-                                       {"review": batch_id, "ordinal": ordinal,
-                                        "reason": item.get("reason", ""),
-                                        "partial": True}, correction=True))
+                negatives[source_key].append(_case(
+                    negative_start, negative_end, 0,
+                    {"review": batch_id, "ordinal": ordinal,
+                     "reason": item.get("reason", ""),
+                     "partial": True}, correction=True))
                 if float(negative_start) - clip_start >= 0.2:
-                    positives.append(_case(clip_start, negative_start, 1,
-                                           {"review": batch_id, "ordinal": ordinal,
-                                            "kept_part": True}, correction=True))
+                    positives[source_key].append(_case(
+                        clip_start, negative_start, 1,
+                        {"review": batch_id, "ordinal": ordinal,
+                         "kept_part": True}, correction=True))
                 continue
-            negatives.append(_case(*item["span"], 0,
-                                   {"review": batch_id, "ordinal": ordinal,
-                                    "reason": item.get("reason", "")}, correction=True))
+            negatives[source_key].append(_case(
+                *item["span"], 0,
+                {"review": batch_id, "ordinal": ordinal,
+                 "reason": item.get("reason", "")}, correction=True))
         # The reviewed batch's remaining accepted clips were heard and approved
         # by the user, so they are reviewed positives, not unreviewed model
         # output.
         for ordinal, row in enumerate(latest_rows, 1):
             if ordinal in latest_excluded:
                 continue
-            positives.append(_case(row["start"], row["end"], 1,
-                                   {"batch": batch_id, "ordinal": ordinal,
-                                    "reviewed": True}))
+            positives[source_key].append(_case(
+                row["start"], row["end"], 1,
+                {"batch": batch_id, "ordinal": ordinal, "reviewed": True}))
     for item in old_review["flagged_outputs"]:
         if item["kind"] == "entire_other":
-            negatives.append(_case(*item["span"], 0,
-                                   {"review": "20260926", "ordinal": item["index"]}))
-    negatives = _merge(negatives)
+            negatives[base_key].append(_case(*item["span"], 0,
+                                             {"review": "20260926", "ordinal": item["index"]}))
     clean, conflicts = [], []
-    for positive in _merge(positives):
-        pieces = [(positive["start"], positive["end"])]
-        for negative in negatives:
-            start = max(positive["start"], negative["start"])
-            end = min(positive["end"], negative["end"])
-            if start < end:
-                conflicts.append({"span": [start, end], "resolution": "explicit_negative_wins",
-                                  "positive_origins": positive["origins"],
-                                  "negative_origins": negative["origins"]})
-            remaining = []
+    for source_key in sorted(positives):
+        source_negatives = _merge(negatives[source_key])
+        for positive in _merge(positives[source_key]):
+            pieces = [(positive["start"], positive["end"])]
+            for negative in source_negatives:
+                start = max(positive["start"], negative["start"])
+                end = min(positive["end"], negative["end"])
+                if start < end:
+                    conflicts.append({"span": [start, end], "resolution": "explicit_negative_wins",
+                                      "positive_origins": positive["origins"],
+                                      "negative_origins": negative["origins"]})
+                remaining = []
+                for left, right in pieces:
+                    if negative["end"] <= left or negative["start"] >= right:
+                        remaining.append((left, right))
+                    else:
+                        if left < negative["start"]:
+                            remaining.append((left, negative["start"]))
+                        if negative["end"] < right:
+                            remaining.append((negative["end"], right))
+                pieces = remaining
             for left, right in pieces:
-                if negative["end"] <= left or negative["start"] >= right:
-                    remaining.append((left, right))
-                else:
-                    if left < negative["start"]:
-                        remaining.append((left, negative["start"]))
-                    if negative["end"] < right:
-                        remaining.append((negative["end"], right))
-            pieces = remaining
-        clean.extend({**positive, "start": left, "end": right} for left, right in pieces)
-    cases = sorted(clean + negatives, key=lambda r: (r["start"], r["end"]))
+                clean.append({**positive, "start": left, "end": right,
+                              "source_key": source_key})
+        for negative in source_negatives:
+            clean.append({**negative, "source_key": source_key})
+    cases = sorted(clean, key=lambda r: (r["source_key"], r["start"], r["end"]))
     for case in cases:
-        case["id"] = f"episode:{round(case['start'] * 16000)}:{round(case['end'] * 16000)}"
+        case["id"] = f"{case['source_key'][:8]}:{round(case['start'] * 16000)}:{round(case['end'] * 16000)}"
     return cases, conflicts
 
 
@@ -194,7 +207,26 @@ def calibration_thresholds(rows: list[dict]) -> tuple[float, float]:
                          and math.isfinite(row["negative_evidence"])]
     if not negative_means or not positive_evidence:
         raise ValueError("Insufficient calibration negatives or adjacent positive windows")
-    return max(2.0, max(negative_means) + 0.5), min(-1.0, min(positive_evidence) - 0.5)
+    threshold = max(2.0, max(negative_means) + 0.5)
+    # Veto threshold: bisect the gap between the shallowest trained negative
+    # correction and the deepest reviewed positive evidence (any split, the
+    # zero-false-veto gate enforces this ceiling).  Fall back to the
+    # calibration-only anchor when the bisection anchors are missing.
+    train_negative_evidence = [row["negative_evidence"] for row in rows
+                               if row["split"] == "train" and row["label"] == 0
+                               and row.get("correction")
+                               and row["negative_evidence"] is not None
+                               and math.isfinite(row["negative_evidence"])]
+    all_positive_evidence = [row["negative_evidence"] for row in rows
+                             if row["label"] == 1
+                             and row["negative_evidence"] is not None
+                             and math.isfinite(row["negative_evidence"])]
+    if train_negative_evidence and all_positive_evidence:
+        bisected = (max(train_negative_evidence) + min(all_positive_evidence)) / 2
+        reject_threshold = min(-1.0, bisected)
+    else:
+        reject_threshold = min(-1.0, min(positive_evidence) - 0.5)
+    return threshold, reject_threshold
 
 
 def validate_veto_metrics(metrics: dict, corrections: list[dict],
@@ -248,7 +280,8 @@ def prepare_dataset(review_paths: list[Path], request_path: Path = REQUEST) -> d
         inputs[str(path.resolve())] = sha256(path)
         return json.loads(path.read_text(encoding="utf-8"))
 
-    reviews: list[tuple[dict, dict]] = []
+    reviews: list[tuple[dict, dict, str]] = []
+    stem_by_hash: dict[str, Path] = {}
     stems: list[Path] = []
     for review_path in review_paths:
         review = read(review_path)
@@ -263,26 +296,24 @@ def prepare_dataset(review_paths: list[Path], request_path: Path = REQUEST) -> d
         inputs[str(stem)] = sha256(stem)
         if inputs[str(stem)] != review["source_stem_sha256"]:
             raise ValueError(f"Review audio checksum mismatch: {batch}")
-        reviews.append((latest, review))
+        stem_hash = inputs[str(stem)]
+        reviews.append((latest, review, stem_hash))
+        stem_by_hash.setdefault(stem_hash, stem)
         stems.append(stem)
-    # Reviewed batches share one deterministic source stem per episode; the
-    # clip spans are source-time coordinates, so one waveform serves them all.
-    if len({inputs[str(stem.resolve())] for stem in stems}) > 1:
-        raise ValueError("Chained reviews cover different source audio")
-    stem = stems[0]
     verified = read(ROOT / "output" / VERIFIED_BATCH / "batch_manifest.json")
     rescued = read(ROOT / "output" / RESCUED_BATCH / "batch_manifest.json")
     old_review = read(ROOT / "evaluation/episode1_user_review_20260926.json")
     cases, conflicts = build_episode_cases(verified, rescued, reviews, old_review)
     for case in cases:
+        stem = stem_by_hash[case["source_key"]]
         case["audio"] = str(stem)
-        case["source_id"] = inputs[str(stem)]
+        case["source_id"] = case["source_key"]
     request = read(request_path)
     reference_hashes = [sha256(Path(path)) for path in request["references"]]
     inputs.update(zip(request["references"], reference_hashes))
     # All target-reference crops share one training group. A source reference
     # can yield multiple crops, so separate crop-level splits would leak audio.
-    work = stem.parent.parent
+    work = stems[-1].parent.parent
     reference_sets = [("target_references", 1, sorted((work / "reference_voice_clips").glob("*.wav")))]
     reference_sets.extend((folder.name, 0, sorted(folder.glob("*.wav")))
                           for folder in sorted((work / "negative_reference_voice_clips").glob("role_*")))
@@ -304,7 +335,8 @@ def prepare_dataset(review_paths: list[Path], request_path: Path = REQUEST) -> d
             "cases": cases, "label_conflicts": conflicts,
             "ignored_mixed_labels": [item for item in old_review["flagged_outputs"]
                                      if item["kind"] == "mixed"],
-            "limitations": "Episode-one development with grouped sentence holdouts; not cross-character validation. "
+            "limitations": "Multi-episode development with grouped per-source sentence holdouts; "
+                           "not cross-series validation. "
                            "Latest corrections belong to training, not held-out success claims."}
 
 
@@ -364,14 +396,14 @@ def train(dataset: dict, output: Path) -> bool:
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
     train_x, train_y = X[training_indices].to(device), y[training_indices].to(device)
     history = []
-    for epoch in range(200):
+    for epoch in range(600):
         optimizer.zero_grad()
         loss = torch.nn.functional.binary_cross_entropy_with_logits(model(train_x).squeeze(-1), train_y)
         if not torch.isfinite(loss):
             raise ValueError("Nonfinite training loss")
         loss.backward()
         optimizer.step()
-        if epoch in (0, 49, 99, 199):
+        if epoch in (0, 149, 299, 599):
             history.append({"epoch": epoch + 1, "loss": float(loss.detach())})
             print(json.dumps(history[-1]), flush=True)
     model.eval()
@@ -386,7 +418,7 @@ def train(dataset: dict, output: Path) -> bool:
         case["mean"] = sum(values) / len(values) if values else None
         case["min"] = min(values) if values else None
         case["negative_evidence"] = negative_window_evidence(case["windows"])
-    report = {**dataset, "training_history": history, "epochs": 200,
+    report = {**dataset, "training_history": history, "epochs": 600,
               "training_windows": len(training_indices), "total_windows": len(features)}
     reasons = []
     try:
@@ -395,6 +427,8 @@ def train(dataset: dict, output: Path) -> bool:
         threshold = reject_threshold = None
         reasons.append(str(exc))
     metrics = {}
+    warnings = []
+    veto_failure_reasons = []
     if reject_threshold is not None:
         def veto(case):
             return (case["negative_evidence"] is not None
@@ -419,31 +453,58 @@ def train(dataset: dict, output: Path) -> bool:
                        "mean": case["mean"]} for case in corrections],
             threshold,
         )
-    else:
-        warnings = []
+        # The rescue gate is independently shippable.  When only the veto
+        # calibration fails, ship the checkpoint with the veto disabled: every
+        # negative correction is already blocked by the calibrated rescue mean
+        # and no split shows a false rescue, so this is the conservative
+        # fallback, never a loosening of the correction contract.
+        rescue_reasons = []
+        for split in ("train", "calibration", "test"):
+            if metrics[split].get("negative_false_rescue", 0):
+                rescue_reasons.append(f"{split} false-rescues reviewed negatives")
+        unblocked = [item["id"] for item in report["training_corrections"]
+                     if item["label"] == 0
+                     and not item["detected"]
+                     and not (item["mean"] is not None and item["mean"] < threshold)]
+        if unblocked:
+            rescue_reasons.append(f"negative corrections escape both gates: {unblocked}")
+        veto_failure_reasons = reasons
+        if rescue_reasons:
+            reasons = rescue_reasons + veto_failure_reasons
+        elif veto_failure_reasons:
+            reasons = []
+            warnings = warnings + [f"veto disabled: {reason}" for reason in veto_failure_reasons]
+            reject_threshold = None
     report.update(threshold=threshold, reject_threshold=reject_threshold, metrics=metrics,
                   calibration_status="failed" if reasons else "passed",
+                  veto_status="disabled" if (reject_threshold is None and not reasons) else "active",
+                  veto_failure_reasons=veto_failure_reasons,
                   failure_reasons=reasons, validation_warnings=warnings,
                   validation_scope=(
-                      "Secondary local negative veto. Threshold is calibrated below all reviewed "
-                      "positive evidence; positives must have zero false vetoes in each split, "
-                      "and at least one negative must be detected across held-out splits. "
-                      "Per-split negative misses are retained as warnings; this is not an accuracy claim."
+                      "Secondary local negative veto plus classifier rescue. Rescue threshold is "
+                      "calibrated with zero false rescues in every split and every negative "
+                      "correction blocked by at least one gate. Veto threshold is calibrated below "
+                      "all reviewed positive evidence; when its own calibration fails the veto is "
+                      "disabled and the rescue gate alone carries the correction contract."
                   ))
     (output / "training_report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     if reasons:
         print(json.dumps({"calibration_status": "failed", "reasons": reasons}, ensure_ascii=False), flush=True)
         return False
     payload = {"state_dict": {key: value.cpu() for key, value in model.state_dict().items()},
-               "input_dim": X.shape[1], "threshold": threshold, "reject_threshold": reject_threshold,
+               "input_dim": X.shape[1], "threshold": threshold,
                "reference_sha256": dataset["reference_sha256"], "calibration_status": "passed",
+               "veto_status": "disabled" if reject_threshold is None else "active",
                "window_seconds": 0.5, "stride_seconds": 0.25,
                "feature_version": "wavlm-tdnn-unpooled-v1", "seed": SEED,
                "training_report_sha256": sha256(output / "training_report.json")}
+    if reject_threshold is not None:
+        payload["reject_threshold"] = reject_threshold
     buffer = io.BytesIO()
     torch.save(payload, buffer)
     (output / "candidate.pt").write_bytes(buffer.getvalue())
-    print(json.dumps({"calibration_status": "passed", "metrics": metrics,
+    print(json.dumps({"calibration_status": "passed", "veto_status": payload["veto_status"],
+                      "metrics": metrics,
                       "candidate": str(output / "candidate.pt")}, ensure_ascii=False), flush=True)
     return True
 

@@ -1870,7 +1870,12 @@ class ExtractionPipeline:
             ):
                 self._tail_scorer_cache = "missing"
                 return None
-            self._local_identity_reject_threshold = float(payload["reject_threshold"])
+            # A checkpoint whose veto calibration failed ships rescue-only;
+            # its payload carries no reject threshold and the secondary veto
+            # stays off.
+            reject_threshold = payload.get("reject_threshold")
+            self._local_identity_reject_threshold = (
+                float(reject_threshold) if reject_threshold is not None else None)
             self._local_identity_model_sha256 = file_digest(classifier_path)
         from transformers import Wav2Vec2FeatureExtractor, WavLMForXVector
 

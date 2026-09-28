@@ -19,7 +19,7 @@ def manifest(spans):
 
 class AnimeTrainingLabelsTests(unittest.TestCase):
     def build(self, verified, rescued, latest, review, old=None, bad=()):
-        reviews = [(manifest(latest), {"excluded_clips": review})]
+        reviews = [(manifest(latest), {"excluded_clips": review}, "test-audio")]
         return build_episode_cases(
             manifest(verified), manifest(rescued), reviews,
             old or {"flagged_outputs": []},
