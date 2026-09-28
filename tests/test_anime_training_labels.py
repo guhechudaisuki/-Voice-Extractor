@@ -19,9 +19,10 @@ def manifest(spans):
 
 class AnimeTrainingLabelsTests(unittest.TestCase):
     def build(self, verified, rescued, latest, review, old=None, bad=()):
+        reviews = [(manifest(latest), {"excluded_clips": review})]
         return build_episode_cases(
-            manifest(verified), manifest(rescued), manifest(latest),
-            {"excluded_clips": review}, old or {"flagged_outputs": []},
+            manifest(verified), manifest(rescued), reviews,
+            old or {"flagged_outputs": []},
             rescued_bad_ordinals=bad,
         )
 
@@ -81,7 +82,7 @@ class AnimeTrainingLabelsTests(unittest.TestCase):
         self.assertEqual([(c["start"], c["label"]) for c in cases], [(10, 1), (20, 0)])
 
     def test_review_must_match_its_manifest_ordinal(self):
-        with self.assertRaisesRegex(ValueError, "review"):
+        with self.assertRaisesRegex(ValueError, "Review span"):
             self.build([], [], [(10, 12)], [{"ordinal": 1, "span": [20, 22]}])
 
     def test_nearby_cases_share_a_group_and_correction_forces_training(self):

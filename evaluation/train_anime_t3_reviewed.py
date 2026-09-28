@@ -56,10 +56,16 @@ def _merge(rows: list[dict]) -> list[dict]:
     return merged
 
 
-def build_episode_cases(verified: dict, rescued: dict, latest: dict,
-                        review: dict, old_review: dict, *,
+def build_episode_cases(verified: dict, rescued: dict, reviews: list,
+                        old_review: dict, *,
                         rescued_bad_ordinals=(20, 22, 39)) -> tuple[list[dict], list[dict]]:
-    """Latest explicit negatives supersede old positives; mixed is unknown."""
+    """Review feedback supersedes old positives; mixed is unknown.
+
+    ``reviews`` is the chronological chain of (batch_manifest, review) pairs.
+    Every review's explicit negatives become corrections and its remaining
+    accepted clips count as reviewed positives, so later rounds refine the
+    labels earlier rounds produced.
+    """
     positives, negatives = [], []
     for batch, manifest in ((VERIFIED_BATCH, verified), (RESCUED_BATCH, rescued)):
         for ordinal, row in enumerate(_accepted(manifest), 1):
@@ -67,52 +73,55 @@ def build_episode_cases(verified: dict, rescued: dict, latest: dict,
             case = _case(row["start"], row["end"], label,
                          {"batch": batch, "ordinal": ordinal, "reviewed": True})
             (positives if label else negatives).append(case)
-    latest_rows = _accepted(latest)
-    latest_excluded: set[int] = set()
-    for item in review["excluded_clips"]:
-        ordinal = int(item["ordinal"])
-        if not 1 <= ordinal <= len(latest_rows):
-            raise ValueError("Latest review ordinal is outside its manifest")
-        row = latest_rows[ordinal - 1]
-        if any(abs(float(row[key]) - float(value)) > 1 / 16000
-               for key, value in zip(("start", "end"), item["span"])):
-            raise ValueError("Latest review span does not match its manifest ordinal")
-        if "duplicate_of" in item:
-            if not 1 <= int(item["duplicate_of"]) <= len(latest_rows):
-                raise ValueError("Latest review duplicate ordinal is invalid")
+    for latest, review in reviews:
+        latest_rows = _accepted(latest)
+        batch_id = review.get("source_batch_id", "latest")
+        latest_excluded: set[int] = set()
+        for item in review["excluded_clips"]:
+            ordinal = int(item["ordinal"])
+            if not 1 <= ordinal <= len(latest_rows):
+                raise ValueError("Review ordinal is outside its manifest")
+            row = latest_rows[ordinal - 1]
+            if any(abs(float(row[key]) - float(value)) > 1 / 16000
+                   for key, value in zip(("start", "end"), item["span"])):
+                raise ValueError("Review span does not match its manifest ordinal")
+            if "duplicate_of" in item:
+                if not 1 <= int(item["duplicate_of"]) <= len(latest_rows):
+                    raise ValueError("Review duplicate ordinal is invalid")
+                latest_excluded.add(ordinal)
+                continue
             latest_excluded.add(ordinal)
-            continue
-        latest_excluded.add(ordinal)
-        if "negative_span" in item:
-            # The user kept part of the clip: the reported sub-interval is a
-            # negative correction and the kept remainder is a positive
-            # correction, so the model learns the split instead of a
-            # whole-clip compromise.
-            negative_start, negative_end = item["negative_span"]
-            clip_start, clip_end = item["span"]
-            if (not clip_start - 1 / 16000 <= float(negative_start)
-                    < float(negative_end) <= clip_end + 1 / 16000):
-                raise ValueError("Latest review negative span escapes its clip")
-            negatives.append(_case(negative_start, negative_end, 0,
-                                   {"review": "latest", "ordinal": ordinal,
-                                    "reason": item.get("reason", ""),
-                                    "partial": True}, correction=True))
-            if float(negative_start) - clip_start >= 0.2:
-                positives.append(_case(clip_start, negative_start, 1,
-                                       {"review": "latest", "ordinal": ordinal,
-                                        "kept_part": True}, correction=True))
-            continue
-        negatives.append(_case(*item["span"], 0,
-                               {"review": "latest", "ordinal": ordinal,
-                                "reason": item.get("reason", "")}, correction=True))
-    # The reviewed batch's remaining accepted clips were heard and approved by
-    # the user, so they are reviewed positives, not unreviewed model output.
-    for ordinal, row in enumerate(latest_rows, 1):
-        if ordinal in latest_excluded:
-            continue
-        positives.append(_case(row["start"], row["end"], 1,
-                               {"batch": review.get("source_batch_id", "latest"),
-                                "ordinal": ordinal, "reviewed": True}))
+            if "negative_span" in item:
+                # The user kept part of the clip: the reported sub-interval is
+                # a negative correction and the kept remainder is a positive
+                # correction, so the model learns the split instead of a
+                # whole-clip compromise.
+                negative_start, negative_end = item["negative_span"]
+                clip_start, clip_end = item["span"]
+                if (not clip_start - 1 / 16000 <= float(negative_start)
+                        < float(negative_end) <= clip_end + 1 / 16000):
+                    raise ValueError("Review negative span escapes its clip")
+                negatives.append(_case(negative_start, negative_end, 0,
+                                       {"review": batch_id, "ordinal": ordinal,
+                                        "reason": item.get("reason", ""),
+                                        "partial": True}, correction=True))
+                if float(negative_start) - clip_start >= 0.2:
+                    positives.append(_case(clip_start, negative_start, 1,
+                                           {"review": batch_id, "ordinal": ordinal,
+                                            "kept_part": True}, correction=True))
+                continue
+            negatives.append(_case(*item["span"], 0,
+                                   {"review": batch_id, "ordinal": ordinal,
+                                    "reason": item.get("reason", "")}, correction=True))
+        # The reviewed batch's remaining accepted clips were heard and approved
+        # by the user, so they are reviewed positives, not unreviewed model
+        # output.
+        for ordinal, row in enumerate(latest_rows, 1):
+            if ordinal in latest_excluded:
+                continue
+            positives.append(_case(row["start"], row["end"], 1,
+                                   {"batch": batch_id, "ordinal": ordinal,
+                                    "reviewed": True}))
     for item in old_review["flagged_outputs"]:
         if item["kind"] == "entire_other":
             negatives.append(_case(*item["span"], 0,
@@ -223,7 +232,7 @@ def validate_veto_metrics(metrics: dict, corrections: list[tuple[int, bool]]) ->
     return reasons, warnings
 
 
-def prepare_dataset(review_path: Path, request_path: Path = REQUEST) -> dict:
+def prepare_dataset(review_paths: list[Path], request_path: Path = REQUEST) -> dict:
     import soundfile as sf
 
     inputs: dict[str, str] = {}
@@ -233,23 +242,32 @@ def prepare_dataset(review_path: Path, request_path: Path = REQUEST) -> dict:
         inputs[str(path.resolve())] = sha256(path)
         return json.loads(path.read_text(encoding="utf-8"))
 
-    review = read(review_path)
-    batch = review["source_batch_id"]
-    if Path(batch).name != batch:
-        raise ValueError("Review batch must be a directory name")
-    latest_path = ROOT / "output" / batch / "batch_manifest.json"
-    latest = read(latest_path)
-    if inputs[str(latest_path.resolve())] != review["source_manifest_sha256"]:
-        raise ValueError("Latest review manifest checksum mismatch")
-    work = ROOT / "work" / f"{batch}_001"
-    stem = work / "stems/target_vocals.wav"
-    inputs[str(stem)] = sha256(stem)
-    if inputs[str(stem)] != review["source_stem_sha256"]:
-        raise ValueError("Latest review audio checksum mismatch")
+    reviews: list[tuple[dict, dict]] = []
+    stems: list[Path] = []
+    for review_path in review_paths:
+        review = read(review_path)
+        batch = review["source_batch_id"]
+        if Path(batch).name != batch:
+            raise ValueError("Review batch must be a directory name")
+        batch_path = ROOT / "output" / batch / "batch_manifest.json"
+        latest = read(batch_path)
+        if inputs[str(batch_path.resolve())] != review["source_manifest_sha256"]:
+            raise ValueError(f"Review manifest checksum mismatch: {batch}")
+        stem = ROOT / "work" / f"{batch}_001" / "stems/target_vocals.wav"
+        inputs[str(stem)] = sha256(stem)
+        if inputs[str(stem)] != review["source_stem_sha256"]:
+            raise ValueError(f"Review audio checksum mismatch: {batch}")
+        reviews.append((latest, review))
+        stems.append(stem)
+    # Reviewed batches share one deterministic source stem per episode; the
+    # clip spans are source-time coordinates, so one waveform serves them all.
+    if len({inputs[str(stem.resolve())] for stem in stems}) > 1:
+        raise ValueError("Chained reviews cover different source audio")
+    stem = stems[0]
     verified = read(ROOT / "output" / VERIFIED_BATCH / "batch_manifest.json")
     rescued = read(ROOT / "output" / RESCUED_BATCH / "batch_manifest.json")
     old_review = read(ROOT / "evaluation/episode1_user_review_20260926.json")
-    cases, conflicts = build_episode_cases(verified, rescued, latest, review, old_review)
+    cases, conflicts = build_episode_cases(verified, rescued, reviews, old_review)
     for case in cases:
         case["audio"] = str(stem)
         case["source_id"] = inputs[str(stem)]
@@ -258,6 +276,7 @@ def prepare_dataset(review_path: Path, request_path: Path = REQUEST) -> dict:
     inputs.update(zip(request["references"], reference_hashes))
     # All target-reference crops share one training group. A source reference
     # can yield multiple crops, so separate crop-level splits would leak audio.
+    work = stem.parent.parent
     reference_sets = [("target_references", 1, sorted((work / "reference_voice_clips").glob("*.wav")))]
     reference_sets.extend((folder.name, 0, sorted(folder.glob("*.wav")))
                           for folder in sorted((work / "negative_reference_voice_clips").glob("role_*")))
@@ -423,7 +442,9 @@ def train(dataset: dict, output: Path) -> bool:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--review", type=Path, required=True)
+    parser.add_argument("--review", type=Path, action="append", required=True,
+                        help="Review JSON, oldest first; each is validated "
+                             "against its own batch and chained into labels")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--request", type=Path, default=REQUEST)
     parser.add_argument("--prepare-only", action="store_true")

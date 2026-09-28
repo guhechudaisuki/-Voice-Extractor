@@ -1,0 +1,10 @@
+{
+  "source_batch_id": "20260928_142657_batch_36ccc8",
+  "source_manifest_sha256": "e5bfbee72717d28e3d51045f6a7d1936d5cc3b9fe1705e8b94b0a1f47ff183b6",
+  "source_stem_sha256": "106d9ea00c47572a191768ac7f24a1d3ac05b42b4e6e0e7cf727b11476ffd381",
+  "basis": "用户对指定 36ccc8 试听压缩包的反馈：除第 49、50 句外全部正确；这两句不是目标人物（均为分类器目标救援引入、此前从未被试听的片段）。仅用于训练标签修订，不作为模型泛化证据，也不是运行时排除标记。",
+  "excluded_clips": [
+    {"ordinal": 49, "span": [1094.86, 1096.96], "reason": "用户确认非目标人物"},
+    {"ordinal": 50, "span": [1112.92, 1114.21], "reason": "用户确认非目标人物"}
+  ]
+}
