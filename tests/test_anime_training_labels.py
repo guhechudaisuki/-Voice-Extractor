@@ -136,7 +136,7 @@ class AnimeTrainingLabelsTests(unittest.TestCase):
             "test": {"positive_cases": 2, "negative_cases": 2,
                      "positive_false_veto": 0, "negative_detected": 1},
         }
-        reasons, warnings = validate_veto_metrics(metrics, [(0, True), (0, True), (0, True)])
+        reasons, warnings = validate_veto_metrics(metrics, [{"id": "a", "label": 0, "detected": True, "mean": -5.0}, {"id": "b", "label": 0, "detected": True, "mean": -4.0}, {"id": "c", "label": 0, "detected": True, "mean": -3.0}], 2.0)
         self.assertEqual(reasons, [])
         self.assertEqual(warnings, ["calibration detects no negative cases"])
 
@@ -146,7 +146,7 @@ class AnimeTrainingLabelsTests(unittest.TestCase):
                     "positive_false_veto": int(split == "test"), "negative_detected": 1}
             for split in ("train", "calibration", "test")
         }
-        reasons, _ = validate_veto_metrics(metrics, [(0, True)])
+        reasons, _ = validate_veto_metrics(metrics, [{"id": "a", "label": 0, "detected": True, "mean": -5.0}], 2.0)
         self.assertIn("test contains positive false vetoes", reasons)
 
     def test_veto_fails_when_positive_correction_is_vetoed(self):
@@ -155,8 +155,38 @@ class AnimeTrainingLabelsTests(unittest.TestCase):
                     "positive_false_veto": 0, "negative_detected": 1}
             for split in ("train", "calibration", "test")
         }
-        reasons, _ = validate_veto_metrics(metrics, [(0, True), (1, True)])
+        reasons, _ = validate_veto_metrics(metrics, [{"id": "a", "label": 0, "detected": True, "mean": -5.0}, {"id": "b", "label": 1, "detected": True, "mean": 5.0}], 2.0)
         self.assertIn("Explicit positive corrections are vetoed", reasons)
+
+    def test_negative_correction_may_be_blocked_by_rescue_gate_alone(self):
+        metrics = {
+            split: {"positive_cases": 1, "negative_cases": 1,
+                    "positive_false_veto": 0,
+                    "negative_detected": int(split == "test")}
+            for split in ("train", "calibration", "test")
+        }
+        reasons, warnings = validate_veto_metrics(
+            metrics,
+            [{"id": "a", "label": 0, "detected": True, "mean": -3.0},
+             {"id": "b", "label": 0, "detected": False, "mean": -2.5}],
+            2.0,
+        )
+        self.assertEqual(reasons, [])
+        self.assertEqual(warnings, ["calibration detects no negative cases"])
+
+    def test_negative_correction_escaping_both_gates_fails(self):
+        metrics = {
+            split: {"positive_cases": 1, "negative_cases": 1,
+                    "positive_false_veto": 0,
+                    "negative_detected": int(split == "test")}
+            for split in ("train", "calibration", "test")
+        }
+        reasons, _ = validate_veto_metrics(
+            metrics,
+            [{"id": "a", "label": 0, "detected": False, "mean": 3.0}],
+            2.0,
+        )
+        self.assertIn("Negative correction a escapes both gates", reasons)
 
     def test_veto_fails_when_no_heldout_negative_is_detected(self):
         metrics = {
@@ -164,7 +194,7 @@ class AnimeTrainingLabelsTests(unittest.TestCase):
                     "positive_false_veto": 0, "negative_detected": int(split == "train")}
             for split in ("train", "calibration", "test")
         }
-        reasons, warnings = validate_veto_metrics(metrics, [(0, True)])
+        reasons, warnings = validate_veto_metrics(metrics, [{"id": "a", "label": 0, "detected": True, "mean": -5.0}], 2.0)
         self.assertIn("held-out splits detect no negative cases", reasons)
         self.assertEqual(len(warnings), 2)
 

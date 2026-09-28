@@ -197,16 +197,19 @@ def calibration_thresholds(rows: list[dict]) -> tuple[float, float]:
     return max(2.0, max(negative_means) + 0.5), min(-1.0, min(positive_evidence) - 0.5)
 
 
-def validate_veto_metrics(metrics: dict, corrections: list[tuple[int, bool]]) -> tuple[list[str], list[str]]:
+def validate_veto_metrics(metrics: dict, corrections: list[dict],
+                          rescue_threshold: float) -> tuple[list[str], list[str]]:
     """Gate a conservative secondary veto, while reporting weak recall.
 
     Calibration selects the veto threshold below every reviewed positive.
     A small calibration split can contain no negative below that threshold;
     this is a recall warning, not evidence of a positive false veto. Require
     zero positive false vetoes in every split and at least one held-out
-    negative detection across calibration plus test. Negative corrections
-    must all be detected; positive corrections (kept parts of partially
-    rejected clips) must all survive the veto.
+    negative detection across calibration plus test. Every negative
+    correction must be blocked by at least one calibrated gate - the veto or
+    the rescue mean - because production exports only what passes both.
+    Positive corrections (kept parts of partially rejected clips) must
+    survive the veto.
     """
     reasons, warnings = [], []
     for split in ("train", "calibration", "test"):
@@ -223,12 +226,15 @@ def validate_veto_metrics(metrics: dict, corrections: list[tuple[int, bool]]) ->
     for split, values in zip(("calibration", "test"), heldout):
         if values.get("negative_cases") and not values.get("negative_detected"):
             warnings.append(f"{split} detects no negative cases")
-    undetected = [label for label, detected in corrections if label == 0 and not detected]
-    falsely_vetoed = [label for label, detected in corrections if label == 1 and detected]
-    if undetected:
-        reasons.append("Explicit negative corrections are not all detected")
-    if falsely_vetoed:
-        reasons.append("Explicit positive corrections are vetoed")
+    for correction in corrections:
+        mean = correction.get("mean")
+        blocked = correction["detected"] or (
+            mean is not None and math.isfinite(mean) and mean < rescue_threshold)
+        if correction["label"] == 0 and not blocked:
+            reasons.append(
+                f"Negative correction {correction['id']} escapes both gates")
+        if correction["label"] == 1 and correction["detected"]:
+            reasons.append("Explicit positive corrections are vetoed")
     return reasons, warnings
 
 
@@ -405,11 +411,13 @@ def train(dataset: dict, output: Path) -> bool:
                                                            for case in negative)}
         corrections = [case for case in dataset["cases"] if case["correction"]]
         report["training_corrections"] = [{"id": case["id"], "label": case["label"],
-                                           "detected": veto(case),
+                                           "detected": veto(case), "mean": case["mean"],
                                            "negative_evidence": case["negative_evidence"]}
                                           for case in corrections]
         reasons, warnings = validate_veto_metrics(
-            metrics, [(case["label"], veto(case)) for case in corrections],
+            metrics, [{"id": case["id"], "label": case["label"], "detected": veto(case),
+                       "mean": case["mean"]} for case in corrections],
+            threshold,
         )
     else:
         warnings = []

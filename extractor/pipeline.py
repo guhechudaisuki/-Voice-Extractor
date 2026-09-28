@@ -770,7 +770,12 @@ class ExtractionPipeline:
         total = len(accepted_turns)
         withheld = 0
         rescued = 0
+        superseded_ids: set[int] = set()
         for index, candidate in enumerate(list(accepted_turns), 1):
+            if id(candidate) in superseded_ids:
+                # A verified child superseded this fragment after the snapshot
+                # was taken; its rejection is already recorded.
+                continue
             parent = TimeSpan(candidate.start, candidate.end)
             whole_domain = domain_for(parent)
             whole_match = self._verify_speaker_span(
@@ -922,6 +927,7 @@ class ExtractionPipeline:
                 child.diagnostics["final_purity_parent_span"] = [
                     candidate.start, candidate.end,
                 ]
+                contained: list[CandidateSentence] = []
                 if child_span.duration < self.options.min_output_seconds:
                     child.reject_reason = "局部目标子句短于当前导出下限"
                 elif any(
@@ -930,49 +936,70 @@ class ExtractionPipeline:
                     for mask in blocked
                 ):
                     child.reject_reason = "局部目标子句跨越歌声或多人遮罩"
-                elif any(
-                    min(child_span.end, other.end)
-                    - max(child_span.start, other.start) > 0.10
-                    for other in accepted_turns
-                ):
-                    child.reject_reason = "局部目标子句与已保留回合重叠"
                 else:
-                    child_match = self._verify_speaker_span(
-                        verifier, stem_waveform, child_span, profile, threshold,
-                        audit_raw=True,
-                    )
-                    child_exclusion = verifier.exclusion_audit(
-                        child_match, profile, exclusion_profiles,
-                    ) or {}
-                    child_domain = domain_for(child_span)
-                    if (not child_match.accepted
-                            or child_exclusion.get("excluded_role_rejected")
-                            or child_domain is None
-                            or child_domain.state != "target_supported"):
-                        child.reject_reason = "局部目标子句身份未获独立确认"
-                        if (not child_match.accepted
-                                and not child_exclusion.get("excluded_role_rejected")
-                                and child_domain is not None
-                                and child_domain.state == "target_supported"):
-                            # The anime-domain models confirm the exact child;
-                            # only the legacy voiceprint gate missed it. Hand
-                            # it to the standard classifier rescue instead of
-                            # a dead-end reason, so evidence trained on
-                            # user-reviewed audio gets the final say.
-                            child.reject_reason = "声纹匹配不足"
+                    overlapping = [
+                        other for other in accepted_turns
+                        if min(child_span.end, other.end)
+                        - max(child_span.start, other.start) > 0.10
+                    ]
+                    if any(
+                        other.start < child_span.start - 0.02
+                        or other.end > child_span.end + 0.02
+                        for other in overlapping
+                    ):
+                        child.reject_reason = "局部目标子句与已保留回合重叠"
                     else:
-                        self._apply_speaker_match(
-                            child, child_match, profile, threshold,
+                        contained = overlapping
+                    if not child.reject_reason:
+                        child_match = self._verify_speaker_span(
+                            verifier, stem_waveform, child_span, profile, threshold,
+                            audit_raw=True,
                         )
-                        child.diagnostics.update(child_exclusion)
-                        child.diagnostics["local_identity_audit"] = {
-                            "span": [left, right],
-                            "passed": True,
-                            "method": "experimental_island_consensus_child",
-                        }
-                        child.diagnostics["experimental_purity_child"] = True
-                        accepted_turns.append(child)
-                        rescued += 1
+                        child_exclusion = verifier.exclusion_audit(
+                            child_match, profile, exclusion_profiles,
+                        ) or {}
+                        child_domain = domain_for(child_span)
+                        if (not child_match.accepted
+                                or child_exclusion.get("excluded_role_rejected")
+                                or child_domain is None
+                                or child_domain.state != "target_supported"):
+                            child.reject_reason = "局部目标子句身份未获独立确认"
+                            if (not child_match.accepted
+                                    and not child_exclusion.get("excluded_role_rejected")
+                                    and child_domain is not None
+                                    and child_domain.state == "target_supported"):
+                                # The anime-domain models confirm the exact child;
+                                # only the legacy voiceprint gate missed it. Hand
+                                # it to the standard classifier rescue instead of
+                                # a dead-end reason, so evidence trained on
+                                # user-reviewed audio gets the final say.
+                                child.reject_reason = "声纹匹配不足"
+                        else:
+                            # The child passed on its own audio. Accepted turns
+                            # it fully covers are narrower stale fragments; the
+                            # complete verified clause replaces them instead of
+                            # being vetoed by them.
+                            for stale in contained:
+                                accepted_turns.remove(stale)
+                                stale.accepted = False
+                                stale.reject_reason = "被更完整的局部目标子句取代"
+                                stale.diagnostics["superseded_by_child"] = [
+                                    child.start, child.end,
+                                ]
+                                superseded_ids.add(id(stale))
+                                rejected.append(stale)
+                            self._apply_speaker_match(
+                                child, child_match, profile, threshold,
+                            )
+                            child.diagnostics.update(child_exclusion)
+                            child.diagnostics["local_identity_audit"] = {
+                                "span": [left, right],
+                                "passed": True,
+                                "method": "experimental_island_consensus_child",
+                            }
+                            child.diagnostics["experimental_purity_child"] = True
+                            accepted_turns.append(child)
+                            rescued += 1
                 if child.reject_reason:
                     rejected.append(child)
             progress(0.80, f"实验性局部身份终审：{index}/{total}")
