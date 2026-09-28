@@ -1,0 +1,13 @@
+{
+  "source_batch_id": "20260927_232153_batch_43744b",
+  "source_manifest_sha256": "fc2ed805cb5b608a58c2fe454d67e7cef6875cf8028cd4d1c8a56a9052b07c27",
+  "source_stem_sha256": "106d9ea00c47572a191768ac7f24a1d3ac05b42b4e6e0e7cf727b11476ffd381",
+  "basis": "用户对指定43744b压缩包的试听反馈；仅用于修订这批产物，不作为模型泛化证据。",
+  "excluded_clips": [
+    {"ordinal": 6, "span": [123.4, 124.8], "reason": "用户确认重复05后半段，保留05完整句", "duplicate_of": 5},
+    {"ordinal": 8, "span": [146.04, 150.38], "reason": "用户确认重复07后半段，保留07完整句", "duplicate_of": 7},
+    {"ordinal": 20, "span": [645.2, 647.03], "reason": "用户确认非目标人物"},
+    {"ordinal": 22, "span": [792.52, 802.42], "reason": "用户确认非目标人物"},
+    {"ordinal": 40, "span": [1241.17, 1242.99], "reason": "用户确认乐器声"}
+  ]
+}

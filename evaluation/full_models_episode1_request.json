@@ -1,0 +1,26 @@
+{
+  "references": [
+    "X:/AboutAI/voice/voice apart/提取/work/20260927_232153_batch_43744b_001/reference_original_voice_clips/reference_001_001.wav",
+    "X:/AboutAI/voice/voice apart/提取/work/20260927_232153_batch_43744b_001/reference_original_voice_clips/reference_002_001.wav",
+    "X:/AboutAI/voice/voice apart/提取/work/20260927_232153_batch_43744b_001/reference_original_voice_clips/reference_003_001.wav",
+    "X:/AboutAI/voice/voice apart/提取/work/20260927_232153_batch_43744b_001/reference_original_voice_clips/reference_004_001.wav",
+    "X:/AboutAI/voice/voice apart/提取/work/20260927_232153_batch_43744b_001/reference_original_voice_clips/reference_005_001.wav",
+    "X:/AboutAI/voice/voice apart/提取/work/20260927_232153_batch_43744b_001/reference_original_voice_clips/reference_006_001.wav"
+  ],
+  "negative_groups": [
+    ["X:/AboutAI/voice/voice apart/提取/work/20260927_232153_batch_43744b_001/negative_reference_original_voice_clips/role_001/negative_001_001.wav"],
+    ["X:/AboutAI/voice/voice apart/提取/work/20260927_232153_batch_43744b_001/negative_reference_original_voice_clips/role_002/negative_001_001.wav"],
+    ["X:/AboutAI/voice/voice apart/提取/work/20260927_232153_batch_43744b_001/negative_reference_original_voice_clips/role_003/negative_001_001.wav"],
+    ["X:/AboutAI/voice/voice apart/提取/work/20260927_232153_batch_43744b_001/negative_reference_original_voice_clips/role_004/negative_001_001.wav"],
+    ["X:/AboutAI/voice/voice apart/提取/work/20260927_232153_batch_43744b_001/negative_reference_original_voice_clips/role_005/negative_001_001.wav"]
+  ],
+  "options": {
+    "speaker_threshold": 0.68,
+    "silence_min_seconds": 0.20,
+    "silence_max_seconds": 0.85,
+    "use_overlap_detector": true,
+    "use_singing_detector": true,
+    "experimental_final_island_consensus": true,
+    "user_excluded_spans": []
+  }
+}

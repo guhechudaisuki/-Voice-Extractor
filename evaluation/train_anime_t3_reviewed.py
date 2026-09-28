@@ -223,7 +223,10 @@ def calibration_thresholds(rows: list[dict]) -> tuple[float, float]:
                              and math.isfinite(row["negative_evidence"])]
     if train_negative_evidence and all_positive_evidence:
         bisected = (max(train_negative_evidence) + min(all_positive_evidence)) / 2
-        reject_threshold = min(-1.0, bisected)
+        # Hard cap: the veto may never fire on any reviewed positive. A
+        # trained negative that sits above the cap is not veto-detectable and
+        # must fall back to the rescue gate instead.
+        reject_threshold = min(-1.0, bisected, min(all_positive_evidence) - 0.25)
     else:
         reject_threshold = min(-1.0, min(positive_evidence) - 0.5)
     return threshold, reject_threshold
