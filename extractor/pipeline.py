@@ -950,6 +950,16 @@ class ExtractionPipeline:
                             or child_domain is None
                             or child_domain.state != "target_supported"):
                         child.reject_reason = "局部目标子句身份未获独立确认"
+                        if (not child_match.accepted
+                                and not child_exclusion.get("excluded_role_rejected")
+                                and child_domain is not None
+                                and child_domain.state == "target_supported"):
+                            # The anime-domain models confirm the exact child;
+                            # only the legacy voiceprint gate missed it. Hand
+                            # it to the standard classifier rescue instead of
+                            # a dead-end reason, so evidence trained on
+                            # user-reviewed audio gets the final say.
+                            child.reject_reason = "声纹匹配不足"
                     else:
                         self._apply_speaker_match(
                             child, child_match, profile, threshold,
@@ -5969,6 +5979,17 @@ class ExtractionPipeline:
                         "实验性局部身份终审："
                         f"撤回 {withheld} 个混合/身份未决父句，复核保留 {rescued} 个子句",
                     )
+                    island_child_rescued = self._classifier_target_rescue(
+                        accepted_turns,
+                        rejected,
+                        target_waveform,
+                        progress=lambda _value, message: progress(0.80, message),
+                    )
+                    if island_child_rescued:
+                        progress(
+                            0.80,
+                            f"局部子句分类器救援：恢复 {island_child_rescued} 段域模型确认子句",
+                        )
                 excluded_marked = self._apply_user_marked_exclusions(
                     accepted_turns,
                     rejected,
