@@ -70,9 +70,12 @@ def main() -> int:
     if missing:
         parser.error("Missing input files: " + ", ".join(missing))
     effective_options = dict(request["options"])
+    target_sha256 = sha256(target)
     if args.exclude_spans:
         marked = json.loads(args.exclude_spans.read_text(encoding="utf-8"))
         if isinstance(marked, dict):
+            if marked.get("target_sha256", target_sha256) != target_sha256:
+                parser.error("Exclusion marks belong to a different source audio")
             marked = marked.get("spans", [])
         effective_options["user_excluded_spans"] = marked
     if args.experimental_adjacent_domain_rescue:
@@ -88,10 +91,11 @@ def main() -> int:
         ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True,
     ).strip()
     inputs = {
-        "target": sha256(target),
+        "target": target_sha256,
         "subtitle": sha256(subtitle) if subtitle else None,
         "references": [sha256(path) for path in references],
         "negative_groups": [[sha256(path) for path in group] for group in negatives],
+        "excluded_spans": sha256(args.exclude_spans) if args.exclude_spans else None,
     }
     started = time.monotonic()
     last_percent = -1
@@ -121,6 +125,7 @@ def main() -> int:
         "inputs_sha256": inputs,
         "options": asdict(options),
         "cli_overrides": {
+            "excluded_spans": str(args.exclude_spans.resolve()) if args.exclude_spans else None,
             "experimental_adjacent_domain_rescue": args.experimental_adjacent_domain_rescue,
             "experimental_internal_reassembly": args.experimental_internal_reassembly,
             "experimental_final_island_consensus": args.experimental_final_island_consensus,
@@ -133,6 +138,7 @@ def main() -> int:
     report_path.write_text(json.dumps(provenance, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"BATCH_MANIFEST={result.manifest_path}", flush=True)
     print(f"PROVENANCE={report_path}", flush=True)
+    print(f"ZIP={result.archive_path}", flush=True)
     return 0
 
 

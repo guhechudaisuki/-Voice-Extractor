@@ -41,8 +41,9 @@ class _StubMatch:
     tier = "strong"
     diagnostics = {}
 
-    def __init__(self, accepted: bool = True) -> None:
+    def __init__(self, accepted: bool = True, diagnostics=None) -> None:
         self.accepted = accepted
+        self.diagnostics = dict(diagnostics or {})
 
 
 class _StubVerifier:
@@ -52,7 +53,7 @@ class _StubVerifier:
     def exclusion_audit(self, match, profile, exclusion_profiles, **_kwargs):
         if self.reject_exclusion:
             return {"excluded_role_rejected": True, "excluded_role": "排除角色 1"}
-        return {}
+        return {"excluded_role_rejected": False, "excluded_primary_margin": 0.23}
 
 
 def accepted_turn(start: float, end: float) -> CandidateSentence:
@@ -73,7 +74,8 @@ class UserMarkedExclusionTests(unittest.TestCase):
         self.verifier = _StubVerifier()
 
     def run_gate(self, accepted, rejected, marks, verifier=None,
-                 verify_accepted: bool = True, classifier_score=None):
+                 verify_accepted: bool = True, classifier_score=None,
+                 match_diagnostics=None):
         if classifier_score is None:
             self.pipeline._ensure_tail_scorer = lambda: None
         else:
@@ -102,7 +104,7 @@ class UserMarkedExclusionTests(unittest.TestCase):
             self.pipeline._ensure_tail_scorer = lambda: pack
         self.pipeline._verify_speaker_span = (
             lambda _verifier, _wave, _span, _profile, _threshold, **_kw: _StubMatch(
-                accepted=verify_accepted
+                accepted=verify_accepted, diagnostics=match_diagnostics,
             )
         )
         return self.pipeline._apply_user_marked_exclusions(
@@ -166,7 +168,35 @@ class UserMarkedExclusionTests(unittest.TestCase):
         self.assertEqual(removed, 1)
         self.assertEqual(accepted, [])
 
-    def test_classifier_pass_keeps_remainder_without_formal_verify(self):
+    def test_exclusion_rejection_takes_priority_over_classifier_score(self):
+        turn = accepted_turn(11.17, 14.89)
+        accepted = [turn]
+        rejected = []
+        self.run_gate(
+            accepted, rejected, [(12.99, 15.46)],
+            verifier=_StubVerifier(reject_exclusion=True),
+            verify_accepted=True, classifier_score=4.2,
+        )
+        self.assertEqual(accepted, [])
+        self.assertIn(turn, rejected)
+
+    def test_rejected_parent_cannot_remain_an_exported_accepted_clip(self):
+        for bounds in ((11.17, 14.89), (13.0, 14.5)):
+            with self.subTest(bounds=bounds):
+                turn = accepted_turn(*bounds)
+                turn.audio_file = "audio/old.wav"
+                turn.text_file = "text/old.txt"
+                turn.video_file = "video/old.mp4"
+                accepted = [turn]
+                rejected = []
+                self.run_gate(accepted, rejected, [(12.99, 15.46)])
+                self.assertIn(turn, rejected)
+                self.assertFalse(turn.accepted)
+                self.assertEqual(turn.audio_file, "")
+                self.assertEqual(turn.text_file, "")
+                self.assertEqual(turn.video_file, "")
+
+    def test_classifier_cannot_keep_remainder_without_formal_verification(self):
         turn = accepted_turn(11.17, 14.89)
         accepted = [turn]
         rejected: list[CandidateSentence] = []
@@ -175,11 +205,38 @@ class UserMarkedExclusionTests(unittest.TestCase):
             verify_accepted=False, classifier_score=4.2,
         )
         self.assertEqual(removed, 1)
-        self.assertEqual(len(accepted), 1)
+        self.assertEqual(accepted, [])
+        self.assertIn(turn, rejected)
+
+    def test_trimmed_remainder_records_its_own_identity_evidence(self):
+        turn = accepted_turn(11.17, 14.89)
+        turn.diagnostics = {
+            "duration": 3.72,
+            "speaker_tier": "raw_rescue",
+            "excluded_primary_margin": 0.8,
+            "target_locator_recovery": True,
+            "local_identity_audit": {
+                "span": [11.17, 14.89], "passed": True,
+            },
+        }
+        accepted = [turn]
+        self.run_gate(
+            accepted, [], [(12.99, 15.46)],
+            match_diagnostics={"duration": 1.82, "raw_channel_available": True},
+        )
         trimmed = accepted[0]
-        self.assertAlmostEqual(trimmed.end, 12.99, places=2)
+        self.assertEqual(trimmed.speaker_score, 0.75)
+        self.assertEqual(trimmed.diagnostics["duration"], 1.82)
+        self.assertEqual(trimmed.diagnostics["speaker_tier"], "strong")
+        self.assertTrue(trimmed.diagnostics["raw_channel_available"])
+        self.assertEqual(trimmed.diagnostics["excluded_primary_margin"], 0.23)
+        self.assertNotIn("local_identity_audit", trimmed.diagnostics)
+        self.assertNotIn("target_locator_recovery", trimmed.diagnostics)
+        provenance = trimmed.diagnostics["user_marked_trim"]["provenance"]
+        self.assertEqual(provenance["diagnostics"]["duration"], 3.72)
         self.assertEqual(
-            trimmed.diagnostics['user_marked_trim']['classifier']['mean_score'], 4.2
+            provenance["diagnostics"]["local_identity_audit"]["span"],
+            [11.17, 14.89],
         )
 
     def test_options_normalize_marked_spans(self):

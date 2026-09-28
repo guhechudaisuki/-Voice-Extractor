@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -18,6 +19,16 @@ from src.model.modeling_enh import VoiceFilter
 
 
 SAMPLE_RATE = 16000
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 CASES = (
     ("reviewed_target_303", 303.38, 307.79),
     ("reviewed_target_788", 788.42, 802.42),
@@ -111,7 +122,8 @@ def main() -> None:
         print(json.dumps(row, ensure_ascii=False), flush=True)
     output_peak = float(output.abs().max())
     playback = output * (0.95 / max(output_peak, 0.95))
-    sf.write(str(destination / "FULL_EPISODE_UNVERIFIED.wav"), playback.numpy(), SAMPLE_RATE,
+    playback_path = destination / "FULL_EPISODE_UNVERIFIED.wav"
+    sf.write(str(playback_path), playback.numpy(), SAMPLE_RATE,
              subtype="PCM_16")
     for name, start, end in CASES:
         left, right = round(start * SAMPLE_RATE), round(end * SAMPLE_RATE)
@@ -120,6 +132,10 @@ def main() -> None:
     report = {
         "purpose": "development_only_not_training_audio_or_identity_acceptance",
         "source": str(source_path), "reference": str(refs[args.reference_index]),
+        "source_sha256": sha256(source_path),
+        "reference_sha256": sha256(refs[args.reference_index]),
+        "model_weight_sha256": sha256(MODEL_DIR / "pytorch_model.bin"),
+        "output_sha256": sha256(playback_path),
         "channel": args.channel, "channel_mode": "first", "sample_rate": SAMPLE_RATE,
         "duration_seconds": source.numel() / SAMPLE_RATE,
         "model_chunk_seconds": model.wav_chunk_size / SAMPLE_RATE,
