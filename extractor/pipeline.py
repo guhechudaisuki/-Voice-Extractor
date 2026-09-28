@@ -6044,13 +6044,52 @@ class ExtractionPipeline:
                 if local_models is not None and self._local_identity_reject_threshold is not None:
                     from .local_identity_classifier import audit_candidates, score_window
 
-                    local_rejected = audit_candidates(
+                    local_rejected, trim_proposals = audit_candidates(
                         accepted_turns, rejected, target_waveform,
                         lambda wave: score_window(local_models, wave),
                         self._local_identity_reject_threshold,
                         model_sha256=self._local_identity_model_sha256,
+                        min_output_seconds=self.options.min_output_seconds,
                     )
                     progress(0.80, f"局部模型复核：撤回 {local_rejected} 个含持续非目标声音的回合")
+                    trimmed = 0
+                    for proposal in trim_proposals:
+                        source = proposal["source"]
+                        span_start, span_end = proposal["span"]
+                        child_span = TimeSpan(span_start, span_end)
+                        if any(
+                            min(child_span.end, existing.end)
+                            - max(child_span.start, existing.start) > 0.10
+                            for existing in accepted_turns
+                        ):
+                            continue
+                        child_match = self._verify_speaker_span(
+                            verifier, target_waveform, child_span, profile,
+                            effective_threshold, audit_raw=True,
+                        )
+                        child_exclusion = verifier.exclusion_audit(
+                            child_match, profile, exclusion_profiles,
+                        ) or {}
+                        if not child_match.accepted or child_exclusion.get(
+                                "excluded_role_rejected"):
+                            continue
+                        child = CandidateSentence(span_start, span_end, "")
+                        self._apply_speaker_match(
+                            child, child_match, profile, effective_threshold,
+                        )
+                        child.diagnostics.update(child_exclusion)
+                        child.diagnostics["classifier_veto_trim"] = {
+                            "parent_span": proposal["parent_span"],
+                            "kept_span": [span_start, span_end],
+                            "windows": proposal["windows"],
+                        }
+                        accepted_turns.append(child)
+                        trimmed += 1
+                    if trimmed:
+                        progress(
+                            0.80,
+                            f"否决后修剪：保留 {trimmed} 个撤回回合中的已验证干净段",
+                        )
                 certified = sum(
                     self._install_acoustic_identity_certificate(candidate)
                     for candidate in accepted_turns
