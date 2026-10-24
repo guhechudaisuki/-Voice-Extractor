@@ -67,6 +67,9 @@ class PipelineOptions:
     cluster_wespeaker_arbitration: bool = True
     # 双轨（Stem+Raw）边缘复核：UVR 伪影误杀的边缘轮次用原轨救回（只救不杀）。
     cluster_raw_crosscheck: bool = True
+    # Stage 12：run_many 批内跨集高纯度种子共享池（前序集四模型满分核心句
+    # 为后续集提供跨集同源证据；merge 一半权重仍锚在用户原始参考）。
+    cluster_cross_episode_pool: bool = True
     speaker_threshold: float = 0.68
     # Gaps shorter than the lower bound are detector jitter inside one speech
     # island. Gaps within [min, max] may be joined only after same-speaker
@@ -182,6 +185,7 @@ class ExtractionPipeline:
         self._stage_audit: dict | None = None
         self._cluster_report: dict | None = None
         self._cluster_accepted_spans: list | None = None
+        self._batch_bank: list = []
         self._verified_fallback_registry: dict[int, list[CandidateSentence]] = {}
         self._verified_fallback_anchors: list[CandidateSentence] = []
         self._tail_scorer_cache: tuple | str | None = None
@@ -4719,6 +4723,40 @@ class ExtractionPipeline:
         partial_archive.replace(archive_path)
         return manifest, srt_path, archive_path
 
+    def _collect_cross_episode_bank(self, analyzer, turns, result, blocked) -> int:
+        """Stage 12：收集本集四模型一致满分的无争议核心句入批内共享池。
+
+        准入：p>=0.82、s>=0.80、WavLM>=0.93、时长 >= 2.0s、簇级核心成员
+        （非边缘）、不与用户排除/阻塞区间重叠。池上限 24 条，按双通道
+        最低分降序保留，deduplicate 去近似重复。
+        """
+        from .nextgen.bootstrap_bank import BootstrapVector, deduplicate
+        collected = 0
+        for turn in turns:
+            if (not turn.usable or turn.duration < 2.0
+                    or not result.membership[turn.index]
+                    or (len(result.borderline_membership) == len(turns)
+                        and result.borderline_membership[turn.index])):
+                continue
+            if any(min(turn.end, b) > max(turn.start, a) for a, b in blocked):
+                continue
+            scores, _negatives = analyzer.scores(turn.primary, turn.secondary)
+            if scores[0] < 0.82 or scores[1] < 0.80:
+                continue
+            if analyzer.tertiary is not None:
+                tertiary = analyzer.tertiary_score(turn)
+                if tertiary is None or tertiary < 0.93:
+                    continue
+            self._batch_bank.append(BootstrapVector(
+                analyzer.source_hash, turn.start, turn.end, turn.speech_seconds,
+                turn.primary, turn.secondary, min(scores), ()))
+            collected += 1
+        if self._batch_bank:
+            self._batch_bank = deduplicate(self._batch_bank)
+            self._batch_bank.sort(key=lambda vector: -vector.confidence)
+            del self._batch_bank[24:]
+        return collected
+
     def _apply_cluster_identity(self, stem, references, negative_reference_groups,
                                 verifier, profile, split_result, accepted_turns, rejected,
                                 target, job_id, progress):
@@ -4755,6 +4793,8 @@ class ExtractionPipeline:
                 quaternary_encoder=quaternary,
                 raw_stem=raw_stem,
             )
+            if self.options.cluster_cross_episode_pool:
+                analyzer.cross_bank = tuple(getattr(self, "_batch_bank", []) or ())
             try:
                 spans = [(t.start, t.end) for t in split_result]
                 settings = dict(margin=self.options.cluster_target_margin,
@@ -4788,6 +4828,13 @@ class ExtractionPipeline:
                 # STT 精裁阶段要用已验证干净区间判定每个文本分片的归属。
                 self._cluster_accepted_spans = list(
                     cluster_result.diagnostics.get("accepted_spans") or [])
+                # Stage 12：本集四模型满分核心句入批内共享池，供后续集数使用。
+                if self.options.cluster_cross_episode_pool:
+                    collected = self._collect_cross_episode_bank(
+                        analyzer, cluster_turns, cluster_result, blocked)
+                    if collected:
+                        progress(0.80, f"跨集共享池新增 {collected} 条高纯度种子"
+                                f"（共 {len(self._batch_bank)} 条）")
                 if self.options.cluster_identity_mode == "enforce":
                     arbitrated = analyzer.wespeaker_arbitrate(accepted_turns, rejected)
                     if arbitrated:
@@ -6678,6 +6725,8 @@ class ExtractionPipeline:
         batch_id = time.strftime("%Y%m%d_%H%M%S") + "_batch_" + uuid.uuid4().hex[:6]
         batch_dir = OUTPUT_ROOT / batch_id
         batch_dir.mkdir(parents=True, exist_ok=False)
+        # Stage 12：批内跨集共享池从空开始，逐集累积。
+        self._batch_bank = []
         results: list[PipelineResult] = []
         target_count = len(target_paths)
 

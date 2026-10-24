@@ -74,6 +74,10 @@ WAVLM_SV_MODEL = (
     _configured_path("VOICE_EXTRACT_WAVLM_MODEL")
     or MODEL_ROOT / "speaker" / "wavlm-base-plus-sv"
 )
+CLASSIFIER_V2_MODEL = (
+    _configured_path("VOICE_EXTRACT_CLASSIFIER_V2_MODEL")
+    or ASSET_ROOT / "models" / "anime_t3" / "classifier_v2.pt"
+)
 WESPEAKER_MODEL = (
     _configured_path("VOICE_EXTRACT_WESPEAKER_MODEL")
     or MODEL_ROOT / "speaker" / "wespeaker-resnet34-lm" / "onnx" / "model.onnx"

@@ -56,6 +56,7 @@ class ClusterAnalyzer:
     raw_waveform = None
 
     auto_negatives: list = []
+    cross_bank: tuple = ()
 
     def __init__(self, stem, references, negative_groups=(), *, device="cuda",
                  cache_enabled=True, encoders=None, progress=None,
@@ -526,6 +527,7 @@ class ClusterAnalyzer:
         }
         turn_clean_spans = {}
         demoted = []
+        cross_rescued = []
 
         def check(profile, *, strict=False):
             def window_ok(a, b, p, s):
@@ -636,6 +638,15 @@ class ClusterAnalyzer:
                     if all(row["accepted"] for row in expanded):
                         supports[key] = evidence_spans(independent)
                         rows = [{**row, "reference": "bootstrap"} for row in expanded]
+            if not all(row["accepted"] for row in rows) and self.cross_bank:
+                # Stage 12：跨集高纯度共享池。与单文件自举同机制——合并剖面
+                # 一半权重锚在用户原始参考（merge_profile 保持参考下限不变），
+                # 且要求全部窗口在合并剖面下通过才放行，绝不降低任何阈值。
+                cross_profile = merge_profile(self.profile, list(self.cross_bank))
+                expanded = check(cross_profile, strict=True)
+                if all(row["accepted"] for row in expanded):
+                    rows = [{**row, "reference": "cross_episode"} for row in expanded]
+                    cross_rescued.append(turn.index)
             clean = extract_spans(turn, rows)
             if clean and turn.duration <= SHORT_TURN_SECONDS:
                 # 短句 + 副通道贴近下限（或竞争余量弱 / 窗口部分未过）：
@@ -675,6 +686,8 @@ class ClusterAnalyzer:
         diagnostics["turn_clean_spans"] = turn_clean_spans
         if demoted:
             diagnostics["short_weak_demoted"] = demoted
+        if cross_rescued:
+            diagnostics["cross_episode_rescued_turns"] = cross_rescued
         if bank:
             diagnostics["bootstrap_supports"] = supports
         return replace(candidates, membership=tuple(membership),
@@ -697,4 +710,5 @@ class ClusterAnalyzer:
                              "hash": self.tertiary_hash or None,
                              "cache_hits": self.tertiary_cache.hits if self.tertiary_cache else 0,
                              "cache_misses": self.tertiary_cache.misses if self.tertiary_cache else 0},
-                "bootstrap": self.bootstrap_provenance}
+                "bootstrap": self.bootstrap_provenance,
+                "cross_bank_size": len(self.cross_bank)}

@@ -53,6 +53,7 @@ def main() -> int:
             cluster_wavlm_channel=bool(options_data.get("cluster_wavlm_channel", True)),
             cluster_wespeaker_arbitration=bool(options_data.get("cluster_wespeaker_arbitration", True)),
             cluster_raw_crosscheck=bool(options_data.get("cluster_raw_crosscheck", True)),
+            cluster_cross_episode_pool=bool(options_data.get("cluster_cross_episode_pool", True)),
             speaker_threshold=float(options_data.get("speaker_threshold", 0.68)),
             silence_min_seconds=float(options_data.get("silence_min_seconds", 0.20)),
             silence_split_seconds=float(options_data.get("silence_max_seconds", 0.85)),

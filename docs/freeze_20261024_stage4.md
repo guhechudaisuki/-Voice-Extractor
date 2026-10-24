@@ -44,3 +44,30 @@ runtime/python.exe -B -m unittest discover -s tests        # 518 项全部通过
 ## 回滚
 
 `git checkout v2.01`（tag 不存在则 `a287fe1`）即回 2.01 基线；模型 `.previous` 备份机制不变。
+
+
+---
+
+# 定档补记：v2.03（Stage 9(3)、11(2)、12 尾部项补齐 —— Stage 1–12 计划 100% 完整）
+
+本节追加于 v2.02 定档之后。三个尾部项全部落地，**计划书 Stage 1–12 至此无遗留**。
+
+## 本轮新增
+
+1. **Stage 9(3)：classifier_v2.pt 参考重绑定（`launcher/model_reinforcement.py: rebind_classifier_references`）**
+   模型强化成功后自动执行：用本次标注的正/负片段对冻结分类头做**阈值再校准**（veto 阈值压到全部正例窗口分之下、rescue 阈值抬到全部负例整句均分之上，0.1 安全边距），并把 `reference_sha256` 重绑到本次参考集——"一换参考音频 0.5s 局部分类器就静默罢工"的历史顽疾就此关闭。权重不动、原子写入、`.previous` 备份；多参考集会话与正负分布重叠时保守跳过。
+2. **Stage 11(2)：partial 保留段台词修正输入框**
+   Desktop（`askstring` 预填 `_partial_clip_text` 自动切片结果）与 WebUI（`#partialText` 输入框）均可编辑 `review.partial_text`；导出端（`d497067` 已落地的 `_partial_clip_text`）按 显式填写 > 字幕子片段 > 比例切片 优先级取词，`train.list` 音字 100% 对齐。`clean_reviews` 白名单与 `ItemReview` 模型已放行该字段。
+3. **Stage 12：run_many 批内跨集高纯度共享池（`cluster_cross_episode_pool` 选项，默认开）**
+   每集簇级判决完成后，收集四模型一致满分核心句（p≥0.82 / s≥0.80 / WavLM≥0.93 / ≥2.0s / 非边缘 / 不与排除区间重叠）入批内池（`deduplicate` 去重 + 24 条上限按 confidence 降序）；后续集数的 `verify_temporal` 在原始剖面失败时尝试跨集合并剖面（`merge_profile` 一半权重仍锚在用户原始参考、参考下限不变、全部窗口 strict 通过才放行），命中窗口标记 `reference="cross_episode"` 并计入 `cross_episode_rescued_turns`。单文件自举的同源豁免语义不受影响。
+
+## 验证（v2.03 定档口径）
+
+- 离线回放（`docs/high_recall_stage5_11_20261024.json`）：**拦截 41/41 = 100%、Tier A 重叠对 0（6 集）、覆盖 95/92.5/100% 一分不掉**，四门禁全过。
+- 单元测试 **532 项全过**（新增重绑定×2、跨集池×2、partial_text 管道×2）。
+- Smoke：训练工作流 + 原生桌面全流程（真实 WavLM 训练 + 真实重绑定 + 原型库，**新增生产 classifier_v2.pt 哈希不变断言**）；tier/training/cluster 三个浏览器 smoke 通过（QA 18784）。
+- 说明：真实整集端到端推理与人工听音按所有者要求留待 UI 实跑；4→6 个本地提交未 push。
+
+## 定档
+
+tag `v2.03` = 本文件所在提交。回滚链：`v2.03 → v2.02 → v2.01(a287fe1)`。Stage 1–12 全部完成，无计划内遗留。

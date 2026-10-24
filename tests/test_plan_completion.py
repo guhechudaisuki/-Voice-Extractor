@@ -281,3 +281,155 @@ class PartialClipTextTests(unittest.TestCase):
         from launcher.review_export import _partial_clip_text
         row = {"start": 0.0, "end": 10.0, "text": "abcdefghij"}
         self.assertEqual(_partial_clip_text(row, {}, (2.0, 6.0)), "cdef")
+
+
+class ClassifierRebindTests(unittest.TestCase):
+    def _make_payload(self, classifier):
+        import torch
+        payload = {"state_dict": {}, "input_dim": 4, "threshold": 0.75,
+                   "reject_threshold": -4.0, "reference_sha256": ["legacy"],
+                   "calibration_status": "passed", "veto_status": "active",
+                   "window_seconds": 0.5, "stride_seconds": 0.25}
+        torch.save(payload, classifier)
+
+    def test_rebind_recalibrates_and_rebinds(self):
+        import hashlib
+        import io
+        import tempfile
+        import numpy as np
+        import soundfile as sf
+        import torch
+        from launcher.model_reinforcement import rebind_classifier_references
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sr = 16000
+            axis = np.linspace(0, 2.0, sr * 2, dtype=np.float32)
+            pos, neg, ref = root / 'pos.wav', root / 'neg.wav', root / 'ref.wav'
+            sf.write(pos, 0.5 * np.sin(2 * np.pi * 220 * axis), sr)
+            sf.write(neg, 0.05 * np.sin(2 * np.pi * 220 * axis), sr)
+            sf.write(ref, 0.3 * np.sin(2 * np.pi * 220 * axis), sr)
+            classifier = root / 'classifier_v2.pt'
+            self._make_payload(classifier)
+            ref_sha = hashlib.sha256(ref.read_bytes()).hexdigest()
+            items = [
+                {"path": str(pos), "review": {"label": "correct"},
+                 "reference_paths": [str(ref)]},
+                {"path": str(neg), "review": {"label": "wrong"},
+                 "reference_paths": [str(ref)]},
+            ]
+            scorer = lambda wave: 5.0 if float(wave.abs().mean()) > 0.2 else -5.0  # noqa: E731
+            result = rebind_classifier_references(
+                items, lambda message: None, classifier_path=classifier, scorer_fn=scorer)
+            self.assertIsNotNone(result)
+            reloaded = torch.load(classifier, map_location='cpu', weights_only=True)
+            self.assertEqual(reloaded['reference_sha256'], [ref_sha])
+            self.assertAlmostEqual(reloaded['reject_threshold'], 4.9, places=6)
+            self.assertAlmostEqual(reloaded['threshold'], -4.9, places=6)
+            self.assertEqual(reloaded['calibration_status'], 'reinforced')
+            self.assertTrue(classifier.with_suffix('.pt.previous').is_file())
+
+    def test_rebind_skips_multi_context_sessions(self):
+        import io
+        import tempfile
+        import torch
+        from launcher.model_reinforcement import rebind_classifier_references
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            classifier = root / 'classifier_v2.pt'
+            self._make_payload(classifier)
+            import soundfile as sf
+            import numpy as np
+            axis = np.linspace(0, 1.0, 16000, dtype=np.float32)
+            r1, r2 = root / 'r1.wav', root / 'r2.wav'
+            sf.write(r1, 0.3 * np.sin(2 * np.pi * 220 * axis), 16000)
+            sf.write(r2, 0.3 * np.sin(2 * np.pi * 330 * axis), 16000)
+            items = [
+                {"path": str(root / 'a.wav'), "review": {"label": "correct"},
+                 "reference_paths": [str(r1)]},
+                {"path": str(root / 'b.wav'), "review": {"label": "wrong"},
+                 "reference_paths": [str(r2)]},
+            ]
+            messages = []
+            result = rebind_classifier_references(
+                items, messages.append, classifier_path=classifier,
+                scorer_fn=lambda wave: 1.0)
+            self.assertIsNone(result)
+            reloaded = torch.load(classifier, map_location='cpu', weights_only=True)
+            self.assertEqual(reloaded['reference_sha256'], ["legacy"])
+            self.assertTrue(any('多个参考集' in message for message in messages))
+
+
+class CrossEpisodeBankTests(unittest.TestCase):
+    def test_cross_bank_rescues_window_that_original_profile_rejects(self):
+        import numpy as np
+        from extractor.nextgen.bootstrap_bank import BootstrapVector
+        from extractor.nextgen.cluster_runtime import ClusterAnalyzer
+        from extractor.nextgen.identity_cluster import TargetProfile, TurnEvidence
+        from test_high_recall_cluster import make_result
+
+        def unit(vector):
+            vector = np.asarray(vector, dtype=np.float64)
+            return vector / np.linalg.norm(vector)
+
+        def vector(degrees):
+            angle = np.deg2rad(degrees)
+            return unit([np.cos(angle), np.sin(angle)])
+
+        analyzer = ClusterAnalyzer.__new__(ClusterAnalyzer)
+        analyzer.profile = TargetProfile(vector(0), vector(0), .68, .64)
+        analyzer.negatives = []
+        analyzer.progress = lambda message: None
+        analyzer.cross_bank = (BootstrapVector(
+            "episode-002", 0.0, 3.0, 3.0, vector(60), vector(60), .95, ()),)
+        analyzer.embed = lambda a, b: (vector(60), vector(60))
+        turns = [TurnEvidence(0, 0.0, 4.0, 4.0, vector(60), vector(60))]
+        candidates = make_result(turns)
+        result, local = analyzer.verify_temporal(turns, candidates)
+        # 原始剖面（0°）拒绝 60° 窗口；跨集共享池把合并剖面拉到 30° 后放行
+        #（4s 轮次避开短句降级边界，专注验证跨集合并剖面本身）。
+        if not result.membership[0]:
+            self.fail(f"rows={local.get('0')} diag={result.diagnostics}")
+        self.assertTrue(all(row.get("reference") == "cross_episode"
+                            for row in local.get("0", [])))
+        self.assertEqual(result.diagnostics.get("cross_episode_rescued_turns"), [0])
+
+    def test_without_cross_bank_window_stays_rejected(self):
+        import numpy as np
+        from extractor.nextgen.cluster_runtime import ClusterAnalyzer
+        from extractor.nextgen.identity_cluster import TargetProfile, TurnEvidence
+        from test_high_recall_cluster import make_result
+
+        def unit(vector):
+            vector = np.asarray(vector, dtype=np.float64)
+            return vector / np.linalg.norm(vector)
+
+        def vector(degrees):
+            angle = np.deg2rad(degrees)
+            return unit([np.cos(angle), np.sin(angle)])
+
+        analyzer = ClusterAnalyzer.__new__(ClusterAnalyzer)
+        analyzer.profile = TargetProfile(vector(0), vector(0), .68, .64)
+        analyzer.negatives = []
+        analyzer.progress = lambda message: None
+        analyzer.cross_bank = ()
+        analyzer.embed = lambda a, b: (vector(60), vector(60))
+        turns = [TurnEvidence(0, 0.0, 4.0, 4.0, vector(60), vector(60))]
+        candidates = make_result(turns)
+        result, _local = analyzer.verify_temporal(turns, candidates)
+        self.assertFalse(result.membership[0])
+
+
+class PartialTextPlumbingTests(unittest.TestCase):
+    def test_clean_reviews_keeps_partial_text(self):
+        from launcher.training_material import clean_reviews
+        cleaned = clean_reviews({"1": {"label": "partial", "partial_text": "正文",
+                                       "junk": 1}})
+        self.assertEqual(cleaned["1"]["partial_text"], "正文")
+        self.assertNotIn("junk", cleaned["1"])
+
+    def test_item_review_model_accepts_partial_text(self):
+        from launcher.webui_server import ItemReview
+        item = ItemReview(ordinal=1, filename="a.wav", label="partial",
+                          partial_start=0.0, partial_end=1.0,
+                          partial_text="保留段台词")
+        self.assertEqual(item.partial_text, "保留段台词")

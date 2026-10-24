@@ -763,6 +763,7 @@ function decide(label) {
     label: label,
     partial_start: label === "partial" ? parseFloat($("trimStart").value) : null,
     partial_end: label === "partial" ? parseFloat($("trimEnd").value) : null,
+    partial_text: label === "partial" ? (($("partialText") || {}).value || "").trim() || null : null,
   };
 
   reflectReview(seg.ordinal);
@@ -788,6 +789,8 @@ function reflectReview(ordinal) {
   const seg = currentSegment();
   if (review.label === "partial" && seg) {
     $("trimBox").hidden = false;
+    const partialInput = $("partialText");
+    if (partialInput) partialInput.value = review.partial_text || "";
     $("trimStart").value = (review.partial_start ?? 0).toFixed(2);
     $("trimEnd").value = (review.partial_end ?? seg.duration).toFixed(2);
   } else {

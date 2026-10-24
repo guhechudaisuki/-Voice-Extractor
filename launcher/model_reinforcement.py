@@ -20,6 +20,118 @@ EPOCHS = 60
 BATCH_SIZE = 64
 
 
+def rebind_classifier_references(items, progress, *, classifier_path: Path | None = None,
+                                 scorer_fn=None) -> dict | None:
+    """把 classifier_v2.pt 重绑定到本次强化的参考集（Stage 9(3)）。
+
+    历史顽疾：classifier_v2.pt 的 veto/rescue 阈值按训练时的参考集校准，
+    用户一换参考音频加载器即静默罢工。本函数用本次强化标注的片段做
+    阈值再校准（权重冻结不动）：reject 阈值压到全部正例窗口分之下、
+    rescue 阈值抬到全部负例整句均分之上，并把 reference_sha256 重绑到
+    本次参考集。多参考集会话与校准不可行（正负分布重叠）时保守跳过。
+    """
+    import io
+    import numpy as np
+    import torch
+
+    from extractor.config import CLASSIFIER_V2_MODEL, WAVLM_SV_MODEL
+    from extractor.model_store import file_sha256
+
+    path = Path(classifier_path) if classifier_path else Path(CLASSIFIER_V2_MODEL)
+    if not path.is_file():
+        return None
+    positives = [str(item["path"]) for item in items
+                 if item.get("review", {}).get("label") == "correct"]
+    negatives = [str(item["path"]) for item in items
+                 if item.get("review", {}).get("label") == "wrong"]
+    if not positives or not negatives:
+        return None
+    # 单参考集会话才可重绑定：加载器按单一有序哈希列表精确比对。
+    context_hashes = None
+    for item in items:
+        paths = item.get("reference_paths") or []
+        hashes = sorted(file_sha256(Path(value)) for value in paths)
+        if context_hashes is None:
+            context_hashes = hashes
+        elif hashes != context_hashes:
+            progress("classifier_v2 重绑定跳过：本次强化包含多个参考集")
+            return None
+    if not context_hashes:
+        return None
+
+    payload = torch.load(io.BytesIO(path.read_bytes()), map_location="cpu", weights_only=True)
+    if payload.get("calibration_status") not in {"passed", "reinforced"}:
+        return None
+
+    if scorer_fn is None:
+        from transformers import Wav2Vec2FeatureExtractor, WavLMForXVector
+        from extractor.local_identity_classifier import score_window
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        encoder = WavLMForXVector.from_pretrained(
+            str(WAVLM_SV_MODEL), local_files_only=True).to(device).eval()
+        encoder.requires_grad_(False)
+        processor = Wav2Vec2FeatureExtractor.from_pretrained(
+            str(WAVLM_SV_MODEL), local_files_only=True)
+        clf = torch.nn.Sequential(
+            torch.nn.Linear(payload["input_dim"], 256),
+            torch.nn.ReLU(),
+            torch.nn.Linear(256, 1),
+        )
+        clf.load_state_dict(payload["state_dict"])
+        clf.to(device).eval()
+        models = (encoder, processor, clf, float(payload["threshold"]), device)
+        scorer_fn = lambda wave: score_window(models, wave)  # noqa: E731
+
+    from extractor.audio import load_mono
+    from extractor.local_identity_classifier import window_starts
+
+    def window_scores(clip_path):
+        wave = load_mono(Path(clip_path), 16000)
+        scores = []
+        for offset in window_starts(len(wave)):
+            local = wave[offset:offset + 8000]
+            if float(local.square().mean()) < 1e-8:
+                continue
+            scores.append(float(scorer_fn(local)))
+        return scores
+
+    positive_scores = []
+    for clip in positives:
+        positive_scores.extend(window_scores(clip))
+    negative_means = []
+    for clip in negatives:
+        scores = window_scores(clip)
+        if scores:
+            negative_means.append(float(np.mean(scores)))
+    if not positive_scores or not negative_means:
+        progress("classifier_v2 重绑定跳过：正/负例窗口证据不足")
+        return None
+    new_reject = min(positive_scores) - 0.1
+    new_rescue = max(negative_means) + 0.1
+    if new_rescue >= new_reject - 0.2:
+        progress("classifier_v2 重绑定跳过：本次标注的正负分布重叠，校准不可行")
+        return None
+
+    backup = path.with_suffix(path.suffix + ".previous")
+    backup.write_bytes(path.read_bytes())
+    payload["reference_sha256"] = list(context_hashes)
+    payload["reject_threshold"] = new_reject
+    payload["threshold"] = new_rescue
+    payload["calibration_status"] = "reinforced"
+    payload["veto_status"] = "active"
+    payload["rebound_from"] = {
+        "reject_threshold": payload.get("reject_threshold"),
+        "threshold": payload.get("threshold"),
+    }
+    temporary = path.with_suffix(path.suffix + ".rebond")
+    torch.save(payload, temporary)
+    os.replace(temporary, path)
+    progress(f"classifier_v2 已重绑定到本次参考集（veto {new_reject:.2f} / rescue {new_rescue:.2f}），"
+             "原权重未改动，备份 .previous")
+    return {"reject_threshold": new_reject, "threshold": new_rescue,
+            "reference_count": len(context_hashes)}
+
+
 def update_auto_negative_prototypes(items, model_dir: Path, progress) -> int:
     """把用户标注的整句非目标沉淀为持久排除角色原型（auto_negatives.npz）。
 
@@ -324,6 +436,10 @@ def _train_current(paths, destination, progress, current):
         update_auto_negative_prototypes(items, current.parent, progress)
     except Exception as exc:  # 原型库失败不影响已完成的模型强化
         progress(f"负例原型库更新失败（模型强化已生效）: {type(exc).__name__}: {exc}")
+    try:
+        rebind_classifier_references(items, progress)
+    except Exception as exc:  # 重绑定失败不影响已完成的模型强化
+        progress(f"classifier_v2 重绑定失败（模型强化已生效）: {type(exc).__name__}: {exc}")
     feature.cache_clear()
     progress(completion_message(report))
     return report

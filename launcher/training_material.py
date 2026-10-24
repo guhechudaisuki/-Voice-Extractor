@@ -102,7 +102,8 @@ def validated_rows(batch_dir: Path, manifest: dict, reviews: dict) -> list[tuple
 def clean_reviews(reviews: dict) -> dict:
     if not isinstance(reviews, dict):
         raise ValueError('标注格式无效')
-    fields = {"ordinal", "filename", "label", "partial_start", "partial_end", "notes"}
+    fields = {"ordinal", "filename", "label", "partial_start", "partial_end",
+              "partial_text", "notes"}
     return {key: {name: value for name, value in item.items() if name in fields}
             for key, item in reviews.items() if isinstance(item, dict)}
 

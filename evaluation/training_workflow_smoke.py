@@ -27,6 +27,14 @@ def main():
     start = time.monotonic()
     production = ROOT / 'model/speaker/wavlm-base-plus-sv/pytorch_model.bin'
     before = digest(production) if production.is_file() else None
+    production_classifier = ROOT / 'models/anime_t3/classifier_v2.pt'
+    classifier_before = (digest(production_classifier)
+                         if production_classifier.is_file() else None)
+    if production_classifier.is_file():
+        isolated_dir = Path(tempfile.mkdtemp(prefix='voice_classifier_isolated_'))
+        isolated_classifier = isolated_dir / 'classifier_v2.pt'
+        shutil.copyfile(production_classifier, isolated_classifier)
+        os.environ['VOICE_EXTRACT_CLASSIFIER_V2_MODEL'] = str(isolated_classifier)
     with tempfile.TemporaryDirectory(prefix='voice_workflow_smoke_') as temporary:
         root = Path(temporary) / 'output'
         root.mkdir()
@@ -127,11 +135,13 @@ def main():
         assert digest(current.with_suffix('.bin.previous')) == before
         assert client.delete(f'/api/training/{repeated_id}').status_code == 200
         assert (digest(production) if production.is_file() else None) == before
+        if classifier_before is not None:
+            assert digest(production_classifier) == classifier_before
         report = {'passed': True, 'synthetic_audio_only': True, 'seconds': round(time.monotonic() - start, 2),
                   'checks': ['direct_zip_import', 'non_zip_rejected', 'duplicate_renamed_zip_skipped_after_restart', 'duplicate_weights_backup_mtime_unchanged', 'real_wavlm_training', 'mixed_episode_and_reference_material', 'same_audio_different_targets',
                              'current_weights_continued', 'automatic_in_place_save', 'previous_model_backup',
                              'updated_model_loaded_and_scored_by_extraction',
-                             'cleanup_preserves_updated_model', 'production_model_unchanged']}
+                             'cleanup_preserves_updated_model', 'production_model_unchanged', 'production_classifier_untouched_by_smoke']}
         output = ROOT / 'work/cluster_p0p2_logs/training_workflow_smoke.json'
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')

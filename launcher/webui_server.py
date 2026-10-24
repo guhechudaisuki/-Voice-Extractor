@@ -144,6 +144,7 @@ class ItemReview(BaseModel):
     label: str
     partial_start: Optional[float] = None
     partial_end: Optional[float] = None
+    partial_text: Optional[str] = None
     notes: Optional[str] = ""
 
 

@@ -41,9 +41,17 @@ def main():
         directory = Path(temporary)
         production = ROOT / 'model/speaker/wavlm-base-plus-sv/pytorch_model.bin'
         production_sha = file_sha256(production)
+        production_classifier = ROOT / 'models/anime_t3/classifier_v2.pt'
+        production_classifier_sha = (file_sha256(production_classifier)
+                                     if production_classifier.is_file() else None)
         assets = directory / 'isolated_assets'
         model_path = assets / 'model/speaker/wavlm-base-plus-sv/pytorch_model.bin'
         shutil.copytree(production.parent, model_path.parent, ignore=shutil.ignore_patterns('.cache', '*.previous', '*.lock'))
+        isolated_classifier = None
+        if production_classifier.is_file():
+            isolated_classifier = assets / 'models/anime_t3/classifier_v2.pt'
+            isolated_classifier.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(production_classifier, isolated_classifier)
         try:
             app = desktop.VoiceExtractorDesktop(root)
             root.geometry('1240x820+40+30')
@@ -104,8 +112,11 @@ def main():
                 assert not any(name.endswith('.zip') for name in archive.namelist())
             raw = archive_path
             train = app.training_tab
-            train.environment_provider = lambda: {'VOICE_EXTRACT_ASSET_ROOT': str(assets),
+            environment = {'VOICE_EXTRACT_ASSET_ROOT': str(assets),
                 'VOICE_EXTRACT_WAVLM_MODEL': str(model_path.parent)}
+            if isolated_classifier is not None:
+                environment['VOICE_EXTRACT_CLASSIFIER_V2_MODEL'] = str(isolated_classifier)
+            train.environment_provider = lambda: environment
             app.main_notebook.select(train.tab_frame)
             with patch('tkinter.filedialog.askopenfilenames', return_value=(str(raw), str(raw))):
                 train.choose_button.invoke()
@@ -142,6 +153,8 @@ def main():
             assert not temp_root.exists()
             assert model_path.is_file()
             assert file_sha256(production) == production_sha
+            if production_classifier_sha is not None:
+                assert file_sha256(production_classifier) == production_classifier_sha
             assert errors == [], errors
             assert not dialog_error.called, dialog_error.call_args_list
             report = {'passed': True, 'ui': 'native_tk_desktop', 'browser_required': False,
@@ -150,7 +163,7 @@ def main():
                                  'flat_annotation_files', 'saved_labels_reload', 'zip_contains_labels_audio_references', 'native_zip_picker', 'real_wavlm_training',
                                  'duplicate_zip_skipped_in_new_worker', 'duplicate_no_weight_or_mtime_change',
                                  'cross_machine_dedup', 'reference_audio_bundled', 'no_manual_person_fields', 'current_weights_continued', 'automatic_in_place_save',
-                                 'previous_model_backup', 'cleanup_preserves_updated_model', 'production_untouched_by_smoke']}
+                                 'previous_model_backup', 'cleanup_preserves_updated_model', 'production_untouched_by_smoke', 'production_classifier_untouched_by_smoke']}
             (output / 'native_desktop_workflow_smoke.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
             print(json.dumps(report), flush=True)
         finally:

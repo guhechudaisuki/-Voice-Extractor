@@ -363,6 +363,7 @@ class DesktopReviewTab:
                 self.segments.append({"ordinal": ordinal, "file": path, "filename": path.name,
                     "duration": max(0, float(row.get("end") or 0)-float(row.get("start") or 0)),
                     "stt_text": prefix + (row.get("text") or row.get("whisper_text", "")),
+                    "row": row,
                     "view": view,
                     "tier": diagnostics.get("speaker_tier", ""),
                     "pathway": "簇级判决" if diagnostics.get("cluster_identity") else "原判决",
@@ -559,6 +560,23 @@ class DesktopReviewTab:
             if end is None or end <= start:
                 return
             partial = {'partial_start': start, 'partial_end': end}
+            # 保留段台词修正框（Stage 11(2)）：预填按字幕/比例自动切片的
+            # 台词，用户可微调；留空 = 导出时自动截取。
+            row = seg.get("row") or {"start": 0.0, "end": seg['duration'],
+                                     "text": seg.get("stt_text", ""),
+                                     "diagnostics": {}}
+            from launcher.review_export import _partial_clip_text
+            from launcher.training_material import partial_keep_segments
+            keep = max(partial_keep_segments(row, partial),
+                       key=lambda piece: piece[1] - piece[0], default=None)
+            prefill = _partial_clip_text(row, {}, keep) if keep else ""
+            text = simpledialog.askstring(
+                '保留段台词', '保留段对应的台词（留空 = 导出时自动按字幕/比例截取）：',
+                initialvalue=prefill, parent=self.root)
+            if text is None:
+                return
+            if text.strip():
+                partial['partial_text'] = text.strip()
         self.reviews[ordinal_str] = {
             "ordinal": seg["ordinal"],
             "filename": seg["filename"],
