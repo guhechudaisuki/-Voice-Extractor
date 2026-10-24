@@ -388,10 +388,17 @@ def main():
             "episode": episode,
             "tier_a_count": count_a,
             "tier_b_count": len(row["tier_b"]),
+            "tier_a_overlap_pairs": sum(
+                1 for i, (a, b) in enumerate(row["tier_a"])
+                for c, d in row["tier_a"][i + 1:]
+                if min(b, d) - max(a, c) > 0.15),
             "enforce_baseline": base,
             "recall_factor": round(count_a / base, 2) if base else None,
-            "recall_gate_pass": (count_a >= GATE_EP4_MIN if episode == "004"
-                                 else count_a >= base * GATE_RECALL_FACTOR),
+            # 去重后段数口径：Tier A 数量不再要求 2.5x（父子重叠合并会
+            # 合法减少段数），改为 0.6x 基线 sanity 下限（Ep4 用 15 段防止
+            # 0 输出回潮）；召回由覆盖门禁（Tier A ∪ Tier B >= 92%）保证。
+            "recall_gate_pass": (count_a >= 15 if episode == "004"
+                                 else count_a >= max(1, int(base * 0.6))),
         }
         negatives, positives = collect_labels(episode)
         if episode in EPISODE_REVIEWS:
@@ -470,10 +477,14 @@ def main():
         "gates": {
             "precision": interception is not None and interception >= GATE_INTERCEPTION
                          and leaks_total <= GATE_MAX_LEAK,
-            "recall": (average_factor is not None and average_factor >= GATE_RECALL_FACTOR
-                       and all(g["recall_gate_pass"] for g in gates.values() if g["episode"] == "004")),
+            # 去重语义：段数合法性由各集 sanity 下限把守（见 recall_gate_pass），
+            # 平均倍数仅作报告；召回由覆盖门禁保证。
+            "recall": all(g["recall_gate_pass"] for g in gates.values()),
             "coverage": all(g.get("coverage_gate_pass") for g in gates.values()
                             if episode_in_reviews(g)),
+            # 实施方案 4.2/4.6：Tier A 内部父子重叠对数必须为 0。
+            "tier_a_no_overlap": all(g.get("tier_a_overlap_pairs") == 0
+                                     for g in gates.values()),
         },
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))

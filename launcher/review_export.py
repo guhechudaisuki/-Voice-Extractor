@@ -14,6 +14,55 @@ def _clip_text(row: dict) -> str:
     return text.replace("|", "／").replace("\n", " ")
 
 
+def _partial_clip_text(row: dict, review: dict, keep: tuple[float, float]) -> str:
+    """partial 保留段对应的台词切片：音字同步，杜绝整句脏文本进 train.list。
+
+    优先级：
+    1. 用户在标注里显式填写的 partial_text；
+    2. 字幕/分片子片段（diagnostics.subtitle_reference 等带绝对时间的
+       {start, end, text} 条目）：只拼接与保留段绝对区间重叠 >= 50% 的
+       子片段台词，按时间顺序连接；
+    3. 无任何子片段时间戳时，按保留区间在整句中的相对位置对整句文本做
+       等比例字符切片（保底）。
+    """
+    duration = max(1e-6, float(row.get("end") or 0) - float(row.get("start") or 0))
+    explicit = str(review.get("partial_text") or "").strip()
+    if explicit:
+        return explicit.replace("|", "／").replace("\n", " ")
+    abs_start = float(row.get("start") or 0) + float(keep[0])
+    abs_end = float(row.get("start") or 0) + float(keep[1])
+    fragments = []
+    diagnostics = row.get("diagnostics") or {}
+    for key in ("subtitle_reference", "subtitle_cues", "stt_fragments"):
+        entries = diagnostics.get(key)
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            text = str(entry.get("text") or "").strip()
+            start = entry.get("aligned_start", entry.get("start"))
+            end = entry.get("aligned_end", entry.get("end"))
+            if not text or not isinstance(start, (int, float)) \
+                    or not isinstance(end, (int, float)):
+                continue
+            overlap = min(abs_end, float(end)) - max(abs_start, float(start))
+            if overlap >= 0.5 * max(1e-6, float(end) - float(start)):
+                fragments.append((float(start), float(end), text))
+    if fragments:
+        fragments.sort()
+        text = "".join(piece for _s, _e, piece in fragments)
+        return text.replace("|", "／").replace("\n", " ").strip()
+    full = _clip_text(row)
+    if not full:
+        return ""
+    left = max(0.0, min(1.0, keep[0] / duration))
+    right = max(0.0, min(1.0, keep[1] / duration))
+    begin = int(len(full) * left)
+    finish = max(begin + 1, int(len(full) * right))
+    return full[begin:finish].strip()
+
+
 def export_review_zip(batch: Path, manifest: dict, reviews: dict, destination: Path,
                       include_material: bool = False, *, gpt_sovits_list: bool = False,
                       speaker: str = "target", language: str = "JA") -> int:
@@ -59,8 +108,9 @@ def export_review_zip(batch: Path, manifest: dict, reviews: dict, destination: P
                         continue
                     entry = f'partial/{piece.name}'
                     archive.write(piece, entry)
-                    exported.append((entry, _clip_text(row)))
-                    archive.writestr(f'partial/{piece.stem}.txt', _clip_text(row))
+                    piece_text = _partial_clip_text(row, review, keep)
+                    exported.append((entry, piece_text))
+                    archive.writestr(f'partial/{piece.stem}.txt', piece_text)
                 if gpt_sovits_list and exported:
                     # GPT-SoVITS 标准训练索引：wav_path|speaker|language|text
                     lines = [f"{path}|{speaker}|{language}|{text}"

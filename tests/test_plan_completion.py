@@ -184,3 +184,100 @@ class WespeakerArbitrationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LocalClassifierMultiVetoTests(unittest.TestCase):
+    def _candidate(self, scores, threshold=-4.24, start=0.0, end=5.0):
+        windows = []
+        for index, score in enumerate(scores):
+            windows.append({"start": start + index * 0.5, "end": start + index * 0.5 + 0.5,
+                            "score": score, "voiced": True})
+        from extractor.types import CandidateSentence
+        return CandidateSentence(start, end, "", accepted=True, window_min_score=0.8,
+                                 diagnostics={"local_classifier_audit": {
+                                     "windows": windows, "reject_threshold": threshold}})
+
+    def test_two_strong_negative_windows_veto(self):
+        from extractor.nextgen.cluster_gate import _local_classifier_multi_veto
+        candidate = self._candidate([0.5, -5.0, 0.6, -6.0, 0.4])
+        self.assertTrue(_local_classifier_multi_veto(candidate))
+
+    def test_single_negative_window_does_not_veto(self):
+        from extractor.nextgen.cluster_gate import _local_classifier_multi_veto
+        candidate = self._candidate([0.5, -5.0, 0.6, 0.4, 0.7])
+        self.assertFalse(_local_classifier_multi_veto(candidate))
+
+    def test_negative_windows_outside_interval_do_not_count(self):
+        from extractor.nextgen.cluster_gate import _local_classifier_multi_veto
+        candidate = self._candidate([0.5, 0.6, 0.4], start=0.0, end=1.5)
+        # 强负窗位于候选区间之外（间隔裁切后的子段场景）。
+        candidate.diagnostics["local_classifier_audit"]["windows"] = [
+            {"start": 3.0, "end": 3.5, "score": -9.0, "voiced": True},
+            {"start": 4.0, "end": 4.5, "score": -9.0, "voiced": True}]
+        self.assertFalse(_local_classifier_multi_veto(candidate))
+
+    def test_vetoed_crop_child_goes_tier_b(self):
+        from extractor.nextgen.cluster_gate import apply_cluster_gate
+        import numpy as np
+        from test_high_recall_cluster import make_result
+        base = np.ones(8) / np.sqrt(8)
+        from extractor.nextgen.identity_cluster import TurnEvidence
+        turns = [TurnEvidence(0, 0.0, 4.0, 4.0, base, base)]
+        result = make_result(turns, accepted_spans=[[0.0, 4.0]])
+        parent = CandidateSentence(0.5, 3.5, "", reject_reason="最终局部身份冲突，原混合片段已撤回",
+                                   window_min_score=0.8,
+                                   diagnostics={"local_classifier_audit": {
+                                       "windows": [
+                                           {"start": 1.0, "end": 1.5, "score": -6.0, "voiced": True},
+                                           {"start": 2.0, "end": 2.5, "score": -8.0, "voiced": True}],
+                                       "reject_threshold": -4.24}})
+        accepted, rejected = [], [parent]
+        changes = apply_cluster_gate(accepted, rejected, turns, result,
+                                     mode="enforce", min_seconds=1.2)
+        self.assertEqual(changes["cropped"], 0)
+        self.assertEqual(changes["borderline"], 1)
+        self.assertEqual(accepted, [])
+
+    def test_tier_a_containment_dedup_and_tier_b_no_cap(self):
+        from extractor.nextgen.cluster_gate import _deduplicate_tier_a, _refine_tier_b
+        long = CandidateSentence(0.0, 4.0, "", accepted=True)
+        inner = CandidateSentence(0.2, 2.0, "", accepted=True)
+        separate = CandidateSentence(10.0, 12.0, "", accepted=True)
+        kept = _deduplicate_tier_a([long, inner, separate])
+        self.assertEqual([(c.start, c.end) for c in kept], [(0.0, 4.0), (10.0, 12.0)])
+        # Tier B：被 Tier A 覆盖 >=85% 的隐藏，其余保留且不设数量上限。
+        covered = CandidateSentence(0.5, 3.5, "")
+        covered.diagnostics["cluster_tier"] = "B"
+        survivors = [CandidateSentence(float(i) * 20.0, float(i) * 20.0 + 2.0, "")
+                     for i in range(40)]
+        for c in survivors:
+            c.diagnostics["cluster_tier"] = "B"
+            c.speaker_score = 0.5
+        borderline = [covered, *survivors]
+        _refine_tier_b(borderline, [long, separate])
+        kept_b = [c for c in borderline if c.diagnostics.get("cluster_tier") == "B"]
+        # 40 个幸存者中 [0,2] 被 Tier A [0,4] 覆盖隐藏，其余 39 个全保留。
+        self.assertEqual(len(kept_b), 39)
+        self.assertEqual(covered.diagnostics.get("cluster_tier"), "covered_by_tier_a")
+
+
+class PartialClipTextTests(unittest.TestCase):
+    def test_explicit_partial_text_wins(self):
+        from launcher.review_export import _partial_clip_text
+        row = {"start": 10.0, "end": 14.0, "text": "全文"}
+        self.assertEqual(_partial_clip_text(row, {"partial_text": "修正"}, (0.0, 2.0)), "修正")
+
+    def test_subtitle_fragments_sliced_by_time(self):
+        from launcher.review_export import _partial_clip_text
+        row = {"start": 100.0, "end": 106.0, "text": "整句",
+               "diagnostics": {"subtitle_reference": [
+                   {"text": "他人插话", "aligned_start": 100.0, "aligned_end": 102.0},
+                   {"text": "目标正文", "aligned_start": 102.5, "aligned_end": 105.5}]}}
+        # 保留段 [102.0, 106.0]：与"目标正文"重叠 3.0s（>=50%），与"他人插话"
+        # 重叠 0.0s（<50%）→ 只保留正文。
+        self.assertEqual(_partial_clip_text(row, {}, (2.0, 6.0)), "目标正文")
+
+    def test_proportional_fallback(self):
+        from launcher.review_export import _partial_clip_text
+        row = {"start": 0.0, "end": 10.0, "text": "abcdefghij"}
+        self.assertEqual(_partial_clip_text(row, {}, (2.0, 6.0)), "cdef")

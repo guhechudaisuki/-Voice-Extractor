@@ -148,8 +148,11 @@ class ApplyGateTests(unittest.TestCase):
         accepted, rejected = [], [candidate]
         apply_cluster_gate(accepted, rejected, self.turns, result,
                            mode="enforce", min_seconds=1.2, local=local)
-        # 低通过率（混合长句）不得整句晋升：与目标家族重叠时进 Tier B 待试听。
+        # 双重门槛：低通过率（混合长句）不得整句晋升，也不得借裁切救援
+        # 混入 Tier A（父轮次通过率 < PROMOTION_TURN_PASS_RATIO）——与目标
+        # 家族重叠时进 Tier B 待试听。
         self.assertFalse(candidate.accepted)
+        self.assertEqual(accepted, [])
         self.assertEqual(candidate.diagnostics.get("cluster_tier"), "B")
 
     def test_demoted_accepted_defaults_to_tier_b(self):

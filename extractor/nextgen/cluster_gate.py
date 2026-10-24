@@ -48,6 +48,33 @@ def _secondary_hint(candidate):
     return None
 
 
+def _local_classifier_multi_veto(candidate, start: float | None = None,
+                                 end: float | None = None) -> bool:
+    """局部分类器双强负窗否决：候选区间内出现 >= 2 个跌破 reject_threshold
+    （约 -4.24）的 0.5s 强负分窗口 → 证据表明区间内混有他人语音。
+
+    降入 Tier B（不整句否决）。实测 Ep1–3 全量扫描：该规则对真目标 0 误伤
+    （单窗换气负分不触发），唯独精准命中 Ep3 [550.64,555.74] 的 4 个强负窗
+    （最低 -12.40）。不要求两个负窗连续紧挨。
+    """
+    audit = candidate.diagnostics.get("local_classifier_audit")
+    if not isinstance(audit, dict):
+        return False
+    windows = audit.get("windows") or []
+    threshold = audit.get("reject_threshold")
+    if not isinstance(threshold, (int, float)):
+        threshold = -4.24
+    a = candidate.start if start is None else start
+    b = candidate.end if end is None else end
+    neg_count = sum(
+        1 for w in windows
+        if isinstance(w, dict) and w.get("voiced")
+        and isinstance(w.get("score"), (int, float))
+        and min(float(w.get("end", 0)), b) - max(float(w.get("start", 0)), a) >= 0.25
+        and float(w["score"]) <= threshold)
+    return neg_count >= 2
+
+
 def _window_min(candidate):
     """候选的窗口最低分；<=0 视为无窗口证据（不参与弱窗判定）。"""
     value = float(getattr(candidate, "window_min_score", 0.0) or 0.0)
@@ -56,6 +83,8 @@ def _window_min(candidate):
 
 def _rescue_tier(candidate, secondary_floor):
     """高危救援候选严审：低副通道分或低窗口分 → 只能进 Tier B。"""
+    if _local_classifier_multi_veto(candidate):
+        return "B"
     window_min = _window_min(candidate)
     if not any(candidate.diagnostics.get(key) for key in RESCUE_KEYS):
         if window_min is not None and window_min < WEAK_WINDOW_FLOOR:
@@ -179,6 +208,15 @@ def apply_cluster_gate(accepted, rejected, turns, result, *, mode, min_seconds=1
         """
         child = replace(parent, start=start, end=end, accepted=True,
                         reject_reason="", diagnostics=dict(parent.diagnostics))
+        if _local_classifier_multi_veto(child, start, end):
+            # 裁切子段区间内仍有 >=2 个局部分类器强负窗：主干里混着他人
+            # 语音，降入 Tier B 待试听（0 误伤实测见函数注释）。
+            child.accepted = False
+            child.reject_reason = "簇级身份未通过：local_classifier_multi_veto"
+            child.diagnostics["cluster_tier"] = "B"
+            child.diagnostics["cluster_reason"] = "local_classifier_multi_veto"
+            borderline.append(child)
+            return None
         child.diagnostics.update(cluster_cropped=True, cluster_identity=True,
                                  cluster_would_accept=True,
                                  cluster_parent_span=[parent.start, parent.end],
@@ -266,6 +304,7 @@ def apply_cluster_gate(accepted, rejected, turns, result, *, mode, min_seconds=1
                 and (not rescue_marked or window_min is None
                      or window_min >= PROMOTION_RESCUE_WINDOW_FLOOR)
                 and (ratio is None or ratio >= PROMOTION_TURN_PASS_RATIO))
+            whole_promoted = False
             if promotable and not any(
                     min(candidate.end, a.end) > max(candidate.start, a.start)
                     for a in [*(c for c in accepted if all(c is not r for r in removed)),
@@ -274,10 +313,28 @@ def apply_cluster_gate(accepted, rejected, turns, result, *, mode, min_seconds=1
                 candidate.reject_reason = ""
                 candidate.diagnostics["cluster_tier"] = "A"
                 promoted.append(candidate)
-            elif promotable or _has_family_overlap(candidate, turns, result):
-                # 晋升证据不足但与目标簇家族重叠 → Tier B 待试听。
-                candidate.diagnostics["cluster_tier"] = "B"
-                borderline.append(candidate)
+                whole_promoted = True
+            if not whole_promoted:
+                # 未能整句晋升（常见于首/尾 1 个换气窗口未过的 4~12 秒高分
+                # 长句）：与已验证干净区间求交集裁出干净主干升 Tier A。
+                # 双重门槛：父轮次滑窗通过率 >= PROMOTION_TURN_PASS_RATIO
+                # （低通过率混合长句的"干净区间"边界不可信，实测 Ep2
+                # [228.44,230.54] 借此混入），加上 make_crop 的救援/弱窗/
+                # 双强负窗审查——混音主干会被降入 Tier B 而不是混进主输出。
+                croppable = ratio is None or ratio >= PROMOTION_TURN_PASS_RATIO
+                cropped_any = False
+                if croppable:
+                    for a, b in accepted_spans:
+                        start, end = max(candidate.start, a), min(candidate.end, b)
+                        if end - start >= min_seconds:
+                            child = make_crop(candidate, start, end, "promoted_subspan",
+                                              strict_parent=False)
+                            if child is not None:
+                                cropped_any = True
+                if not cropped_any and (promotable
+                                        or _has_family_overlap(candidate, turns, result)):
+                    candidate.diagnostics["cluster_tier"] = "B"
+                    borderline.append(candidate)
         elif (not hard
               and any(key in candidate.reject_reason for key in MIXED_CROP_REASONS)):
             # 混合嫌疑候选：不整句晋升，只裁出与已验证干净区间的交集子段。
@@ -306,10 +363,80 @@ def apply_cluster_gate(accepted, rejected, turns, result, *, mode, min_seconds=1
             if not any(min(child.end, c.end) > max(child.start, c.start) for c in [*kept, *unique_crops]):
                 unique_crops.append(child)
         cropped = unique_crops
-        accepted[:] = kept + cropped
+        accepted[:] = _deduplicate_tier_a([*kept, *cropped])
         rejected[:] = [c for c in rejected if id(c) not in promoted_ids] + removed
+        _refine_tier_b(borderline, accepted)
+    refined_b = sum(
+        1 for c in borderline if c.diagnostics.get("cluster_tier") == "B")
     return {"removed": len(removed), "promoted": len(promoted),
-            "cropped": len(cropped), "borderline": len(borderline)}
+            "cropped": len(cropped), "borderline": refined_b}
+
+
+def _deduplicate_tier_a(candidates, containment=0.85):
+    """Tier A 内部父子重复消解：仅当短片段被长片段包裹 >= 85% 自身时长时
+    去重（保留更完整的长句）。不设数量上限、不按分数替换——相邻独立短句
+    与 Tier A 时间轴覆盖均不受影响。"""
+    ordered = sorted(candidates, key=lambda c: (-c.duration, c.start))
+    selected: list = []
+    for cand in ordered:
+        if any(min(cand.end, e.end) - max(cand.start, e.start)
+               >= containment * max(1e-6, cand.duration)
+               for e in selected):
+            continue
+        selected.append(cand)
+    return sorted(selected, key=lambda c: (c.start, c.end))
+
+
+def _tier_b_rank(candidate) -> float:
+    """Tier B 捡漏优先级：上游已接受的候选（完整流水线验证过、只在簇层
+    无法确认）显著优先于从未被任何环节接受的候选。"""
+    upstream = 0.8 if candidate.diagnostics.get("cluster_removed") else 0.0
+    return (upstream
+            + 0.5 * float(getattr(candidate, "speaker_score", 0.0) or 0.0)
+            + 0.3 * float(_secondary_hint(candidate) or 0.0)
+            + 0.2 * float(_window_min(candidate) or 0.0))
+
+
+def _covered_ratio(span_start, span_end, spans) -> float:
+    """[span_start, span_end] 被 spans 时间轴覆盖的时长比例。"""
+    duration = max(1e-6, span_end - span_start)
+    covered, cursor = 0.0, span_start
+    for left, right in sorted(spans):
+        if right <= cursor or left >= span_end:
+            continue
+        covered += max(0.0, min(span_end, right) - max(cursor, left))
+        cursor = max(cursor, right)
+    return min(covered / duration, 1.0)
+
+
+def _refine_tier_b(borderline, accepted, tier_a_coverage=0.85,
+                   mutual_containment=0.80):
+    """Tier B 无损精炼：互斥 + 包含去重 + 置信度排序，绝不设数量上限。
+
+    仅隐藏两类纯重复碎片：已被 Tier A 覆盖 >= 85% 时长（covered_by_tier_a），
+    或与更高优先级 Tier B 候选重叠 >= 80% 自身时长（tier_b_nms_suppressed）。
+    其余全部保留并按 _tier_b_rank 降序排列——Tier A ∪ Tier B 的时间轴
+    覆盖面积与精炼前完全一致，覆盖率一分不掉。
+    """
+    if not borderline:
+        return
+    tier_a_spans = [(a.start, a.end) for a in accepted]
+    survivors = []
+    for candidate in borderline:
+        if _covered_ratio(candidate.start, candidate.end, tier_a_spans) >= tier_a_coverage:
+            candidate.diagnostics["cluster_tier"] = "covered_by_tier_a"
+            continue
+        survivors.append(candidate)
+    ranked = sorted(survivors, key=_tier_b_rank, reverse=True)
+    kept: list = []
+    for candidate in ranked:
+        if any(min(candidate.end, k.end) - max(candidate.start, k.start)
+               >= mutual_containment * max(1e-6, candidate.duration)
+               for k in kept):
+            candidate.diagnostics["cluster_tier"] = "tier_b_nms_suppressed"
+            continue
+        candidate.diagnostics["tier_b_rank_score"] = round(_tier_b_rank(candidate), 4)
+        kept.append(candidate)
 
 
 def _deduplicate_tier_a(candidates, min_overlap=0.15):

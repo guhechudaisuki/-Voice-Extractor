@@ -6418,6 +6418,7 @@ class ExtractionPipeline:
                 verifier.close()
 
             accepted: list[CandidateSentence] = []
+            segmenter = None
             if accepted_turns:
                 accepted_turns.sort(key=lambda item: (item.start, item.end))
                 progress(0.80, f"筛选完成：仅对 {len(accepted_turns)} 个目标人物回合执行 STT")
@@ -6585,7 +6586,10 @@ class ExtractionPipeline:
             # Tier B 时文本列不为空，勾选导出的 train.list 才有台词。
             borderline_turns = [
                 c for c in rejected if c.diagnostics.get("cluster_tier") == "B"]
-            if borderline_turns and accepted:
+            if borderline_turns:
+                # 作用域修复：无论主输出多少段，Tier B 边缘池永远补齐台词。
+                if segmenter is None:
+                    segmenter = WhisperSegmenter(self.device)
                 progress(0.93, f"为 {len(borderline_turns)} 段边缘候选补齐 STT 台词")
                 borderline_transcribed = segmenter.transcribe_spans(
                     stem,
