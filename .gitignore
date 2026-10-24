@@ -104,3 +104,8 @@ evaluation/*_cases.json
 evaluation/repair_preview_*.json
 evaluation/short_span_*.json
 evaluation/join_cases.json
+
+我心危素材/
+计划方案/
+training/
+run_cluster_p0p2.ps1
