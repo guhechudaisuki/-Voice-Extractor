@@ -82,6 +82,9 @@ class DirectFile:
     expected_hash: str | None = None
 
 
+REPO_RAW = "https://github.com/guhechudaisuki/-Voice-Extractor/raw/main"
+
+
 @dataclass(frozen=True)
 class ComponentSpec:
     key: str
@@ -139,7 +142,7 @@ COMPONENTS = (
     ),
     ComponentSpec(
         "wavlm_model",
-        "WavLM 声纹模型",
+        "WavLM 声纹模型（满血强化版）",
         "model/speaker/wavlm-base-plus-sv",
         "direct",
         386,
@@ -154,7 +157,7 @@ COMPONENTS = (
             ),
             DirectFile(
                 "pytorch_model.bin",
-                "https://huggingface.co/microsoft/wavlm-base-plus-sv/resolve/feb593a6c23c1cc3d9510425c29b0a14d2b07b1e/pytorch_model.bin?download=true",
+                "https://github.com/guhechudaisuki/-Voice-Extractor/releases/download/v3.0/wavlm_reinforced_pytorch_model.bin",
             ),
         ),
         check_file="pytorch_model.bin",
@@ -1347,7 +1350,9 @@ def ensure_assets(
             )
         if not _component_ready(spec, destination):
             raise RuntimeError(f"{spec.label} 安装后仍不完整")
-    assets, missing = scan_assets(layout, gpt_root)
+        # Stage 13：WavLM 满血强化版分片拼接
+        if spec.key == "wavlm_model":
+                destination, "pytorch_model.bin",
     if missing:
         raise RuntimeError("仍缺少模型：" + "、".join(spec.label for spec in missing))
     return assets
