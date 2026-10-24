@@ -12,6 +12,10 @@ on:
       sha256:
         description: Expected SHA-256 of the complete resource ZIP
         required: true
+      artifact_name:
+        description: Published desktop artifact filename
+        default: VoiceExtractor_resources.zip
+        required: true
 
 permissions:
   contents: write
@@ -26,6 +30,7 @@ jobs:
           PREFIX: ${{ inputs.prefix }}
           COUNT: ${{ inputs.count }}
           EXPECTED_SHA256: ${{ inputs.sha256 }}
+          ARTIFACT_NAME: ${{ inputs.artifact_name }}
         run: |
           python - <<'PY'
           import hashlib, json, os, re, subprocess
@@ -47,7 +52,10 @@ jobs:
               return Path(name)
           with ThreadPoolExecutor(max_workers=8) as pool:
               parts = list(pool.map(fetch, range(count)))
-          destination = Path('VoiceExtractor_resources.zip')
+          artifact = os.environ['ARTIFACT_NAME']
+          if artifact not in {'VoiceExtractor_resources.zip', 'VoiceExtractor.exe'}:
+              raise ValueError('Invalid desktop artifact filename')
+          destination = Path(artifact)
           digest = hashlib.sha256()
           with destination.open('wb') as output:
               for path in parts:
