@@ -1,0 +1,64 @@
+name: Assemble verified desktop resource release asset
+
+on:
+  workflow_dispatch:
+    inputs:
+      prefix:
+        description: Unique prefix of the staging part assets
+        required: true
+      count:
+        description: Number of staging parts
+        required: true
+      sha256:
+        description: Expected SHA-256 of the complete resource ZIP
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  assemble:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Assemble, verify, and publish the program resource ZIP
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREFIX: ${{ inputs.prefix }}
+          COUNT: ${{ inputs.count }}
+          EXPECTED_SHA256: ${{ inputs.sha256 }}
+        run: |
+          python - <<'PY'
+          import hashlib, json, os, re, subprocess
+          from concurrent.futures import ThreadPoolExecutor
+          from pathlib import Path
+
+          prefix = os.environ['PREFIX']
+          count = int(os.environ['COUNT'])
+          expected = os.environ['EXPECTED_SHA256']
+          if not re.fullmatch(r'resource-stage-[a-f0-9]{12}-', prefix) or not 1 <= count <= 200:
+              raise ValueError('Invalid staging part selection')
+          if not re.fullmatch(r'[a-f0-9]{64}', expected):
+              raise ValueError('Invalid checksum')
+          repository = os.environ['GITHUB_REPOSITORY']
+          def fetch(index):
+              name = f'{prefix}{index:03d}'
+              subprocess.run(['gh', 'release', 'download', 'v3.0', '--repo', repository,
+                              '--pattern', name], check=True)
+              return Path(name)
+          with ThreadPoolExecutor(max_workers=8) as pool:
+              parts = list(pool.map(fetch, range(count)))
+          destination = Path('VoiceExtractor_resources.zip')
+          digest = hashlib.sha256()
+          with destination.open('wb') as output:
+              for path in parts:
+                  block = path.read_bytes()
+                  output.write(block)
+                  digest.update(block)
+          if digest.hexdigest() != expected:
+              raise ValueError('Resource ZIP checksum mismatch')
+          subprocess.run(['gh', 'release', 'upload', 'v3.0', str(destination), '--repo', repository], check=True)
+          print(f'Published {destination}: {destination.stat().st_size} bytes, SHA256 {expected}')
+          for part in parts:
+              subprocess.run(['gh', 'release', 'delete-asset', 'v3.0', part.name,
+                              '--repo', repository, '--yes'], check=True)
+          PY
