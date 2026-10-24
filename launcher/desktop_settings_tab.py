@@ -9,8 +9,8 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-LAUNCHER_DIR = Path(__file__).resolve().parent
+BASE_DIR = Path(os.environ.get("VOICE_EXTRACT_DATA_ROOT", Path(__file__).resolve().parent.parent))
+LAUNCHER_DIR = Path(os.environ.get("VOICE_EXTRACT_SOURCE_ROOT", BASE_DIR)) / "launcher"
 SETTINGS_PATH = BASE_DIR / "voice_extractor_settings.json"
 WEBUI_SERVER_PATH = LAUNCHER_DIR / "webui_server.py"
 

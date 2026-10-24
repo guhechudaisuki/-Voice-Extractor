@@ -1,0 +1,22 @@
+name: Publish verified WavLM release asset
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish-model:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download the exact model used by the desktop release
+        run: |
+          curl --fail --location --retry 3 --output wavlm_reinforced_pytorch_model.bin \
+            'https://huggingface.co/microsoft/wavlm-base-plus-sv/resolve/feb593a6c23c1cc3d9510425c29b0a14d2b07b1e/pytorch_model.bin?download=true'
+          echo 'e906bce2fa42fb497a1d1a9ecf81548adb7e03b12a5644e32d2f42f0d6500fad  wavlm_reinforced_pytorch_model.bin' | sha256sum --check
+      - name: Publish the verified model to v3.0
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload v3.0 wavlm_reinforced_pytorch_model.bin --repo "$GITHUB_REPOSITORY"

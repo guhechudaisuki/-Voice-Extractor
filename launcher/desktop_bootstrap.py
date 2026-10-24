@@ -15,10 +15,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable
 
+from launcher.portable_resources import (ensure_program_files, install_embedded_python,
+    portable_environment, program_ready)
+
 
 APP_VERSION = "3.0"
 APP_NAME = "Voice Extractor"
-CACHE_SCHEMA_VERSION = 1
+CACHE_SCHEMA_VERSION = 2
 GLOBAL_SETTINGS = (
     Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
     / "VoiceExtractor"
@@ -54,6 +57,9 @@ MODULE_PACKAGES = {
     "transformers": "transformers==4.43.0",
     "librosa": "librosa>=0.9,<0.11",
     "tqdm": "tqdm>=4.60",
+    "psutil": "psutil>=5.9",
+    "fastapi": "fastapi>=0.110,<1",
+    "uvicorn": "uvicorn>=0.29,<1",
 }
 
 
@@ -62,6 +68,7 @@ COMPONENT_ENVIRONMENT_PATHS = {
     "sv_model": ("VOICE_EXTRACT_SV_MODEL",),
     "camplus_model": ("VOICE_EXTRACT_CAMPLUS_MODEL",),
     "wavlm_model": ("VOICE_EXTRACT_WAVLM_MODEL",),
+    "classifier_v2": ("VOICE_EXTRACT_CLASSIFIER_V2_MODEL",),
     "wespeaker_model": ("VOICE_EXTRACT_WESPEAKER_MODEL",),
     "overlap_model": ("VOICE_EXTRACT_OVERLAP_MODEL",),
     "panns_model": (
@@ -142,7 +149,7 @@ COMPONENTS = (
     ),
     ComponentSpec(
         "wavlm_model",
-        "WavLM 声纹模型（满血强化版）",
+        "WavLM 声纹模型（本地同版权重）",
         "model/speaker/wavlm-base-plus-sv",
         "direct",
         386,
@@ -158,6 +165,7 @@ COMPONENTS = (
             DirectFile(
                 "pytorch_model.bin",
                 "https://github.com/guhechudaisuki/-Voice-Extractor/releases/download/v3.0/wavlm_reinforced_pytorch_model.bin",
+                "e906bce2fa42fb497a1d1a9ecf81548adb7e03b12a5644e32d2f42f0d6500fad",
             ),
         ),
         check_file="pytorch_model.bin",
@@ -247,6 +255,7 @@ COMPONENTS = (
             DirectFile(
                 "classifier_v2.pt",
                 "https://github.com/guhechudaisuki/-Voice-Extractor/raw/main/models/anime_t3/classifier_v2.pt",
+                "a86a47947dddf8f8d638e2764bee79c086b19910d4673b53f371a9b821e4401c",
             ),
         ),
         check_file="classifier_v2.pt",
@@ -267,12 +276,20 @@ class InstallLayout:
     root: Path
 
     @property
+    def resource(self) -> Path:
+        return self.root / "resource"
+
+    @property
+    def python(self) -> Path:
+        return self.resource / "python" / "python.exe"
+
+    @property
     def model(self) -> Path:
-        return self.root / "model"
+        return self.resource / "model"
 
     @property
     def models(self) -> Path:
-        return self.root / "models"
+        return self.resource / "models"
 
     @property
     def output(self) -> Path:
@@ -288,11 +305,11 @@ class InstallLayout:
 
     @property
     def tools(self) -> Path:
-        return self.root / "tools"
+        return self.resource / "tools"
 
     @property
     def packages(self) -> Path:
-        return self.root / "python_packages"
+        return self.resource / "python_packages"
 
     @property
     def requests(self) -> Path:
@@ -305,6 +322,7 @@ class InstallLayout:
     def prepare(self) -> None:
         for path in (
             self.root,
+            self.resource,
             self.model,
             self.models,
             self.output,
@@ -331,6 +349,8 @@ class BootstrapContext:
 
     def backend_environment(self, output_root: Path | None = None) -> dict[str, str]:
         env = os.environ.copy()
+        if getattr(sys, "frozen", False):
+            env.update(portable_environment(self.layout.root))
         python_paths = [
             str(self.source_root),
             str(self.source_root / "vendor"),
@@ -338,14 +358,14 @@ class BootstrapContext:
             *(str(path) for path in self.extra_python_paths),
         ]
         existing = env.get("PYTHONPATH")
-        if existing:
+        if existing and not getattr(sys, "frozen", False):
             python_paths.append(existing)
         env["PYTHONPATH"] = os.pathsep.join(python_paths)
         env["PYTHONUNBUFFERED"] = "1"
         env["HF_HUB_OFFLINE"] = "1"
         env["MODELSCOPE_CACHE"] = str(self.layout.model / "modelscope_cache")
         env["VOICE_EXTRACT_DATA_ROOT"] = str(self.layout.root)
-        env["VOICE_EXTRACT_ASSET_ROOT"] = str(self.layout.root)
+        env["VOICE_EXTRACT_ASSET_ROOT"] = str(self.layout.resource)
         env["VOICE_EXTRACT_MODEL_ROOT"] = str(self.layout.model)
         env["VOICE_EXTRACT_WORK_ROOT"] = str(self.layout.work)
         env["VOICE_EXTRACT_OUTPUT_ROOT"] = str(output_root or self.layout.output)
@@ -363,6 +383,9 @@ class BootstrapContext:
             self.assets["camplus_model"] / "campplus_voxceleb.bin"
         )
         env["VOICE_EXTRACT_WAVLM_MODEL"] = str(self.assets["wavlm_model"])
+        env["VOICE_EXTRACT_CLASSIFIER_V2_MODEL"] = str(
+            self.assets["classifier_v2"] / "classifier_v2.pt")
+        env["VOICE_EXTRACT_SOURCE_ROOT"] = str(self.source_root)
         env["VOICE_EXTRACT_WESPEAKER_MODEL"] = str(
             self.assets["wespeaker_model"] / "model.onnx"
         )
@@ -386,7 +409,7 @@ class BootstrapContext:
 
 def bundle_source_root() -> Path:
     if getattr(sys, "frozen", False):
-        return Path(getattr(sys, "_MEIPASS")).resolve() / "app_bundle"
+        return current_executable().parent / "resource"
     return Path(__file__).resolve().parents[1]
 
 
@@ -405,6 +428,8 @@ def _read_json(path: Path) -> dict[str, object]:
 
 
 def load_global_settings() -> dict[str, object]:
+    if getattr(sys, "frozen", False):
+        return {}
     return _read_json(GLOBAL_SETTINGS)
 
 
@@ -436,6 +461,8 @@ def save_settings(
         json.dumps(payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    if getattr(sys, "frozen", False):
+        return
     GLOBAL_SETTINGS.parent.mkdir(parents=True, exist_ok=True)
     GLOBAL_SETTINGS.write_text(
         json.dumps(
@@ -454,6 +481,8 @@ def save_settings(
 
 
 def suggested_install_root() -> Path:
+    if getattr(sys, "frozen", False):
+        return current_executable().parent
     configured = os.environ.get("VOICE_EXTRACT_INSTALL_ROOT")
     if configured:
         return Path(configured).expanduser().resolve()
@@ -552,6 +581,9 @@ def _registry_python_candidates() -> list[Path]:
 
 
 def _python_candidates(preferred: Path | None = None) -> list[Path]:
+    if getattr(sys, "frozen", False):
+        python = InstallLayout(suggested_install_root()).python
+        return [python] if python.is_file() else []
     settings = load_global_settings()
     values: list[Path] = []
     if preferred is not None:
@@ -827,6 +859,8 @@ def discover_python(preferred: Path | None = None) -> Path | None:
 
 
 def infer_gpt_root(python: Path | None) -> Path | None:
+    if getattr(sys, "frozen", False):
+        return None
     if python and python.parent.name.lower() == "runtime":
         parent = python.parent.parent
         if (parent / "GPT_SoVITS").is_dir() and (parent / "tools").is_dir():
@@ -1035,7 +1069,10 @@ def _legacy_component_paths(
     layout: InstallLayout,
     gpt_root: Path | None,
 ) -> list[Path]:
-    candidates = [layout.root / spec.relative_path]
+    candidates = [layout.resource / spec.relative_path]
+    if getattr(sys, "frozen", False):
+        return candidates
+    candidates.append(layout.root / spec.relative_path)
     for name in COMPONENT_ENVIRONMENT_PATHS.get(spec.key, ()):
         configured = os.environ.get(name)
         if configured:
@@ -1092,7 +1129,7 @@ def scan_assets(
     stored = stored if isinstance(stored, dict) else {}
     for spec in COMPONENTS:
         candidates: list[Path] = []
-        if stored.get(spec.key):
+        if stored.get(spec.key) and not getattr(sys, "frozen", False):
             candidates.append(Path(str(stored[spec.key])))
         candidates.extend(_legacy_component_paths(spec, layout, gpt_root))
         found = next(
@@ -1118,6 +1155,8 @@ def _download_file(
     span: float,
     label: str,
 ) -> None:
+    if _valid_file(destination, source.expected_hash):
+        return
     destination.parent.mkdir(parents=True, exist_ok=True)
     partial = destination.with_suffix(destination.suffix + ".part")
     partial.unlink(missing_ok=True)
@@ -1143,7 +1182,10 @@ def _download_file(
                         f"{label}：{percent}%（{received / 1024 / 1024:.1f} MB）",
                     )
                     last_percent = percent
-    if source.expected_hash and _sha256(partial).lower() != source.expected_hash.lower():
+    if total and received != total:
+        partial.unlink(missing_ok=True)
+        raise RuntimeError(f"{label} 下载不完整，请重试")
+    if not _valid_file(partial) or (source.expected_hash and _sha256(partial).lower() != source.expected_hash.lower()):
         partial.unlink(missing_ok=True)
         raise RuntimeError(f"{label} 校验失败")
     os.replace(partial, destination)
@@ -1191,7 +1233,9 @@ def install_python_runtime(
 
     layout = InstallLayout(install_root.expanduser().resolve())
     layout.prepare()
-    destination = layout.root / "python"
+    if getattr(sys, "frozen", False):
+        return install_embedded_python(layout.root, reporter)
+    destination = layout.resource / "python"
     python = destination / "python.exe"
     if python.is_file() and probe_python_runtime(python).get("runnable"):
         reporter(1.0, f"Python 已存在：{python}")
@@ -1314,7 +1358,7 @@ def ensure_assets(
         return assets
     total = len(missing)
     for index, spec in enumerate(missing):
-        destination = layout.root / spec.relative_path
+        destination = layout.resource / spec.relative_path
         base = 0.18 + 0.70 * index / total
         span = 0.70 / total
         reporter(base, f"正在安装 {spec.label}（{index + 1}/{total}）")
@@ -1350,9 +1394,7 @@ def ensure_assets(
             )
         if not _component_ready(spec, destination):
             raise RuntimeError(f"{spec.label} 安装后仍不完整")
-        # Stage 13：WavLM 满血强化版分片拼接
-        if spec.key == "wavlm_model":
-                destination, "pytorch_model.bin",
+    assets, missing = scan_assets(layout, gpt_root)
     if missing:
         raise RuntimeError("仍缺少模型：" + "、".join(spec.label for spec in missing))
     return assets
@@ -1479,6 +1521,8 @@ def load_cached_context(
     python = Path(python_text).expanduser()
     if not python.is_file():
         return None
+    if getattr(sys, "frozen", False) and python.resolve() != layout.python:
+        return None
 
     stored_assets = settings.get("assets")
     if not isinstance(stored_assets, dict):
@@ -1489,11 +1533,15 @@ def load_cached_context(
         if not value:
             return None
         path = Path(value).expanduser()
+        if getattr(sys, "frozen", False) and not path.resolve().is_relative_to(layout.resource):
+            return None
         if not _component_quick_ready(spec, path):
             return None
         assets[spec.key] = path
 
     source_root = bundle_source_root()
+    if getattr(sys, "frozen", False) and not program_ready(layout.resource):
+        return None
     if not (source_root / "desktop_worker.py").is_file():
         return None
     gpt_text = str(settings.get("gpt_root") or "").strip()
@@ -1582,8 +1630,8 @@ def finalize_inspected_context(
     if not python_value or not isinstance(assets_value, dict):
         raise RuntimeError("完整扫描结果缺少 Python 或模型路径")
 
-    source_root = bundle_source_root()
     layout = InstallLayout(install_root.expanduser().resolve())
+    source_root = ensure_program_files(layout.root, reporter)
     layout.prepare()
     reporter(0.15, "正在保存首次完整检查结果")
     install_executable(layout)
@@ -1698,15 +1746,15 @@ def prepare_context(
     preferred_python: Path | None,
     reporter: Reporter,
 ) -> BootstrapContext:
-    source_root = bundle_source_root()
-    if not (source_root / "desktop_worker.py").is_file():
-        raise RuntimeError("安装包内缺少 desktop_worker.py")
     layout = InstallLayout(install_root.expanduser().resolve())
+    source_root = ensure_program_files(layout.root, reporter)
+    if not (source_root / "desktop_worker.py").is_file():
+        raise RuntimeError("运行文件内缺少 desktop_worker.py")
     layout.prepare()
     install_executable(layout)
 
     reporter(0.01, "正在复核本地 CUDA/PyTorch 运行环境")
-    installed_python = layout.root / "python" / "python.exe"
+    installed_python = layout.python
     python = discover_python(preferred_python or installed_python)
     if python is None:
         raise RuntimeError(
@@ -1758,14 +1806,32 @@ def prepare_context(
     )
 
 
+
+def prepare_portable_context(install_root: Path, reporter: Reporter) -> BootstrapContext:
+    layout = InstallLayout(install_root.expanduser().resolve())
+    layout.prepare()
+    source_root = ensure_program_files(layout.root, reporter)
+    python = layout.python
+    state = probe_python_runtime(python) if python.is_file() else {}
+    if not (state.get("torch") and state.get("torchaudio")):
+        python = install_embedded_python(layout.root, reporter)
+    ensure_python_modules(python, layout, source_root, reporter)
+    ffmpeg, ffprobe, uvr_code, sv_code = ensure_local_tools(layout, source_root, None, reporter)
+    assets = ensure_assets(python, layout, source_root, None, reporter)
+    save_settings(layout, python, assets, ffmpeg=ffmpeg, ffprobe=ffprobe,
+                  uvr_code=uvr_code, sv_code=sv_code)
+    reporter(1.0, "一键安装完成，正在进入主界面")
+    return BootstrapContext(source_root, layout, python, assets, uvr_code, sv_code,
+                            ffmpeg, ffprobe, [layout.packages])
+
 def inspect_installation(
     install_root: Path,
     preferred_python: Path | None = None,
     reporter: Reporter | None = None,
 ) -> dict[str, object]:
     layout = InstallLayout(install_root.expanduser().resolve())
-    source_root = bundle_source_root()
-    preferred = preferred_python or (layout.root / "python" / "python.exe")
+    source_root = ensure_program_files(layout.root, reporter or (lambda *_: None))
+    preferred = preferred_python or layout.python
     if reporter:
         reporter(0.02, "正在枚举环境变量、PATH、py.exe、注册表和常见 Python 目录")
     python_states = inspect_python_runtimes(preferred, reporter)
@@ -1816,7 +1882,8 @@ def inspect_installation(
     tools = inspect_local_tools(layout, source_root, gpt_root)
     nvidia = inspect_nvidia_environment()
     model_mb = missing_download_size_mb(missing)
-    python_install_required = any_python is None
+    python_install_required = any_python is None or (
+        getattr(sys, "frozen", False) and selected_state is None)
     runtime_ready = selected_state is not None and bool(selected_state.get("cuda_available"))
     supplementary_missing = [
         name for name in missing_modules if name not in {"torch", "torchaudio"}

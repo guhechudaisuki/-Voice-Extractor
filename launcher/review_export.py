@@ -82,7 +82,7 @@ def export_review_zip(batch: Path, manifest: dict, reviews: dict, destination: P
             # negatives), and reference audio. No nested archive or unpack step.
             export_package(batch, manifest, reviews, archive_path)
         else:
-            from extractor.audio import write_clip
+            from launcher.audio_export import write_clip
             with zipfile.ZipFile(archive_path, 'w', zipfile.ZIP_DEFLATED) as archive:
                 written = set()
                 for ordinal, row, audio, relative, *_ in correct:

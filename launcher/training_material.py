@@ -67,7 +67,7 @@ def _cut_to_archive(archive: zipfile.ZipFile, clip: Path, start: float, end: flo
     """从片段音频切出 [start, end]（相对秒）写入压缩包；带 15ms 淡入淡出。"""
     if end - start < 0.5:
         return None
-    from extractor.audio import write_clip
+    from launcher.audio_export import write_clip
     temporary = workspace / (name.replace("/", "_"))
     try:
         write_clip(clip, temporary, start, end, normalize_level=True)

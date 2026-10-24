@@ -45,6 +45,7 @@ class TrainingSession:
     def _run(self, paths, python, environment):
         process = None
         try:
+            source_root = Path((environment or {}).get('VOICE_EXTRACT_SOURCE_ROOT', ROOT))
             total = 0
             for index, path in enumerate(paths):
                 size = 0
@@ -60,8 +61,8 @@ class TrainingSession:
             with self.lock:
                 if self.cancel.is_set():
                     return
-                process = subprocess.Popen([python, '-B', str(ROOT / 'launcher/model_reinforcement.py'), str(self.directory)],
-                    cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace',
+                process = subprocess.Popen([python, '-B', str(source_root / 'launcher/model_reinforcement.py'), str(self.directory)],
+                    cwd=source_root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace',
                     env={**os.environ, **(environment or {}), 'PYTHONIOENCODING': 'utf-8'}, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
                 self.process = process
                 self.workspace.add_worker(process.pid)

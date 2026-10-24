@@ -26,6 +26,8 @@ $previousBuildRoot = $env:VOICE_EXTRACT_BUILD_GPT_ROOT
 $env:VOICE_EXTRACT_BUILD_GPT_ROOT = $GptRoot
 Push-Location $root
 try {
+    & $runtime -B (Join-Path $root 'scripts\package_resources.py') --gpt-root $GptRoot
+    if ($LASTEXITCODE -ne 0) { throw 'Resource package build failed' }
     & $runtime -m PyInstaller --noconfirm --clean (Join-Path $root 'VoiceExtractor.spec')
     if ($LASTEXITCODE -ne 0) { throw 'PyInstaller build failed' }
 } finally {

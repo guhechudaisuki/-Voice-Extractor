@@ -34,6 +34,7 @@ from desktop_bootstrap import (
     inspect_installation,
     load_cached_context,
     prepare_context,
+    prepare_portable_context,
     suggested_install_root,
 )
 
@@ -212,7 +213,7 @@ class VoiceExtractorDesktop:
         ).pack(anchor="w")
         ttk.Label(
             self.setup_page,
-            text="只需选择安装位置。程序会完整检测 Python、CUDA/PyTorch、依赖、模型和后端资源。",
+            text="首次启动自动安装程序文件、运行依赖和全部模型；所有文件保存在 EXE 所在文件夹中。",
             style="Subtitle.TLabel",
         ).pack(anchor="w", pady=(4, 22))
 
@@ -224,11 +225,15 @@ class VoiceExtractorDesktop:
         ttk.Label(card, text="安装目录", style="CardTitle.TLabel").grid(
             row=0, column=0, sticky="w", pady=(0, 7)
         )
-        install_entry = ttk.Entry(card, textvariable=self.install_root_var)
-        install_entry.grid(row=1, column=0, columnspan=2, sticky="ew", padx=(0, 10))
-        ttk.Button(card, text="选择目录", command=self._browse_install_root).grid(
-            row=1, column=2, sticky="e"
-        )
+        portable = getattr(sys, "frozen", False)
+        if portable:
+            ttk.Label(card, textvariable=self.install_root_var, style="CardText.TLabel").grid(
+                row=1, column=0, columnspan=3, sticky="w")
+        else:
+            install_entry = ttk.Entry(card, textvariable=self.install_root_var)
+            install_entry.grid(row=1, column=0, columnspan=2, sticky="ew", padx=(0, 10))
+            ttk.Button(card, text="选择目录", command=self._browse_install_root).grid(
+                row=1, column=2, sticky="e")
 
         ttk.Label(
             card,
@@ -240,8 +245,8 @@ class VoiceExtractorDesktop:
         ttk.Label(
             card,
             text=(
-                "自动检查环境变量、PATH、py.exe、Windows 注册表、Conda/venv、"
-                "常见安装目录和 GPT-SoVITS runtime；不要求填写 python.exe 路径。"
+                "EXE 使用 resource/python 内的便携 Python；首次安装会自动下载运行依赖。"
+                "无需填写路径，程序目录可整体移动。"
             ),
             style="CardText.TLabel",
             wraplength=950,
@@ -671,6 +676,9 @@ class VoiceExtractorDesktop:
     def _start_scan(self) -> None:
         if self.scan_running or self.boot_running:
             return
+        if getattr(sys, "frozen", False):
+            self._start_portable_install()
+            return
         if self.runtime_dialog is not None and self.runtime_dialog.winfo_exists():
             self.runtime_dialog.destroy()
         self.scan_running = True
@@ -701,6 +709,26 @@ class VoiceExtractorDesktop:
                 self.events.put(("scan_error", str(exc)))
 
         threading.Thread(target=worker, name="desktop-scan", daemon=True).start()
+
+    def _start_portable_install(self) -> None:
+        self.boot_running = True
+        self.install_button.configure(text="正在自动安装", state="disabled")
+        self.rescan_button.configure(state="disabled")
+        self.runtime_help_button.configure(state="disabled")
+        self.setup_status_var.set("正在准备程序文件、运行环境和全部模型……")
+        root = Path(sys.executable).resolve().parent
+
+        def reporter(value: float, message: str) -> None:
+            self.events.put(("boot_progress", (value, message)))
+
+        def worker() -> None:
+            try:
+                context = prepare_portable_context(root, reporter)
+                self.events.put(("boot_complete", context))
+            except Exception as exc:
+                self.events.put(("boot_error", str(exc)))
+
+        threading.Thread(target=worker, name="portable-install", daemon=True).start()
 
     def _continue_setup(self) -> None:
         result = self.last_scan_result
@@ -1429,7 +1457,10 @@ class VoiceExtractorDesktop:
                 elif event_type == "boot_error":
                     self.boot_running = False
                     self.rescan_button.configure(state="normal")
-                    if self.last_scan_result.get("ready"):
+                    if getattr(sys, "frozen", False):
+                        self.install_button.configure(text="重试安装", state="normal")
+                        self.runtime_help_button.configure(state="disabled")
+                    elif self.last_scan_result.get("ready"):
                         self.install_button.configure(text="重试进入", state="normal")
                     elif self.last_scan_result.get("python_install_required"):
                         self.install_button.configure(text="自动安装 Python", state="normal")
@@ -1493,6 +1524,9 @@ class VoiceExtractorDesktop:
 
 
 def main() -> int:
+    if getattr(sys, "frozen", False):
+        from launcher.portable_resources import initialize_portable_process
+        initialize_portable_process(Path(sys.executable).resolve().parent)
     root = tk.Tk()
     VoiceExtractorDesktop(root)
     from desktop_handoff import announce_ready

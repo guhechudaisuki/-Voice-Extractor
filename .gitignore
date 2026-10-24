@@ -28,6 +28,7 @@ runtime/
 logs/
 tools/
 python_packages/
+/resource/
 voice_extractor_installation.json
 /VoiceExtractor.exe
 omnvoice/

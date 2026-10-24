@@ -20,31 +20,34 @@ Windows 桌面安装程序可从 [GitHub Releases](https://github.com/guhechudai
 
 ## 桌面版使用
 
-1. 启动 `VoiceExtractor.exe`。
-2. 首次启动时只需选择安装目录，不需要填写或选择 `python.exe`。
-3. 程序会完整检查环境变量、`PATH`、Windows `py.exe`、注册表、Conda/venv、常见 Python 安装目录和 GPT-SoVITS runtime，并实际验证 PyTorch、torchaudio 与 CUDA。
-4. 同一次扫描还会检查全部模型、Hugging Face/ModelScope 常见缓存、FFmpeg、UVR 和 ERes2Net 后端。
-5. 如果完全没有 Python，可在结果弹窗中确认自动安装官方 Python 3.9.13；不要求用户填写路径。
-6. 如果 CUDA/PyTorch 未就绪，弹窗可直接打开 PyTorch 或 CUDA 官网，也可以停止安装。本工具不会擅自下载或替换 CUDA/PyTorch。
-7. 第一次完整检查若全部满足，会自动保存永久依赖缓存并直接进入主界面，不再询问。
-8. 只有发现缺失依赖时才询问是否安装。已存在的资源只读复用，不移动、不修改、不重复下载。
-9. 后续启动直接读取永久缓存并进入主界面，不再导入 PyTorch 或重新扫描模型；只有缓存对应文件被删除或移动时才重新完整检查。
-10. 进入中文桌面界面后，添加参考音频、待提取文件和可选排除人物，确认保存位置后开始提取。
-
-安装目录结构：
+1. 从 [v3.0 Release](https://github.com/guhechudaisuki/-Voice-Extractor/releases/tag/v3.0) 下载 `VoiceExtractor.exe`，放入准备长期使用的文件夹。
+2. 双击 EXE，程序自动下载运行文件、便携 Python、PyTorch、其他依赖和全部模型。无需选择安装目录，也无需手动下载或移动模型。
+3. 文件固定保存在 **EXE 同级的 `resource`** 中。首次安装需要联网和足够的磁盘空间；下载失败时点击“重试安装”，完整模型会保留。
+4. 安装完成自动进入主界面。以后启动直接使用已下载的文件。添加参考音频、待提取文件和可选排除人物，开始提取。
 
 ```text
-VoiceExtractor.exe
-python/                 找不到 Python 时自动安装的工具运行环境
-models/                 缺失时下载的模型
-python_packages/        本工具独立补充的 Python 包
-output/                 默认结果目录
-work/                   处理缓存与任务配置
-logs/                   桌面程序日志
-tools/                  本工具独立使用的媒体工具
+VoiceExtractor/
+├── VoiceExtractor.exe
+├── README.md                    首次安装后自动生成的使用说明
+├── resource/                    自动下载，用户无需整理
+│   ├── desktop_worker.py        后台程序
+│   ├── extractor/、launcher/、vendor/、dependencies/
+│   ├── python/                  便携 Python，不修改系统 PATH/注册表
+│   ├── python_packages/         PyTorch 和其他运行依赖
+│   ├── model/                   自动下载的声纹和语音识别模型
+│   ├── models/                  自动下载的分类器、歌声与重叠检测模型
+│   ├── tools/                   FFmpeg、FFprobe
+│   ├── cache/                   包下载与模型缓存
+│   └── temp/                    临时文件
+├── output/                      默认提取结果
+├── work/                        任务文件
+├── logs/                        程序日志
+└── voice_extractor_installation.json
 ```
 
-自动安装的 Python 下载量约 28 MB、安装后约占 120 MB。CUDA 和 PyTorch 不会由本工具下载或升级。
+需要移动程序时，退出后移动整个文件夹，保留 `resource`。程序不依赖其他软件的运行环境和模型目录，不把安装文件存入 AppData。输入素材仍从用户选择的位置读取。
+
+首次安装可能下载数 GB 文件；PyTorch 使用自带 CUDA 运行库，无需另装 CUDA Toolkit。使用 GPU 加速需有兼容的 NVIDIA 显卡驱动。
 
 ## 处理流程
 
@@ -122,11 +125,11 @@ python extract_cli.py `
 .\scripts\build_launcher.ps1
 ```
 
-生成文件：`dist/VoiceExtractor.exe`。构建结果是单文件、无控制台窗口的原生桌面程序。
+生成文件：`dist/VoiceExtractor.exe` 和 `dist/VoiceExtractor_resources.zip`。将两者上传到 v3.0 Release；EXE 首次启动会下载并验证运行文件 ZIP，解压到自己的 `resource`。构建结果为无控制台窗口的单文件 EXE。
 
-## 资源清单
+## 自动安装的模型
 
-模型权重不提交到源码仓库。桌面版会先扫描本地资源，只下载缺失项；全部缺失时预计约需 3.3 GB。
+模型自动下载到 `resource/model` 和 `resource/models`。WavLM 使用 v3.0 Release 中与本地版本一致的权重，人物分类器使用仓库中的 `classifier_v2.pt`。其他模型继续从原模型站点下载。用户无需手动放置文件；训练素材、标注和本地输出不随发布包分发。
 
 | 资源 | 用途 |
 | --- | --- |

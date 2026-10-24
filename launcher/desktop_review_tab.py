@@ -462,7 +462,7 @@ class DesktopReviewTab:
             messagebox.showinfo('试听保留段', '错人区间覆盖了整句，没有可保留的干净段。', parent=self.root)
             return
         import tempfile
-        from extractor.audio import write_clip
+        from launcher.audio_export import write_clip
         handle, name = tempfile.mkstemp(prefix='voice_keep_', suffix='.wav')
         os.close(handle)
         try:

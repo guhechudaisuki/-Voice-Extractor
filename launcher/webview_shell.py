@@ -27,8 +27,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-LAUNCHER_DIR = Path(__file__).resolve().parent
-BASE_DIR = LAUNCHER_DIR.parent
+LAUNCHER_DIR = Path(os.environ.get("VOICE_EXTRACT_SOURCE_ROOT", Path(__file__).resolve().parent.parent)) / "launcher"
+BASE_DIR = Path(os.environ.get("VOICE_EXTRACT_DATA_ROOT", LAUNCHER_DIR.parent))
 SETTINGS_PATH = BASE_DIR / "voice_extractor_settings.json"
 SERVER_PY = LAUNCHER_DIR / "webui_server.py"
 
@@ -97,7 +97,8 @@ def start_server(port: int) -> subprocess.Popen | None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("ab") as log:
         process = subprocess.Popen(
-            [sys.executable, "-B", str(SERVER_PY), "--port", str(port)],
+            [str(BASE_DIR / "resource/python/python.exe") if getattr(sys, 'frozen', False)
+             else sys.executable, "-B", str(SERVER_PY), "--port", str(port)],
             cwd=str(BASE_DIR), stdout=log, stderr=subprocess.STDOUT,
             creationflags=creationflags, close_fds=True,
         )
