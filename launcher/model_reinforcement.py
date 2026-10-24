@@ -20,6 +20,108 @@ EPOCHS = 60
 BATCH_SIZE = 64
 
 
+def update_auto_negative_prototypes(items, model_dir: Path, progress) -> int:
+    """把用户标注的整句非目标沉淀为持久排除角色原型（auto_negatives.npz）。
+
+    对本次及历史全部 label == "wrong" 的音频提取 ERes2NetV2 + CAM++ 双通道
+    嵌入，与既有原型相似度 >= 0.65 的并入该原型、否则新建原型；原子保存到
+    模型目录。提取端在簇级判决时把它们作为补充排除角色（余量要求放宽至
+    用户排除的 0.75），实现"一集标错人，全季自动防"。
+    """
+    import numpy as np
+    wrong_paths = sorted({str(item["path"]) for item in items
+                          if item.get("review", {}).get("label") == "wrong"})
+    if not wrong_paths:
+        return 0
+    from extractor.speaker import CAMPlusVerifier, SpeakerVerifier
+    from extractor.audio import load_mono
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    primary = SpeakerVerifier(device=device)
+    secondary = CAMPlusVerifier(device=device)
+    try:
+        primary_vectors, secondary_vectors = [], []
+        for index, path in enumerate(wrong_paths, 1):
+            wave = load_mono(Path(path), 16000)
+            primary_vectors.append(primary._embedding_from_waveform(wave).detach().cpu().numpy())
+            secondary_vectors.append(secondary._embedding_from_waveform(wave).detach().cpu().numpy())
+            if index % 20 == 0:
+                progress(f"负例原型提取 {index}/{len(wrong_paths)}")
+    finally:
+        primary.close()
+        secondary.close()
+
+    def normalize(matrix):
+        matrix = np.asarray(matrix, dtype=np.float64)
+        norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+        norms[norms <= 1e-12] = 1.0
+        return matrix / norms
+
+    p_mat, s_mat = normalize(primary_vectors), normalize(secondary_vectors)
+    combo = np.concatenate([p_mat, s_mat], axis=1)
+    combo /= np.maximum(np.linalg.norm(combo, axis=1, keepdims=True), 1e-12)
+
+    # 既有原型作为聚类种子：历史负例跨次训练持续积累。
+    groups: list[list[int]] = []
+    seed_p, seed_s = [], []
+    existing = model_dir / "auto_negatives.npz"
+    if existing.is_file():
+        try:
+            with np.load(existing) as data:
+                seed_p = [row for row in data["primary"]]
+                seed_s = [row for row in data["secondary"]]
+        except (OSError, ValueError, KeyError):
+            seed_p, seed_s = [], []
+    for seed_index in range(len(seed_p)):
+        groups.append([-(seed_index + 1)])  # 负索引 = 既有原型
+
+    for index in range(len(combo)):
+        best, best_sim = None, 0.0
+        for group in groups:
+            members_p = [seed_p[-g[0] - 1] if g[0] < 0 else p_mat[g[0]] for g in group]
+            members_s = [seed_s[-g[0] - 1] if g[0] < 0 else s_mat[g[0]] for g in group]
+            centroid = np.concatenate([
+                normalize(np.mean(members_p, axis=0)[None])[0],
+                normalize(np.mean(members_s, axis=0)[None])[0]])
+            centroid /= max(float(np.linalg.norm(centroid)), 1e-12)
+            similarity = float(centroid @ combo[index])
+            if similarity >= 0.65 and similarity > best_sim:
+                best, best_sim = group, similarity
+        if best is None:
+            groups.append([index])
+        else:
+            best.append(index)
+
+    fresh = [group for group in groups if all(g[0] >= 0 for g in group)]
+    merged_seeds = 0
+    out_p, out_s, counts = [], [], []
+    for group in groups:
+        member_p = [seed_p[-g[0] - 1] if g[0] < 0 else p_mat[g[0]] for g in group]
+        member_s = [seed_s[-g[0] - 1] if g[0] < 0 else s_mat[g[0]] for g in group]
+        if all(g[0] < 0 for g in group):
+            # 未吸收任何新负例的既有原型原样保留。
+            if len(group) == 1 and group[0] < 0:
+                out_p.append(np.asarray(seed_p[-group[0] - 1], dtype=np.float32))
+                out_s.append(np.asarray(seed_s[-group[0] - 1], dtype=np.float32))
+                counts.append(0)
+            continue
+        if any(g[0] < 0 for g in group):
+            merged_seeds += 1
+        out_p.append(normalize(np.mean(member_p, axis=0)[None])[0].astype(np.float32))
+        out_s.append(normalize(np.mean(member_s, axis=0)[None])[0].astype(np.float32))
+        counts.append(sum(1 for g in group if g[0] >= 0))
+
+    model_dir.mkdir(parents=True, exist_ok=True)
+    temporary = model_dir / "auto_negatives.npz.tmp"
+    np.savez(temporary, primary=np.stack(out_p) if out_p else np.zeros((0, 192), np.float32),
+             secondary=np.stack(out_s) if out_s else np.zeros((0, 512), np.float32),
+             new_counts=np.asarray(counts, dtype=np.int32))
+    os.replace(temporary, existing)
+    progress(f"负例原型库已更新：共 {len(out_p)} 个原型"
+             f"（本次新标本 {sum(c for c in counts if c)} 条，并入既有原型 {merged_seeds} 个）")
+    return len(fresh)
+
+
+
 def train(paths: list[Path], destination: Path, progress, *, model_path: Path | None = None) -> dict:
     from extractor.config import WAVLM_SV_MODEL
     current = model_path or active_speaker_path(WAVLM_SV_MODEL)
@@ -218,6 +320,10 @@ def _train_current(paths, destination, progress, current):
         staged.unlink(missing_ok=True)
     except OSError:
         progress('模型已保存，暂存副本将在清理临时文件时移除')
+    try:
+        update_auto_negative_prototypes(items, current.parent, progress)
+    except Exception as exc:  # 原型库失败不影响已完成的模型强化
+        progress(f"负例原型库更新失败（模型强化已生效）: {type(exc).__name__}: {exc}")
     feature.cache_clear()
     progress(completion_message(report))
     return report

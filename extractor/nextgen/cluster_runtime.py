@@ -55,6 +55,8 @@ class ClusterAnalyzer:
     raw_cache = None
     raw_waveform = None
 
+    auto_negatives: list = []
+
     def __init__(self, stem, references, negative_groups=(), *, device="cuda",
                  cache_enabled=True, encoders=None, progress=None,
                  tertiary_encoder=None, quaternary_encoder=None, raw_stem=None):
@@ -127,6 +129,30 @@ class ClusterAnalyzer:
                                             enabled=cache_enabled)
         self.profile, self.negatives = self._profiles()
         self.bootstrap_provenance = None
+
+    def _load_auto_negatives(self):
+        """加载用户标注沉淀的负例原型库（模型强化时自动更新）。
+
+        余量因子 0.75：学习型原型比人工排除参考更噪，簇级资格判定按
+        margin_floor * 0.75 生效；不参与窗口级否决（避免召回回退）。
+        """
+        import numpy as np
+        from ..config import WAVLM_SV_MODEL
+        path = Path(WAVLM_SV_MODEL) / "auto_negatives.npz"
+        if not path.is_file():
+            return []
+        try:
+            with np.load(path) as data:
+                primary = np.asarray(data["primary"], dtype=np.float64)
+                secondary = np.asarray(data["secondary"], dtype=np.float64)
+        except (OSError, ValueError, KeyError):
+            return []
+        if primary.ndim != 2 or secondary.ndim != 2 or not len(primary):
+            return []
+        roles = [(f"auto_neg_{i}", unit(primary[i]), unit(secondary[i]))
+                 for i in range(min(len(primary), len(secondary)))]
+        self.progress(f"已加载习得排除原型 {len(roles)} 个（来自历史标注）")
+        return roles
 
     def bank_context(self):
         return {"encoding_version": self.encoding_version,
@@ -332,9 +358,15 @@ class ClusterAnalyzer:
     def analyze(self, spans, *, margin=0.06, temporal=True, keep_narration=True, require_dominant=True):
         turns = self.evidence(spans)
         clusters = cluster_turns(turns)
+        auto = self._load_auto_negatives()
+        exclusions = [(role, p) for role, p, _ in self.negatives] + [
+            (role, p) for role, p, _ in auto]
+        secondaries = [(role, s) for role, _, s in self.negatives] + [
+            (role, s) for role, _, s in auto]
+        scales = [1.0] * len(self.negatives) + [0.75] * len(auto)
         result = assign_target(turns, clusters, self.profile,
-                               [(role, p) for role, p, _ in self.negatives],
-                               [(role, s) for role, _, s in self.negatives],
+                               exclusions, secondaries,
+                               exclusion_scales=scales,
                                margin_floor=margin,
                                require_dominant=require_dominant)
         result = self._apply_tertiary_promotion(turns, result)

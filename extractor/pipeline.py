@@ -4623,10 +4623,15 @@ class ExtractionPipeline:
             borderline_dir = output_dir / "_borderline"
             borderline_dir.mkdir(exist_ok=True)
             for index, candidate in enumerate(borderline, 1):
-                path = borderline_dir / f"{index:04d}.wav"
+                stem_name = f"{index:04d}_{_safe_name(candidate.text or candidate.whisper_text)}"
+                path = borderline_dir / f"{stem_name}.wav"
                 write_clip(stem, path, candidate.start, candidate.end, sample_rate=16000)
+                text_path = borderline_dir / f"{stem_name}.txt"
+                text_path.write_text(
+                    candidate.text or candidate.whisper_text or "", encoding="utf-8")
                 path.with_suffix(".txt").write_text(
                     f"{candidate.start:.3f}–{candidate.end:.3f}\n"
+                    f"{candidate.text or candidate.whisper_text or ''}\n"
                     f"{candidate.diagnostics.get('cluster_reason', '')}\n"
                     f"簇 {candidate.diagnostics.get('cluster_ids')}", encoding="utf-8")
                 candidate.audio_file = str(path.relative_to(output_dir))
@@ -6576,6 +6581,42 @@ class ExtractionPipeline:
                         clip.unlink(missing_ok=True)
             else:
                 progress(0.92, "筛选完成：没有目标人物回合，跳过 STT")
+            # Tier B（边缘待捡漏）补齐 Whisper 台词与字幕纠错：前端试听
+            # Tier B 时文本列不为空，勾选导出的 train.list 才有台词。
+            borderline_turns = [
+                c for c in rejected if c.diagnostics.get("cluster_tier") == "B"]
+            if borderline_turns and accepted:
+                progress(0.93, f"为 {len(borderline_turns)} 段边缘候选补齐 STT 台词")
+                borderline_transcribed = segmenter.transcribe_spans(
+                    stem,
+                    [TimeSpan(c.start, c.end) for c in borderline_turns],
+                    progress=lambda value, message: progress(0.93, message),
+                )
+                by_borderline: dict[int, list[CandidateSentence]] = {}
+                for fragment in borderline_transcribed:
+                    span_index = int(fragment.diagnostics.get("transcription_span_index", -1))
+                    by_borderline.setdefault(span_index, []).append(fragment)
+                for index, candidate in enumerate(borderline_turns):
+                    fragments = by_borderline.get(index, [])
+                    if not fragments:
+                        continue
+                    fragments.sort(key=lambda item: (item.start, item.end))
+                    candidate_text = ""
+                    for fragment in fragments:
+                        candidate_text = self._join_transcript_text(
+                            candidate_text, fragment.whisper_text)
+                    candidate_text = candidate_text.strip()
+                    if not candidate_text:
+                        continue
+                    candidate.whisper_text = candidate_text
+                    candidate.language = _language_from_text(candidate_text, "auto")
+                    corrected, correction = self._correct_text_with_subtitle(
+                        candidate_text, candidate.language,
+                        candidate.start, candidate.end, self._subtitle_guide)
+                    candidate.text = corrected
+                    if correction:
+                        candidate.diagnostics.update(correction)
+                    candidate.diagnostics["stt_fragment_count"] = len(fragments)
             self._trace_spans("final_accepted", accepted)
             from .training_context import save_training_context
             save_training_context(paths["output"], target, reference_clips)

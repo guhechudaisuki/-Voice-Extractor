@@ -436,6 +436,7 @@ def assign_target(
     exclusion_centroids: Sequence[tuple[str, np.ndarray]] = (),
     exclusion_secondary_centroids: Sequence[tuple[str, np.ndarray]] = (),
     *,
+    exclusion_scales: Sequence[float] | None = None,
     margin_floor: float = TARGET_MARGIN_FLOOR,
     require_dominant: bool = True,
     outlier_drop: float = CLUSTER_OUTLIER_DROP,
@@ -480,6 +481,34 @@ def assign_target(
     secondary_by_role = {
         role: _unit(centroid) for role, centroid in exclusion_secondary_centroids
     }
+
+    scales = list(exclusion_scales) if exclusion_scales is not None else [1.0] * len(exclusion_centroids)
+    if len(scales) != len(exclusion_centroids):
+        raise ValueError("排除余量因子数量必须与排除角色一致")
+
+    def cluster_exclusion_ok(cluster: Cluster) -> bool:
+        """逐排除角色的双通道余量判定。
+
+        每个角色独立要求：主通道余量达标，或主通道贴线且副通道显著占优。
+        学习型负例原型（auto negatives）的余量因子为 0.75——它们来自用户
+        标注的聚类，比人工挑选的排除参考更噪，不能按同强度否决。
+        """
+        for (role, centroid), scale in zip(exclusion_centroids, scales):
+            p_gap = (cluster.primary_target_score
+                     - float(cluster.primary_centroid @ centroid))
+            if p_gap >= margin_floor * scale:
+                continue
+            secondary = secondary_by_role.get(role)
+            if secondary is None:
+                # 无副通道证据（与旧口径一致）：主通道贴线不得靠兜底放行。
+                return False
+            s_gap = (cluster.secondary_target_score
+                     - float(cluster.secondary_centroid @ secondary))
+            if (p_gap >= margin_floor * scale - 0.02
+                    and s_gap >= margin_floor * scale + 0.02):
+                continue
+            return False
+        return True
 
     def dual_margin_ok(cluster: Cluster, floor: float) -> bool:
         """双通道排除余量：主通道达标，或主通道贴线且副通道显著占优。"""
@@ -539,7 +568,7 @@ def assign_target(
         c for c in scored
         if c.primary_target_score >= profile.primary_reference_floor
         and c.secondary_target_score >= profile.secondary_reference_floor
-        and dual_margin_ok(c, margin_floor)
+        and cluster_exclusion_ok(c)
     ]
 
     diagnostics = {
@@ -564,7 +593,7 @@ def assign_target(
         """同人声线子簇判定：高质心亲和，或对参考集双通道强匹配直达。"""
         p_affinity = float(candidate.primary_centroid @ core.primary_centroid)
         s_affinity = float(candidate.secondary_centroid @ core.secondary_centroid)
-        margin_ok = dual_margin_ok(candidate, margin_floor)
+        margin_ok = cluster_exclusion_ok(candidate)
         if (p_affinity >= UNION_PRIMARY_AFFINITY
                 and s_affinity >= UNION_SECONDARY_AFFINITY and margin_ok):
             return True
