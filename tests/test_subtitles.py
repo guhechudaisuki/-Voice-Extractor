@@ -326,13 +326,17 @@ class SubtitlePipelineTests(unittest.TestCase):
             self.assertEqual(gap > .85, end - start > .85)
 
     def test_pipeline_keeps_singing_first_and_stt_last_with_optional_subtitles(self):
-        for with_subtitle in (False, True):
-            with self.subTest(with_subtitle=with_subtitle), tempfile.TemporaryDirectory(dir=ROOT / "work") as temp:
+        # Stage 15：False+无字幕文件=不挂字幕；False+同目录有字幕=自动发现（新契约）。
+        for with_subtitle, keep_file in ((False, False), (True, True), (False, True)):
+            auto_discovered = keep_file and not with_subtitle
+            with tempfile.TemporaryDirectory(dir=ROOT / "work") as temp:
                 root = Path(temp)
                 source = root / "source.wav"
                 source.touch()
                 subtitle = root / "source.srt"
                 subtitle.write_text("1\n00:00:01,000 --> 00:00:04,000\n中文翻译\n", encoding="utf-8")
+                if not keep_file:
+                    subtitle.unlink()
                 events = []
                 pipeline = ExtractionPipeline.__new__(ExtractionPipeline)
                 pipeline.options = PipelineOptions(export_all_sentences=True)
@@ -374,7 +378,8 @@ class SubtitlePipelineTests(unittest.TestCase):
                 stt_kwargs = stt.transcribe_spans.call_args.kwargs
                 self.assertEqual(set(stt_kwargs), {"progress"})
                 manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
-                self.assertEqual("subtitle_assistance" in manifest, with_subtitle)
+                self.assertEqual("subtitle_assistance" in manifest,
+                                 with_subtitle or auto_discovered)
                 self.assertIsNone(pipeline._subtitle_guide)
                 self.assertEqual(list((root / "output/text").glob("*.txt"))[0].read_text(encoding="utf-8"), "こんにちは")
 

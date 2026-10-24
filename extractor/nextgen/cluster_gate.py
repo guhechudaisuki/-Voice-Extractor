@@ -48,6 +48,40 @@ def _secondary_hint(candidate):
     return None
 
 
+def _cluster_windows_strong(local, primary_floor, secondary_floor,
+                            a: float, b: float) -> bool:
+    """1.8s 簇滑窗权威豁免（Stage 13）：候选区间在 ClusterAnalyzer 自身的
+    1.8s 滑窗下全窗通过、双通道强匹配、且对非目标簇无竞争劣势时，豁免上游
+    0.6s 超短窗的瞬时抖动（男声/轻声独白在 0.6s 窗内极易被一个爆破音打落）。
+    """
+    if not local:
+        return False
+    rows = [
+        row
+        for group in local.values() if isinstance(group, list)
+        for row in group
+        if isinstance(row, dict) and row.get("span")
+        and min(row["span"][1], b) - max(row["span"][0], a) >= CANDIDATE_WINDOW_OVERLAP
+    ]
+    if not rows or not all(bool(row.get("accepted")) for row in rows):
+        return False
+    p_floor = (primary_floor or 0.56) + 0.02
+    s_floor = (secondary_floor or 0.50) + 0.02
+    min_p = min(float(row.get("primary", 0.0)) for row in rows)
+    min_s = min(float(row.get("secondary", 0.0)) for row in rows)
+    mean_p = sum(float(row.get("primary", 0.0)) for row in rows) / len(rows)
+    mean_s = sum(float(row.get("secondary", 0.0)) for row in rows) / len(rows)
+    # 任一窗口的竞争余量为负 → 不豁免（防救援错人）。
+    if any(isinstance(row.get("cm_s"), (int, float)) and row["cm_s"] < 0.01
+           for row in rows):
+        return False
+    if any(isinstance(row.get("cm_p"), (int, float)) and row["cm_p"] < 0.08
+           for row in rows):
+        return False
+    return (min_p >= p_floor and min_s >= s_floor
+            and mean_p >= p_floor + 0.03 and mean_s >= s_floor + 0.03)
+
+
 def _local_classifier_multi_veto(candidate, start: float | None = None,
                                  end: float | None = None) -> bool:
     """局部分类器双强负窗否决：候选区间内出现 >= 2 个跌破 reject_threshold
@@ -81,10 +115,19 @@ def _window_min(candidate):
     return value if value > 0.0 else None
 
 
-def _rescue_tier(candidate, secondary_floor):
-    """高危救援候选严审：低副通道分或低窗口分 → 只能进 Tier B。"""
+def _rescue_tier(candidate, secondary_floor, *, local=None, primary_floor=None,
+                 start=None, end=None):
+    """高危救援候选严审：低副通道分或低窗口分 → 只能进 Tier B。
+
+    1.8s 簇滑窗全过且双通道强匹配时（_cluster_windows_strong）豁免 0.6s
+    短窗抖动，直接放行 Tier A（Stage 13 权威豁免）。
+    """
     if _local_classifier_multi_veto(candidate):
         return "B"
+    if _cluster_windows_strong(local, primary_floor, secondary_floor,
+                               candidate.start if start is None else start,
+                               candidate.end if end is None else end):
+        return "A"
     window_min = _window_min(candidate)
     if not any(candidate.diagnostics.get(key) for key in RESCUE_KEYS):
         if window_min is not None and window_min < WEAK_WINDOW_FLOOR:
@@ -162,7 +205,8 @@ def candidate_membership(candidate, turns, result, *, local=None, min_seconds=1.
         if cursor < candidate.end - 0.02:
             return False, ids, "uncovered_interval", None
 
-    tier = _rescue_tier(candidate, secondary_floor)
+    tier = _rescue_tier(candidate, secondary_floor, local=local,
+                        primary_floor=floors.get("primary"))
     if tier == "B":
         return False, ids, "rescue_strict_review", "B"
     return True, ids, "target_cluster", "A"
@@ -200,7 +244,22 @@ def apply_cluster_gate(accepted, rejected, turns, result, *, mode, min_seconds=1
     originally_accepted = list(accepted)
     floors = result.diagnostics.get("profile_floors") or {}
     secondary_floor = floors.get("secondary")
+    primary_floor = floors.get("primary")
     accepted_spans = result.diagnostics.get("accepted_spans") or []
+    # Stage 13：相邻干净子区间合并（间隔 <=0.35s 且间隙不碰阻塞区间）。
+    # 上游把长轮次切成碎片时，连续同簇窗口各自 <1.2s 无法借尸还魂；
+    # 合并后即可成为完整 Tier A 产出。
+    merged_accepted_spans: list[list[float]] = []
+    merged_constituents: list[list[tuple[float, float]]] = []
+    for span_a, span_b in sorted(accepted_spans):
+        if (merged_accepted_spans and span_a - merged_accepted_spans[-1][1] <= 0.35
+                and not any(min(span_a, mark[1]) - max(merged_accepted_spans[-1][1], mark[0]) > 0.02
+                            for mark in blocked_spans)):
+            merged_accepted_spans[-1][1] = max(merged_accepted_spans[-1][1], span_b)
+            merged_constituents[-1].append((span_a, span_b))
+            continue
+        merged_accepted_spans.append([span_a, span_b])
+        merged_constituents.append([(span_a, span_b)])
 
     def make_crop(parent, start, end, reason, *, strict_parent=False):
         """从已验证干净区间裁出子句；子段继承父段的救援/弱窗审查。
@@ -226,12 +285,18 @@ def apply_cluster_gate(accepted, rejected, turns, result, *, mode, min_seconds=1
             "span": [start, end], "passed": True, "method": "cluster_temporal_consensus"}
         window_min = _window_min(parent)
         rescue_marked = any(parent.diagnostics.get(k) for k in RESCUE_KEYS)
-        if _rescue_tier(parent, secondary_floor) == "B" or (strict_parent and (
-                window_min is None
-                or (rescue_marked and window_min < PROMOTION_RESCUE_WINDOW_FLOOR))):
+        strong_windows = _cluster_windows_strong(
+            local, floors.get("primary"), secondary_floor, start, end)
+        rescue_b = _rescue_tier(parent, secondary_floor, local=local,
+                                primary_floor=floors.get("primary"),
+                                start=start, end=end) == "B"
+        strict_b = strict_parent and (window_min is None
+                or (rescue_marked and window_min < PROMOTION_RESCUE_WINDOW_FLOOR))
+        if not strong_windows and (rescue_b or strict_b):
             # 父段证据不足（救援标记 + 弱副通道/弱窗，或整体弱窗；混合嫌疑
             # 父段还要求窗口证据齐全、救援标记者窗口分更高）：子段只进
-            # Tier B 待人工/多模型仲裁，不进主输出。
+            # Tier B 待人工/多模型仲裁，不进主输出。1.8s 簇滑窗全过且双通道
+            # 强匹配时豁免（Stage 13 权威豁免）。
             child.accepted = False
             child.reject_reason = "簇级身份未通过：rescue_strict_review"
             child.diagnostics["cluster_tier"] = "B"
@@ -284,7 +349,7 @@ def apply_cluster_gate(accepted, rejected, turns, result, *, mode, min_seconds=1
                 if keep_tier == "B":
                     borderline.append(candidate)
                 if not hard:
-                    for a, b in accepted_spans:
+                    for a, b in merged_accepted_spans:
                         start, end = max(candidate.start, a), min(candidate.end, b)
                         if end - start >= min_seconds:
                             make_crop(candidate, start, end, reason)
@@ -293,7 +358,8 @@ def apply_cluster_gate(accepted, rejected, turns, result, *, mode, min_seconds=1
             # 供前端 1 分钟捡漏；绝不混入主输出。
             candidate.diagnostics["cluster_tier"] = "B"
             borderline.append(candidate)
-        elif (candidate.reject_reason == "声纹匹配不足" and not hard):
+        elif (not hard and candidate.reject_reason in (
+                "声纹匹配不足", *MIXED_CROP_REASONS, "说话回合过短")):
             # Tier B → Tier A 晋升：要求救援标记候选窗口分更高，且父轮次
             # 滑窗通过率达标（低通过率的混合长句走裁切路径而非整句晋升）。
             ratio = _turn_pass_ratio(candidate, turns, local)
@@ -301,6 +367,7 @@ def apply_cluster_gate(accepted, rejected, turns, result, *, mode, min_seconds=1
             window_min = _window_min(candidate)
             promotable = (
                 allowed and candidate.duration >= min_seconds
+                and candidate.reject_reason == "声纹匹配不足"
                 and (not rescue_marked or window_min is None
                      or window_min >= PROMOTION_RESCUE_WINDOW_FLOOR)
                 and (ratio is None or ratio >= PROMOTION_TURN_PASS_RATIO))
@@ -324,7 +391,7 @@ def apply_cluster_gate(accepted, rejected, turns, result, *, mode, min_seconds=1
                 croppable = ratio is None or ratio >= PROMOTION_TURN_PASS_RATIO
                 cropped_any = False
                 if croppable:
-                    for a, b in accepted_spans:
+                    for a, b in merged_accepted_spans:
                         start, end = max(candidate.start, a), min(candidate.end, b)
                         if end - start >= min_seconds:
                             child = make_crop(candidate, start, end, "promoted_subspan",
@@ -366,10 +433,93 @@ def apply_cluster_gate(accepted, rejected, turns, result, *, mode, min_seconds=1
         accepted[:] = _deduplicate_tier_a([*kept, *cropped])
         rejected[:] = [c for c in rejected if id(c) not in promoted_ids] + removed
         _refine_tier_b(borderline, accepted)
+        # Stage 13 孤儿实体化：合并后的已认证干净区间若未有任何 Tier A 候选
+        # 覆盖（上游碎片化/说话回合过短导致），直接合成 Tier A 候选交给
+        # STT——ClusterAnalyzer 的 1.8s 窗口认证本身就是产出凭据。
+        from ..types import CandidateSentence
+        tier_a_spans = [(c.start, c.end) for c in accepted]
+        synthesized = 0
+        for merged_index, (span_start, span_end) in enumerate(merged_accepted_spans):
+            if span_end - span_start < min_seconds:
+                continue
+            if any(min(span_end, mark_b) - max(span_start, mark_a) > 0.02
+                   for mark_a, mark_b in blocked_spans):
+                continue
+            constituents = merged_constituents[merged_index] if merged_index < len(merged_constituents) else []
+            # 合成凭据检查：accepted 窗口运行段本身已过 floors/margins/cohort，
+            # 此处只复核分数地板与竞争余量（跨边缘的 rejected 邻窗不计入，
+            # 否则 0.9s hop 下任何 1.8s span 都会因相邻窗被误杀）。
+            # Stage 13：合成区间必须继承重叠候选的局部分类器审计——已知
+            # 负例多数带强负窗（0 误伤实测见函数注释）。
+            class _SpanShim:
+                start, end = span_start, span_end
+                diagnostics = {"local_classifier_audit": None}
+            for pool_candidate in [*rejected, *originally_accepted]:
+                if (min(pool_candidate.end, span_end) - max(pool_candidate.start, span_start)
+                        < 0.45 * min(pool_candidate.duration or 1e-6, span_end - span_start)):
+                    continue
+                audit = pool_candidate.diagnostics.get("local_classifier_audit")
+                if isinstance(audit, dict) and audit.get("windows"):
+                    _SpanShim.diagnostics["local_classifier_audit"] = audit
+                    break
+            if _local_classifier_multi_veto(_SpanShim, span_start, span_end):
+                continue
+            constituent_ok = True
+            for s_a, s_b in constituents:
+                rows = [
+                    row for group in (local or {}).values() if isinstance(group, list)
+                    for row in group
+                    if isinstance(row, dict) and row.get("accepted")
+                    and row.get("span")
+                    and min(row["span"][1], s_b) - max(row["span"][0], s_a) >= 0.45
+                ]
+                if not rows:
+                    constituent_ok = False
+                    break
+                if min(float(row["primary"]) for row in rows) < (primary_floor or 0.56):
+                    constituent_ok = False
+                    break
+                if min(float(row["secondary"]) for row in rows) < (secondary_floor or 0.50):
+                    constituent_ok = False
+                    break
+                if any(isinstance(row.get("cm_s"), (int, float)) and row["cm_s"] < 0.01
+                       for row in rows):
+                    constituent_ok = False
+                    break
+                if any(isinstance(row.get("cm_p"), (int, float)) and row["cm_p"] < 0.08
+                       for row in rows):
+                    constituent_ok = False
+                    break
+            if not constituent_ok:
+                continue
+            if _covered_ratio(span_start, span_end, tier_a_spans) >= 0.3:
+                continue
+            accepted.append(CandidateSentence(
+                span_start, span_end, "", accepted=True,
+                diagnostics={
+                    "cluster_span_synthesized": True,
+                    "cluster_tier": "A",
+                    "cluster_identity": True,
+                    "cluster_would_accept": True,
+                    "cluster_mode": mode,
+                    "cluster_target_id": result.target_cluster_id,
+                    "acoustic_identity_audit": {
+                        "span": [span_start, span_end], "passed": True,
+                        "method": "cluster_span_synthesis"},
+                }))
+            tier_a_spans.append((span_start, span_end))
+            synthesized += 1
+        if synthesized:
+            # 合成 span 来自不同轮次的合并区间，互相之间也可能包含——
+            # 再跑一次包含去重保证 Tier A 零重叠。
+            accepted[:] = _deduplicate_tier_a(accepted)
+            accepted.sort(key=lambda c: (c.start, c.end))
     refined_b = sum(
         1 for c in borderline if c.diagnostics.get("cluster_tier") == "B")
     return {"removed": len(removed), "promoted": len(promoted),
-            "cropped": len(cropped), "borderline": refined_b}
+            "cropped": len(cropped), "borderline": refined_b,
+            "synthesized": sum(1 for c in accepted
+                               if c.diagnostics.get("cluster_span_synthesized"))}
 
 
 def _deduplicate_tier_a(candidates, containment=0.85):

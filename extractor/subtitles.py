@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 import sys
 from bisect import bisect_left
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from statistics import median
 from typing import Sequence
@@ -82,9 +82,53 @@ def read_subtitles(path: Path) -> list[SubtitleCue]:
         seen.add(key)
         actor = str(getattr(event, "name", "") or "").strip()
         cues.append(SubtitleCue(index, event.start / 1000, event.end / 1000, plain, kind, actor))
-    if not cues:
+    folded: list[SubtitleCue] = []
+    for cue in sorted(cues, key=lambda cue: (cue.start, cue.end)):
+        # 双语同轴行折叠（Stage 15）：JPSC 类字幕同一句有 Dial-JP/Dial-CH
+        # 两条几乎同轴的事件，绝不当作多人重叠，也不允许把日文行挤掉。
+        if (folded and cue.kind == "speech" and folded[-1].kind == "speech"
+                and abs(cue.start - folded[-1].start) <= 0.15
+                and abs(cue.end - folded[-1].end) <= 0.15):
+            previous = folded[-1]
+            if _has_kana(cue.text) and not _has_kana(previous.text):
+                folded[-1] = replace(previous, text=cue.text)
+            elif _has_kana(cue.text) and _has_kana(previous.text) and len(cue.text) > len(previous.text):
+                folded[-1] = replace(previous, text=cue.text)
+            continue
+        folded.append(cue)
+    if not folded:
         raise ValueError("字幕中没有有效的时间轴条目")
-    return sorted(cues, key=lambda cue: (cue.start, cue.end))
+    return folded
+
+
+def _has_kana(text: str) -> bool:
+    return bool(re.search(r"[\u3040-\u30ff]", str(text or "")))
+
+
+def discover_subtitle_for_target(target: Path) -> Path | None:
+    """当用户未显式绑定字幕时，在目标媒体同目录下自动匹配同名或同前缀字幕。
+
+    精确前缀匹配（xxx.mkv -> xxx.ass / xxx.JPSC.ass / xxx.sc.ass / xxx.srt）；
+    优先 .ass/.ssa，其次含 jp/ja 的原文字幕，再按文件名长度取最短。
+    """
+    target = Path(target)
+    parent = target.parent
+    if not parent.is_dir():
+        return None
+    stem = target.stem
+    candidates = [
+        p for p in parent.iterdir()
+        if p.is_file() and p.suffix.lower() in SUBTITLE_SUFFIXES
+        and (p.stem == stem or p.stem.startswith(stem + "."))
+    ]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: (
+        0 if p.suffix.lower() in {".ass", ".ssa"} else 1,
+        0 if re.search(r"jp|ja", p.name, re.I) else 1,
+        len(p.name),
+    ))
+    return candidates[0]
 
 
 def _nearest(values: Sequence[float], value: float) -> float:
@@ -134,6 +178,10 @@ class SubtitleGuide:
             key=lambda cue: (cue.start, cue.end))
         spans: list[TimeSpan] = []
         for left, right in zip(speech, speech[1:]):
+            # 双语/特效同轴行保护：起止几乎一致的两条字幕不是多人重叠。
+            if (abs(right.start - left.start) <= 0.18
+                    and abs(right.end - left.end) <= 0.18):
+                continue
             overlap = min(left.end, right.end) - max(left.start, right.start)
             if overlap < minimum:
                 continue

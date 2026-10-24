@@ -471,14 +471,16 @@ class WhisperSegmenter:
         """Transcribe each supplied speaker span as an independent unit.
 
         ``spans`` are hard fences: Whisper output from one span is assembled
-        and flushed before the next span is processed.  This API is intended
-        for the post-speaker-segmentation pipeline, where a change of speaker
-        has already produced separate :class:`TimeSpan` values.
+        and flushed before the next span is processed.  The Whisper pipeline
+        is created exactly once per call and reused for all windows.  A
+        non-empty result without terminal punctuation is kept because the
+        caller's span boundary, rather than punctuation, defines the end of
+        the target speaker turn.
 
-        The Whisper pipeline is created exactly once per call and reused for
-        all windows.  A non-empty result without terminal punctuation is kept
-        because the caller's span boundary, rather than punctuation, defines
-        the end of the target speaker turn.
+        Stage 15: after the first auto-language pass, the dominant language
+        (vote of the three longest spans' windows) locks short spans
+        (< 4.0 s) whose detected language disagrees — short Japanese lines
+        otherwise hallucinate into English/Chinese gibberish.
         """
         progress = progress or (lambda _value, _message: None)
         audio_path = Path(audio_path)
@@ -512,9 +514,11 @@ class WhisperSegmenter:
         import tempfile
         from .audio import extract_audio_range
 
-        parts_by_span: dict[int, list[tuple[str, float, float, str]]] = {
-            index: [] for index in range(len(normalised_spans))
+        parts_by_window: dict[int, dict[tuple, list]] = {
+            index: {} for index in range(len(normalised_spans))
         }
+        window_language: dict[tuple, str] = {}
+        locked_language: str | None = None
         windows_per_span = {
             span_index: sum(1 for item in plan if item[0] == span_index)
             for span_index in range(len(normalised_spans))
@@ -540,13 +544,61 @@ class WhisperSegmenter:
                     )
                 if not isinstance(result, dict):
                     result = {}
-                parts_by_span[span_index].extend(
+                parts_by_window[span_index][(window_index, start, end)] = (
                     self._timed_parts_for_result(result, start, end, span)
                 )
+                window_language[(span_index, window_index)] = str(
+                    result.get("language") or "auto").lower()
                 progress(
                     (plan_index + 1) / max(1, len(plan)),
                     f"Whisper 目标段 {span_index + 1}/{len(normalised_spans)}，"
                     f"窗口 {window_index + 1}/{span_window_count}：完成",
+                )
+
+            # Stage 15：主导语言投票（3 个最长目标段）+ 短片段锁定重转写。
+            longest_spans = sorted(
+                range(len(normalised_spans)),
+                key=lambda i: normalised_spans[i].duration, reverse=True)[:3]
+            votes: dict = {}
+            for span_index in longest_spans:
+                for (vote_span, _w), language in window_language.items():
+                    if vote_span == span_index and language in {"ja", "zh", "en"}:
+                        votes[language] = votes.get(language, 0) + 1
+            if votes:
+                dominant = max(votes, key=lambda k: votes[k])
+                if dominant in {"ja", "zh", "en"}:
+                    locked_language = dominant
+            redo = []
+            if locked_language is not None:
+                redo = [
+                    (span_index, window_index, start, end)
+                    for span_index, window_index, start, end in plan
+                    if normalised_spans[span_index].duration < 4.0
+                    and window_language.get((span_index, window_index)) != locked_language
+                ]
+            if redo:
+                progress(0.0, f"Whisper：语言锁定 {locked_language}，重转写 {len(redo)} 个短窗口")
+            for redo_index, (span_index, window_index, start, end) in enumerate(redo):
+                span = normalised_spans[span_index]
+                with tempfile.TemporaryDirectory(prefix="whisper_span_") as temp_dir:
+                    chunk_path = Path(temp_dir) / "span.wav"
+                    extract_audio_range(audio_path, chunk_path, start, end)
+                    result = pipe(
+                        str(chunk_path),
+                        return_timestamps="word",
+                        return_language=True,
+                        batch_size=1,
+                        generate_kwargs={
+                            "task": "transcribe", "language": locked_language},
+                    )
+                if not isinstance(result, dict):
+                    result = {}
+                parts_by_window[span_index][(window_index, start, end)] = (
+                    self._timed_parts_for_result(result, start, end, span)
+                )
+                progress(
+                    (redo_index + 1) / max(1, len(redo)),
+                    f"Whisper：语言锁定重转写 {redo_index + 1}/{len(redo)}",
                 )
         finally:
             del pipe
@@ -556,9 +608,27 @@ class WhisperSegmenter:
 
         candidates: list[CandidateSentence] = []
         for span_index, span in enumerate(normalised_spans):
+            timed_parts: list[tuple[str, float, float, str]] = []
+            for window_key in sorted(parts_by_window.get(span_index, {})):
+                timed_parts.extend(parts_by_window[span_index][window_key])
             candidates.extend(
                 self._candidates_from_span_parts(
-                    parts_by_span.get(span_index, []), span, max_gap=max_gap, span_index=span_index
+                    timed_parts, span, max_gap=max_gap, span_index=span_index
+                )
+            )
+        candidates.sort(key=lambda candidate: (candidate.start, candidate.end))
+        progress(1.0, f"Whisper：目标段识别完成，得到 {len(candidates)} 条文本")
+        return candidates
+
+
+        candidates: list[CandidateSentence] = []
+        for span_index, span in enumerate(normalised_spans):
+            timed_parts: list[tuple[str, float, float, str]] = []
+            for window_key in sorted(parts_by_window.get(span_index, {})):
+                timed_parts.extend(parts_by_window[span_index][window_key])
+            candidates.extend(
+                self._candidates_from_span_parts(
+                    timed_parts, span, max_gap=max_gap, span_index=span_index
                 )
             )
         candidates.sort(key=lambda candidate: (candidate.start, candidate.end))

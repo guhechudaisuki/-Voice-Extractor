@@ -562,8 +562,16 @@ class ClusterAnalyzer:
             rows = []
             for a, b, p, s in windows:
                 passes, score = window_ok(a, b, p, s)
+                cm_p = cm_s = None
+                if non_union:
+                    tcp = max(float(unit(p) @ c.primary_centroid) for c in target_union)
+                    tcs = max(float(unit(s) @ c.secondary_centroid) for c in target_union)
+                    othp = max(float(unit(p) @ c.primary_centroid) for c in non_union)
+                    oths = max(float(unit(s) @ c.secondary_centroid) for c in non_union)
+                    cm_p, cm_s = round(tcp - othp, 4), round(tcs - oths, 4)
                 rows.append({"span": [a, b], "primary": score[0],
-                             "secondary": score[1], "accepted": bool(passes)})
+                             "secondary": score[1], "accepted": bool(passes),
+                             "cm_p": cm_p, "cm_s": cm_s})
             # 长句内部换气平滑：两侧高分通过、自身仅微跌且不偏向排除角色的
             # 窗口视为同人换气。
             neighbor_floor = profile.primary_reference_floor + BREATH_NEIGHBOR_FLOOR

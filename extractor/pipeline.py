@@ -42,7 +42,7 @@ from .speaker import (
     SpeakerProfile,
 )
 from .transcription import FunASRTools, WhisperSegmenter
-from .subtitles import SubtitleGuide, validate_subtitle_bindings
+from .subtitles import SubtitleGuide, discover_subtitle_for_target, validate_subtitle_bindings
 from .subtitle_assistance import (
     restore_subtitle_sentences, retry_subtitle_vad, split_at_subtitle_pauses,
 )
@@ -228,22 +228,42 @@ class ExtractionPipeline:
             "output": OUTPUT_ROOT / job_id,
         }
 
+    @staticmethod
+    def _is_precleaned_reference(path: Path) -> bool:
+        """已是 16kHz 单声道人声短切片（如本工具切出的 cue 参考）→ 免二次 UVR。"""
+        import soundfile as sf
+        try:
+            info = sf.info(str(path))
+        except (OSError, RuntimeError):
+            return False
+        duration = info.frames / max(1, info.samplerate)
+        return info.samplerate == 16000 and info.channels == 1 and duration < 10.0
+
     def _prepare_references(
         self,
         references: list[Path],
         paths: dict[str, Path],
         progress: ProgressCallback,
-    ) -> tuple[list[Path], list[float]]:
+    ) -> tuple[list[Path], list[float], list[bool]]:
         paths["normalized_refs"].mkdir(parents=True, exist_ok=True)
         normalized: list[Path] = []
         durations: list[float] = []
+        precleaned: list[bool] = []
         for index, reference in enumerate(references, start=1):
             destination = paths["normalized_refs"] / f"reference_{index:03d}.wav"
-            normalize_audio(reference, destination, sample_rate=44100, stereo=True)
-            durations.append(pad_for_separator(destination))
+            if self._is_precleaned_reference(reference):
+                # Stage 16：已是分离后人声的 16kHz 单声道短切片，原样沿用
+                #（Double-UVR 会造成高频损伤）。
+                shutil.copyfile(reference, destination)
+                durations.append(pad_for_separator(destination))
+                precleaned.append(True)
+            else:
+                normalize_audio(reference, destination, sample_rate=44100, stereo=True)
+                durations.append(pad_for_separator(destination))
+                precleaned.append(False)
             normalized.append(destination)
             progress(0.04 + 0.08 * index / max(1, len(references)), f"规范化参考音频 {index}/{len(references)}")
-        return normalized, durations
+        return normalized, durations, precleaned
 
     def _prepare_negative_references(
         self,
@@ -4899,6 +4919,12 @@ class ExtractionPipeline:
             self._local_identity_reject_threshold = None
             self._local_identity_model_sha256 = ""
             self._reference_sha256 = reference_sha256
+        if subtitle is None:
+            # Stage 15：未显式绑定字幕时自动挂载目标同目录的同名/同前缀字幕。
+            discovered = discover_subtitle_for_target(target)
+            if discovered is not None:
+                progress(0.01, f"自动发现同目录字幕：{discovered.name}")
+                subtitle = discovered
         self._subtitle_guide = SubtitleGuide.load(Path(subtitle)) if subtitle else None
         self._stage_audit = {"schema_version": 1, "stages": {}}
         self._cluster_report = None
@@ -4908,7 +4934,13 @@ class ExtractionPipeline:
         singing_detector: SingingDetector | None = None
         try:
             progress(0.01, "检查本地模型")
-            normalized_refs, reference_durations = self._prepare_references(references, paths, progress)
+            prepared_refs = self._prepare_references(references, paths, progress)
+            if len(prepared_refs) == 3:
+                normalized_refs, reference_durations, reference_precleaned = prepared_refs
+            else:
+                # 测试桩兼容：旧签名只返回 (normalized, durations)。
+                normalized_refs, reference_durations = prepared_refs
+                reference_precleaned = [False] * len(normalized_refs)
             normalized_negative_groups, negative_duration_groups = (
                 self._prepare_negative_references(
                     negative_reference_groups,
@@ -4947,10 +4979,17 @@ class ExtractionPipeline:
 
             progress(0.16, "提取参考与目标人声：准备 UVR 分块")
             separator = UVR5Separator(self.device)
-            separation_items = [
-                (path, paths["reference_stems"] / f"reference_{index:03d}_vocals.wav")
-                for index, path in enumerate(normalized_refs, start=1)
-            ]
+            reference_precleaned_stems: dict[int, Path] = {}
+            separation_items = []
+            paths["reference_stems"].mkdir(parents=True, exist_ok=True)
+            for index, path in enumerate(normalized_refs, start=1):
+                stem_path = paths["reference_stems"] / f"reference_{index:03d}_vocals.wav"
+                if reference_precleaned[index - 1]:
+                    # Stage 16：免二次 UVR，直接沿用原 16kHz 单声道切片。
+                    shutil.copyfile(path, stem_path)
+                    reference_precleaned_stems[index - 1] = stem_path
+                    continue
+                separation_items.append((path, stem_path))
             negative_item_count = 0
             for group_index, group in enumerate(normalized_negative_groups, start=1):
                 group_dir = paths["negative_stems"] / f"role_{group_index:03d}"
@@ -4986,9 +5025,16 @@ class ExtractionPipeline:
                 )
                 progress(1.0, "完成：目标音频没有人声")
                 return PipelineResult(job_id, output_dir, archive, [], [], manifest, transcript)
-            reference_stems = separated[: len(normalized_refs)]
+            reference_stems: list[Path] = []
+            separated_cursor = 0
+            for index in range(len(normalized_refs)):
+                if index in reference_precleaned_stems:
+                    reference_stems.append(reference_precleaned_stems[index])
+                else:
+                    reference_stems.append(separated[separated_cursor])
+                    separated_cursor += 1
             negative_flat_stems = separated[
-                len(normalized_refs) : len(normalized_refs) + negative_item_count
+                separated_cursor : separated_cursor + negative_item_count
             ]
             stem = separated[-1]
             for reference_stem, original_duration in zip(reference_stems, reference_durations):
