@@ -56,7 +56,8 @@ jobs:
                   digest.update(block)
           if digest.hexdigest() != expected:
               raise ValueError('Resource ZIP checksum mismatch')
-          subprocess.run(['gh', 'release', 'upload', 'v3.0', str(destination), '--repo', repository], check=True)
+          subprocess.run(['gh', 'release', 'upload', 'v3.0', str(destination), '--repo', repository,
+                          '--clobber'], check=True)
           print(f'Published {destination}: {destination.stat().st_size} bytes, SHA256 {expected}')
           for part in parts:
               subprocess.run(['gh', 'release', 'delete-asset', 'v3.0', part.name,

@@ -60,6 +60,7 @@ MODULE_PACKAGES = {
     "psutil": "psutil>=5.9",
     "fastapi": "fastapi>=0.110,<1",
     "uvicorn": "uvicorn>=0.29,<1",
+    "multipart": "python-multipart>=0.0.9",
 }
 
 
@@ -924,6 +925,15 @@ def ensure_python_modules(
         return
     reporter(0.08, "正在把缺失 Python 依赖安装到工具自己的目录")
     env = _python_probe_environment(extra_paths)
+    portable = getattr(sys, "frozen", False)
+    install_options = ["--target", str(layout.packages)]
+    if portable:
+        # Normal installation sees the embedded interpreter's existing torch;
+        # pip --target would ignore it and resolve a second incompatible build.
+        install_options = ["--no-warn-script-location"]
+        constraints = layout.resource / "runtime-constraints.txt"
+        constraints.write_text("torch==2.0.0+cu118\ntorchaudio==2.0.1+cu118\nnumpy<2\nrotary-embedding-torch==0.6.4\n", encoding="utf-8")
+        install_options.extend(("--constraint", str(constraints)))
     _stream_process(
         [
             str(python),
@@ -932,8 +942,7 @@ def ensure_python_modules(
             "install",
             "--disable-pip-version-check",
             "--no-input",
-            "--target",
-            str(layout.packages),
+            *install_options,
             *missing,
         ],
         env,

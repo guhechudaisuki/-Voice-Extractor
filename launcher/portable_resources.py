@@ -174,7 +174,7 @@ def install_embedded_python(root: Path, reporter) -> Path:
         finally:
             archive.unlink(missing_ok=True)
     (destination / 'python39._pth').write_text(
-        'python39.zip\n.\n../python_packages\n..\n../vendor\nimport site\n', encoding='utf-8')
+        'python39.zip\n.\nLib/site-packages\n../python_packages\n..\n../vendor\nimport site\n', encoding='utf-8')
     environment = {**os.environ, **portable_environment(root)}
     packages = resource / 'python_packages'
     packages.mkdir(parents=True, exist_ok=True)
@@ -195,11 +195,11 @@ def install_embedded_python(root: Path, reporter) -> Path:
     if probe.returncode:
         download('https://bootstrap.pypa.io/pip/3.9/get-pip.py', pip_script, reporter)
         try:
-            run([str(pip_script), '--no-warn-script-location', '--target', str(packages)])
+            run([str(pip_script), '--no-warn-script-location'])
         finally:
             pip_script.unlink(missing_ok=True)
     reporter(0.8, '正在安装便携 PyTorch 和 torchaudio（首次约需下载 2.5 GB）')
     run(['-m', 'pip', 'install', '--no-input', '--no-warn-script-location',
-         '--target', str(packages), 'torch==2.0.0+cu118', 'torchaudio==2.0.1+cu118',
+         'torch==2.0.0+cu118', 'torchaudio==2.0.1+cu118',
          '--index-url', 'https://download.pytorch.org/whl/cu118'])
     return python

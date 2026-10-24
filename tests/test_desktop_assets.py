@@ -82,6 +82,21 @@ class DesktopAssetTests(unittest.TestCase):
                 patch.object(bootstrap, 'load_global_settings', side_effect=AssertionError('global settings')):
             self.assertEqual(bootstrap.suggested_install_root(), Path(bootstrap.sys.executable).parent)
 
+    def test_portable_pip_keeps_existing_torch_visible(self):
+        with tempfile.TemporaryDirectory() as directory:
+            layout = bootstrap.InstallLayout(Path(directory))
+            layout.prepare()
+            ready = {name: True for name in bootstrap.MODULE_PACKAGES}
+            missing = {**ready, 'multipart': False}
+            with patch.object(bootstrap.sys, 'frozen', True, create=True), \
+                    patch.object(bootstrap, 'probe_modules', side_effect=[missing, ready]), \
+                    patch.object(bootstrap, '_stream_process') as run:
+                bootstrap.ensure_python_modules(layout.python, layout, layout.resource, lambda *_: None)
+            arguments = run.call_args.args[0]
+            self.assertNotIn('--target', arguments)
+            self.assertIn('--constraint', arguments)
+            self.assertIn('python-multipart>=0.0.9', arguments)
+
 
 if __name__ == '__main__':
     unittest.main()
