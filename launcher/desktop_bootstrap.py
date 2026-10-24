@@ -235,6 +235,20 @@ COMPONENTS = (
         check_file="model.pt",
     ),
     ComponentSpec(
+        "classifier_v2",
+        "局部身份分类器（已训练）",
+        "models/anime_t3",
+        "direct",
+        9,
+        (
+            DirectFile(
+                "classifier_v2.pt",
+                "https://github.com/guhechudaisuki/-Voice-Extractor/raw/main/models/anime_t3/classifier_v2.pt",
+            ),
+        ),
+        check_file="classifier_v2.pt",
+    ),
+    ComponentSpec(
         "whisper_cache",
         "Whisper large-v3-turbo",
         "model/stt/whisper/hf_cache",

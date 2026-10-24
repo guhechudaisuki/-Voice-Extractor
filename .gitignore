@@ -36,6 +36,7 @@ GPT-SoVITS*/
 **/modelscope_cache/
 *.pth
 *.pt
+!models/anime_t3/classifier_v2.pt
 *.ckpt
 *.bin
 *.onnx
