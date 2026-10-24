@@ -1,0 +1,70 @@
+{
+  "verified_at": "2026-10-23",
+  "scope": "high_recall_cluster_stage1-4_offline_replay_and_frontend",
+  "replay": {
+    "batch": "output/20261008_002053_batch_3866bb",
+    "script": "evaluation/verify_high_recall_cluster.py",
+    "wavlm_channel": true,
+    "interception_rate": 0.9512,
+    "leaked_known_wrong": 2,
+    "total_known_wrong": 41,
+    "average_recall_factor": 2.976,
+    "episode_tier_a": {
+      "001": 23,
+      "002": 28,
+      "003": 20,
+      "004": 28,
+      "005": 21,
+      "006": 33
+    },
+    "episode_tier_b": {
+      "001": 145,
+      "002": 125,
+      "003": 135,
+      "004": 109,
+      "005": 167,
+      "006": 132
+    },
+    "enforce_baseline": {
+      "001": 7,
+      "002": 5,
+      "003": 9,
+      "004": 0,
+      "005": 15,
+      "006": 6
+    },
+    "clip_coverage": {
+      "001": 0.95,
+      "002": 0.925,
+      "003": 1.0
+    },
+    "gates": {
+      "precision": true,
+      "recall": true,
+      "coverage": true
+    }
+  },
+  "unittest": {
+    "count": 506,
+    "result": "OK",
+    "new_tests": "tests/test_high_recall_cluster.py (18)"
+  },
+  "smokes": {
+    "cluster_ui_smoke.cjs": "passed",
+    "subtitle_ui_smoke.cjs": "passed",
+    "bootstrap_ui_smoke.cjs": "passed",
+    "desktop_switch_ui_smoke.cjs": "passed",
+    "training_ui_smoke.cjs": "passed (期望值更新 gpt_sovits_list)",
+    "tier_ui_smoke.cjs (新增)": "passed",
+    "native_desktop_workflow_smoke.py": "passed (真实 WavLM 训练)",
+    "training_workflow_smoke.py": "passed (真实 WavLM 训练)",
+    "desktop_subtitle_smoke.py": "passed",
+    "training_desktop_smoke.py": "未跑：Edge 套壳时代遗留断言（edge_app），已被原生桌面流程取代"
+  },
+  "static": {
+    "project_python_compiled": 214,
+    "git_diff_check": true,
+    "studio_js_syntax": true,
+    "note": "audio.py 15ms 淡入淡出使嵌入缓存键整体刷新一次，已重算并热缓存（6 集 WavLM 回放 24.6s）"
+  }
+}

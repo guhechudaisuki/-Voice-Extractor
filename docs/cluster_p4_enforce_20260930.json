@@ -1,0 +1,134 @@
+{
+  "schema_version": 1,
+  "scope": "development_retention_and_held_out_machine_execution_only",
+  "p4_status": "failed",
+  "p4_passed": false,
+  "development": [
+    {
+      "episode": 1,
+      "baseline_count": 55,
+      "final_count": 6,
+      "retention": 0.10909090909090909,
+      "minimum_retention": 0.4,
+      "retention_passed": false,
+      "target_cluster_id": 2,
+      "reason": "target_cluster_found",
+      "accepted_turn_count": 6,
+      "changes": {
+        "removed": 64,
+        "promoted": 2,
+        "cropped": 1
+      },
+      "comparison_inputs": {
+        "baseline_target_sha256": "28520c94d11f7910d657a6d2cde8ef2b28b74df4c261a67b3ec59a254ad39671",
+        "current_target_sha256": "28520c94d11f7910d657a6d2cde8ef2b28b74df4c261a67b3ec59a254ad39671",
+        "method": "identical_source_file"
+      },
+      "baseline": {
+        "path": "X:\\AboutAI\\voice\\voice apart\\提取\\output\\20260928_231317_batch_38abf6\\batch_manifest.json",
+        "sha256": "06c74576cdfbabdadd72c0e0e8b53838436cad00dafc62ad1f003810d927aa4c"
+      },
+      "evidence": {
+        "manifest": {
+          "path": "X:\\AboutAI\\voice\\voice apart\\提取\\output\\20260930_035200_batch_f26b7b\\batch_manifest.json",
+          "sha256": "2efbbc8124d55dacf98274bbfb2246abd42b86ff9f62994b952512b93f7b5b5a"
+        },
+        "provenance": {
+          "path": "X:\\AboutAI\\voice\\voice apart\\提取\\output\\20260930_035200_batch_f26b7b\\evaluation_provenance.json",
+          "sha256": "287a2357164c5f53149df26eaa4e19167bca389bf7ff7d28cc8e1bdf7accfff6"
+        },
+        "cluster_report": {
+          "path": "X:\\AboutAI\\voice\\voice apart\\提取\\output\\20260930_035200_batch_f26b7b\\001_DBD-Raws_Hibike_Euphonium_01_1080P_BDRip_HEVC-10bit_FLACx3\\cluster_report.json",
+          "sha256": "e067e32020a29058290989f2008b3481e10f073c1f0cd5edacdf6eff745dcc1a"
+        }
+      }
+    },
+    {
+      "episode": 2,
+      "baseline_count": 39,
+      "final_count": 13,
+      "retention": 0.3333333333333333,
+      "minimum_retention": 0.4,
+      "retention_passed": false,
+      "target_cluster_id": 5,
+      "reason": "target_cluster_found",
+      "accepted_turn_count": 13,
+      "changes": {
+        "removed": 46,
+        "promoted": 0,
+        "cropped": 8
+      },
+      "comparison_inputs": {
+        "baseline_target_sha256": "da313bfd87750533a5b87b33c698d72dbd71134cf80902bc51b6692ada07ad26",
+        "current_target_sha256": "da313bfd87750533a5b87b33c698d72dbd71134cf80902bc51b6692ada07ad26",
+        "method": "identical_source_file"
+      },
+      "baseline": {
+        "path": "X:\\AboutAI\\voice\\voice apart\\提取\\output\\20260928_202012_batch_27c455\\batch_manifest.json",
+        "sha256": "98ad15331be3b7408df9225b00e9feeb67898d5aa3265c920aa64d88ac93aa99"
+      },
+      "evidence": {
+        "manifest": {
+          "path": "X:\\AboutAI\\voice\\voice apart\\提取\\output\\20260930_041644_batch_35ec53\\batch_manifest.json",
+          "sha256": "ac0f08bd0b40454271f870e7132dfb459054a227a28a5c54bebe4fd5951f498d"
+        },
+        "provenance": {
+          "path": "X:\\AboutAI\\voice\\voice apart\\提取\\output\\20260930_041644_batch_35ec53\\evaluation_provenance.json",
+          "sha256": "a0966ad4f5e1ddf8dbbbd506b1929e951fd7b359d2c889e692dbc0e6704444e8"
+        },
+        "cluster_report": {
+          "path": "X:\\AboutAI\\voice\\voice apart\\提取\\output\\20260930_041644_batch_35ec53\\001_DBD-Raws_Hibike_Euphonium_02_1080P_BDRip_HEVC-10bit_FLACx3\\cluster_report.json",
+          "sha256": "08f7968ba7dfb3529a089b3118d9735f7e4f49e6e54c076ab96295be985800d2"
+        }
+      }
+    },
+    {
+      "episode": 3,
+      "baseline_count": 28,
+      "final_count": 10,
+      "retention": 0.35714285714285715,
+      "minimum_retention": 0.4,
+      "retention_passed": false,
+      "target_cluster_id": 9,
+      "reason": "target_cluster_found",
+      "accepted_turn_count": 11,
+      "changes": {
+        "removed": 38,
+        "promoted": 0,
+        "cropped": 5
+      },
+      "comparison_inputs": {
+        "baseline_target_sha256": "e979b8bc5f0d21918c66446d362f7b7d9f3ef58a1ae2bc76991954ae65360f5c",
+        "current_target_sha256": "e979b8bc5f0d21918c66446d362f7b7d9f3ef58a1ae2bc76991954ae65360f5c",
+        "method": "identical_source_file"
+      },
+      "baseline": {
+        "path": "X:\\AboutAI\\voice\\voice apart\\提取\\output\\20260928_214330_batch_5bd1f3\\batch_manifest.json",
+        "sha256": "5aaf06f033bb3193078a7e55ddad0074e8a71bf19372ccce294e50384f89d167"
+      },
+      "evidence": {
+        "manifest": {
+          "path": "X:\\AboutAI\\voice\\voice apart\\提取\\output\\20260930_044513_batch_4f0ad5\\batch_manifest.json",
+          "sha256": "4a3ef2a22dd201ac4f411e2f3bb5eaf2027426bc8c2ee94027a0ac9ec97ea77e"
+        },
+        "provenance": {
+          "path": "X:\\AboutAI\\voice\\voice apart\\提取\\output\\20260930_044513_batch_4f0ad5\\evaluation_provenance.json",
+          "sha256": "b093c7cf811051de302a156172c76421e05883a220e802c02c12adb5dbb271a4"
+        },
+        "cluster_report": {
+          "path": "X:\\AboutAI\\voice\\voice apart\\提取\\output\\20260930_044513_batch_4f0ad5\\001_DBD-Raws_Hibike_Euphonium_03_1080P_BDRip_HEVC-10bit_FLACx3\\cluster_report.json",
+          "sha256": "7847c1aa302e75911f88436b4117a6971d559d644ed54036bf084b5973ec8a5c"
+        }
+      }
+    }
+  ],
+  "frozen_code_options_and_references_equal": true,
+  "held_out_machine_complete": false,
+  "held_out": [],
+  "p6_acceptance": "not_run",
+  "limitations": [
+    "Retention is a clip count ratio, not recall or accuracy.",
+    "No human wrong-person, singing, or overlap claims are made.",
+    "An empty output cannot establish useful held-out accuracy."
+  ]
+}

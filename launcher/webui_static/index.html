@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Voice Extractor · 声纹提取工作台</title>
+  <link rel="stylesheet" href="/static/css/studio.css">
+</head>
+<body>
+<div class="shell">
+
+  <header class="rack">
+    <div class="rack-brand">
+      <div class="brand-dot"></div>
+      <div class="brand-text">
+        <strong>VOICE EXTRACTOR</strong>
+        <span id="versionTag">v2.01</span>
+      </div>
+    </div>
+
+    <nav class="tabs">
+      <button class="tab is-on" data-panel="p-review">试听标注</button>
+      <button class="tab" data-panel="p-extract">提取任务</button>
+      <button class="tab" data-panel="p-training">模型强化</button>
+      <button class="tab" data-panel="p-settings">设置</button>
+    </nav>
+
+    <div class="rack-tail">
+      <button class="lamp-btn is-on" id="blindBtn" title="隐藏相似度与判定路线">
+        <span class="lamp"></span><span>盲听</span>
+      </button>
+      <button class="lamp-btn" id="switchDesktopBtn" title="关闭网页并打开桌面原生窗口">
+        <span>切回桌面版</span>
+      </button>
+      <button class="lamp-btn" id="closeAppBtn" title="停止任务并清理临时文件，保留已强化的模型">关闭并清理</button>
+    </div>
+  </header>
+
+  <main class="stage">
+
+    <!-- ── 试听标注 ─────────────────────────────────────────── -->
+    <section class="panel is-on" id="p-review">
+      <div class="deck">
+
+        <!-- 左轨：批次 + 片段 -->
+        <aside class="rail">
+          <div class="rail-head">
+            <span class="rail-title">批次</span>
+            <button class="icon-btn" id="reloadBatchesBtn" title="重新扫描 output 目录">↻</button>
+          </div>
+
+          <select id="batchSelect" class="field"></select>
+
+          <div class="batch-meta" id="batchMeta"></div>
+
+          <div class="view-switch">
+            <button class="chip is-on" data-view="player">播放器</button>
+            <button class="chip" data-view="cluster" id="clusterViewBtn" disabled>声纹簇</button>
+          </div>
+
+          <div class="rail-head">
+            <span class="rail-title">片段</span>
+            <span class="counter" id="segmentCounter">0</span>
+          </div>
+
+          <div class="filters" id="filters">
+            <button class="chip is-on" data-filter="all">全部</button>
+            <button class="chip" data-filter="tierA">✅ 主输出</button>
+            <button class="chip" data-filter="tierB">⚡ 边缘捡漏</button>
+            <button class="chip" data-filter="removed">🚫 撤下</button>
+            <button class="chip" data-filter="todo">未标</button>
+            <button class="chip" data-filter="done">已标</button>
+            <button class="chip" data-filter="cluster" id="clusterFilterChip" hidden>目标簇</button>
+          </div>
+
+          <div class="seg-list" id="segList">
+            <p class="empty">正在读取批次…</p>
+          </div>
+        </aside>
+
+        <!-- 中轨：播放器 -->
+        <div class="rail rail-play">
+          <div class="now" id="nowBar">
+            <span class="now-idx" id="nowIndex">—</span>
+            <span class="now-text" id="nowFile">未选择片段</span>
+            <span class="now-dur" id="nowDuration">0.00s</span>
+          </div>
+
+          <div class="scope">
+            <canvas id="waveCanvas"></canvas>
+            <div class="scope-head" id="scopeHead"></div>
+            <div class="scope-empty" id="scopeEmpty">选择右侧片段开始试听</div>
+          </div>
+
+          <div class="timecode">
+            <span id="curTime">0.00</span>
+            <span class="tc-sep">/</span>
+            <span id="totTime">0.00</span>
+            <span class="tc-src" id="srcRange"></span>
+          </div>
+
+          <div class="transport">
+            <button class="tbtn" id="prevBtn" title="上一句 (←)">◀◀</button>
+            <button class="tbtn tbtn-main" id="playBtn" title="播放 / 暂停 (空格)">
+              <span id="playLabel">播放</span>
+            </button>
+            <button class="tbtn" id="replayBtn" title="重播 (R)">↺</button>
+            <button class="tbtn" id="nextBtn" title="下一句 (→)">▶▶</button>
+          </div>
+
+          <blockquote class="line" id="sttLine">（无识别文本）</blockquote>
+
+          <div class="readout" id="readout"></div>
+        </div>
+
+        <!-- 簇视图：和播放器同位置互斥显示，由「簇」标签切换 -->
+        <div class="rail rail-cluster" id="clusterRail" hidden>
+          <div class="rail-head">
+            <span class="rail-title">说话人簇</span>
+            <span class="counter" id="clusterCount">0</span>
+          </div>
+          <div class="cluster-check" id="clusterCheck"></div>
+          <label>目标文件 <select id="clusterTarget" class="field"></select></label>
+          <label>人工确认目标簇 <select id="clusterOverride" class="field"></select></label>
+          <button id="saveClusterOverride" class="mini-btn">保存目标簇标注</button>
+          <p class="pad-note">保存复核结论；现有音频不会被改写。</p>
+          <div class="cluster-list" id="clusterList"></div>
+          <div class="cluster-legend" id="clusterLegend">
+            点一个簇可以只看它的片段。琥珀色的是程序认定的目标簇。
+          </div>
+        </div>
+
+        <!-- 右轨：裁决 -->
+        <div class="rail rail-vote">
+          <div class="vote-head">
+            <span class="rail-title">裁决</span>
+            <span class="verdict" id="verdictTag">待审</span>
+          </div>
+
+          <div class="pads" id="pads">
+            <button class="pad" data-label="correct">
+              <span class="pad-key">1</span>
+              <span class="pad-name">目标匹配</span>
+              <span class="pad-note">纯净目标，可入训练集</span>
+            </button>
+            <button class="pad" data-label="wrong">
+              <span class="pad-key">2</span>
+              <span class="pad-name">整句非目标</span>
+              <span class="pad-note">完全是别人</span>
+            </button>
+            <button class="pad" data-label="partial">
+              <span class="pad-key">3</span>
+              <span class="pad-name">部分非目标</span>
+              <span class="pad-note">夹带他人，需标记区间</span>
+            </button>
+            <button class="pad" data-label="singing">
+              <span class="pad-key">4</span>
+              <span class="pad-name">歌声伴奏</span>
+              <span class="pad-note">有人唱歌或有伴奏</span>
+            </button>
+            <button class="pad" data-label="overlap">
+              <span class="pad-key">5</span>
+              <span class="pad-name">重叠讲话</span>
+              <span class="pad-note">多人同时发声</span>
+            </button>
+            <button class="pad" data-label="skip">
+              <span class="pad-key">6</span>
+              <span class="pad-name">存疑跳过</span>
+              <span class="pad-note">听不准，留待复查</span>
+            </button>
+          </div>
+
+          <div class="trim" id="trimBox" hidden>
+            <span class="trim-title">标出他人声音的区间（秒）</span>
+            <div class="trim-row">
+              <input type="number" id="trimStart" class="field num" step="0.05" min="0" value="0.00">
+              <span class="trim-dash">–</span>
+              <input type="number" id="trimEnd" class="field num" step="0.05" min="0" value="0.00">
+              <button class="mini-btn" id="trimFromPlayhead">从播放头起</button>
+              <button class="mini-btn" id="keepPlayBtn">▶ 试听保留段</button>
+            </div>
+          </div>
+
+          <div class="rail-foot">
+            <label class="check">
+              <input type="checkbox" id="autoNext" checked>
+              <span>标注后自动下一句</span>
+            </label>
+            <div class="foot-btns">
+              <button class="mini-btn" id="undoBtn" title="撤销上一步 (Ctrl+Z)">撤销</button>
+              <button class="mini-btn" id="trustMainBtn" title="把未标注的 Tier A 主输出全部标为目标匹配">一键信任主输出</button>
+              <button class="mini-btn solid" id="exportBtn">导出 ZIP</button>
+            </div>
+            <label class="check material-identity"><input type="checkbox" id="includeMaterial" disabled>
+              <span>附带训练原料（全部标注和音频，ZIP 可直接强化）</span></label>
+            <label class="check material-identity"><input type="checkbox" id="includeGptList" checked>
+              <span>附带 GPT-SoVITS train.list</span></label>
+            <div class="save-state" id="materialState">全部片段打标后可选导出原料</div>
+            <div class="save-state" id="saveState">随点即存</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── 提取任务 ─────────────────────────────────────────── -->
+    <section class="panel" id="p-extract">
+      <div class="deck deck-extract">
+
+        <div class="rail rail-form">
+          <div class="rail-head">
+            <span class="rail-title">提取任务</span>
+            <span class="counter" id="extractState">空闲</span>
+          </div>
+
+          <label class="form-row">
+            <span class="form-label">待提取的音频 / 视频路径</span>
+            <textarea id="targetsInput" class="field area" rows="3"
+              placeholder="每行一个路径。目录里的全部音视频也会被处理。"></textarea>
+          </label>
+
+          <label class="form-row">
+            <span class="form-label">目标人物参考音频</span>
+            <textarea id="refsInput" class="field area" rows="3"
+              placeholder="每行一个参考音频；放同一角色的多段，覆盖不同情绪与录音条件。"></textarea>
+          </label>
+
+          <details class="subtitle-bindings" id="subtitleBindingsPanel">
+            <summary>字幕辅助（可选）<span id="subtitleBindingCount" class="counter">未绑定</span></summary>
+            <p class="form-help">为目标文件填写对应字幕路径，留空则不使用。支持 ASS、SSA、SRT、VTT；绑定时请填写具体音视频文件路径。</p>
+            <div id="subtitleBindings"></div>
+          </details>
+
+          <label class="form-row">
+            <span class="form-label">排除角色（可选，逗号分隔，每组是同一人）</span>
+            <textarea id="excludeInput" class="field area" rows="2"
+              placeholder="每组一行，组内用逗号分隔：&#10;绿.mp3, 绿2.mp3&#10;丽奈.mp3"></textarea>
+          </label>
+
+          <div class="form-grid">
+            <label class="form-row">
+              <span class="form-label">声纹阈值 <b id="thresholdVal">0.68</b></span>
+              <input type="range" id="threshold" min="0.50" max="0.90" step="0.01" value="0.68">
+            </label>
+            <label class="form-row">
+              <span class="form-label">静音下限 / 上限（秒）</span>
+              <div class="pair">
+                <input type="number" id="silenceMin" class="field num" step="0.05" min="0" value="0.20">
+                <span class="trim-dash">–</span>
+                <input type="number" id="silenceMax" class="field num" step="0.05" min="0" value="0.85">
+              </div>
+            </label>
+          </div>
+
+          <div class="toggles">
+            <label class="check"><input type="checkbox" id="useOverlap" checked><span>多人重叠过滤</span></label>
+            <label class="check"><input type="checkbox" id="useSinging" checked><span>歌声与伴奏过滤</span></label>
+            <label class="check"><input type="checkbox" id="useVideo"><span>同时导出视频片段</span></label>
+            <label class="check"><input type="checkbox" id="useBootstrap"><span>自动扩充参考并应用（单文件可用，耗时增加）</span></label>
+          </div>
+
+          <div class="run-btns">
+            <button class="mini-btn solid big" id="runBtn">开始提取</button>
+            <button class="mini-btn" id="stopBtn">停止</button>
+          </div>
+        </div>
+
+        <div class="rail rail-term">
+          <div class="rail-head">
+            <span class="rail-title">运行输出</span>
+            <span class="counter" id="progressPct">0%</span>
+          </div>
+          <div class="progress"><div class="progress-bar" id="progressBar"></div></div>
+          <div class="term" id="term">
+            <p class="term-line dim">等待任务。填好路径后点「开始提取」。</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" id="p-training">
+      <div class="settings training-panel">
+        <h2>模型强化 <span class="counter">从人工标注学习</span></h2>
+        <p class="form-help">选择 annotations 目录中的训练 ZIP，无需解压。ZIP 内含标注、片段音频和参考音频，可汇总不同集、不同电脑的 ZIP。强化成功后模型自动保存回原位置。</p>
+        <label class="form-row"><span class="form-label">选择一个或多个训练 ZIP</span>
+          <input class="field" id="trainingFiles" type="file" accept=".zip" multiple>
+        </label>
+        <p class="form-help">每次最多 30 份，单份最多 4 GB，合计最多 8 GB。模型记住训练成功的 ZIP 哈希，重复 ZIP 自动跳过；重新打包后哈希不同则按新 ZIP 处理。首次强化至少需要 2 段目标匹配和 2 段整句非目标。其余标签保留，暂不参与二分类训练。</p>
+        <div class="run-btns">
+          <button class="mini-btn solid big" id="trainBtn">开始强化</button>
+          <button class="mini-btn" id="discardModelBtn" disabled>清理临时文件</button>
+        </div>
+        <p class="save-state" id="trainingState" role="status">等待原料文件</p>
+        <p class="form-help" id="trainingStorage">原料副本与中间文件使用临时磁盘。强化成功后模型直接保留在原位置，清理或关闭不会删除它。</p>
+        <pre class="term training-report" id="trainingReport">训练报告将在这里显示。</pre>
+        <p class="form-help">强化后的模型供后续提取直接使用，下次启动仍然保留。训练数据上的结果不等于实际识别准确率，效果应以独立语音验证为准。</p>
+      </div>
+    </section>
+
+    <!-- ── 设置 ─────────────────────────────────────────────── -->
+    <section class="panel" id="p-settings">
+      <div class="settings">
+        <h2>界面与偏好</h2>
+
+        <div class="set-row">
+          <div>
+            <span class="set-name">使用哪个界面启动</span>
+            <span class="set-desc">切换时当前界面会关闭，另一个界面自动打开。</span>
+          </div>
+          <div class="set-actions">
+            <button class="mini-btn" id="goDesktopBtn">用桌面版启动</button>
+            <button class="mini-btn solid" id="goWebBtn" disabled>用网页版启动（当前）</button>
+          </div>
+        </div>
+
+        <div class="set-row">
+          <div>
+            <span class="set-name">网页服务端口</span>
+            <span class="set-desc">下次启动网页版时生效。</span>
+          </div>
+          <input type="number" id="portInput" class="field num" value="7860" min="1024" max="65535">
+        </div>
+
+        <div class="set-row">
+          <div>
+            <span class="set-name">默认盲听</span>
+            <span class="set-desc">打开时隐藏相似度与判定路线，避免先入为主。</span>
+          </div>
+          <input type="checkbox" id="blindDefault">
+        </div>
+
+        <div class="set-row">
+          <div>
+            <span class="set-name">标注后自动下一句</span>
+            <span class="set-desc">点完裁决直接播下一段。</span>
+          </div>
+          <input type="checkbox" id="autoNextDefault" checked>
+        </div>
+
+        <div class="set-foot">
+          <button class="mini-btn solid" id="saveSettingsBtn">保存设置</button>
+          <span class="save-state" id="settingsState"></span>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <div class="toasts" id="toasts"></div>
+</div>
+
+<script src="/static/js/studio.js"></script>
+</body>
+</html>

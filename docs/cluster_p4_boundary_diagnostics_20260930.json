@@ -1,0 +1,800 @@
+[
+  {
+    "episode": 1,
+    "proposal": "canonical",
+    "reason": "target_cluster_found",
+    "target_cluster_id": 5,
+    "evidence_turns": 234,
+    "cluster_passed_turns": 4,
+    "candidate_count": 4,
+    "baseline_final_count": 55,
+    "changes": {
+      "removed": 69,
+      "promoted": 0,
+      "cropped": 2
+    },
+    "diagnostics": {
+      "cluster_count": 15,
+      "qualified_count": 5,
+      "largest_cluster_id": 5,
+      "largest_qualified_cluster_id": 5,
+      "outlier_count": 27,
+      "narration_candidates": [],
+      "temporal_rejected_count": 12,
+      "accepted_spans": [
+        [
+          77.68,
+          80.2125
+        ],
+        [
+          128.72,
+          130.52
+        ],
+        [
+          130.52,
+          135.97
+        ],
+        [
+          337.87,
+          340.57
+        ]
+      ]
+    },
+    "review_source_matches": false,
+    "review_check": {
+      "whole_wrong_count": 0,
+      "whole_wrong_inside_target": 0,
+      "whole_wrong_elsewhere": 0,
+      "whole_wrong_caught_by_outlier_rule": 0,
+      "whole_wrong_unresolved": 0,
+      "whole_wrong_withheld_no_target": 0,
+      "mixed_clips_in_target": 0,
+      "mixed_clips_unresolved": 0,
+      "mixed_clips_withheld_no_target": 0,
+      "mixed_clips_total": 0,
+      "verdict": "no_review_overlap",
+      "notes": "按人工试听片段计数，不按轮次计数。mixed 只检查已标注的负例区间；覆盖不足单列 unresolved。簇内保留不等于最终导出，零目标不算成功。此结果不测召回，也不是未见集泛化证据。"
+    },
+    "accepted_spans": [
+      [
+        77.68,
+        80.21249999999999
+      ],
+      [
+        337.87,
+        339.57
+      ],
+      [
+        130.52,
+        135.97
+      ],
+      [
+        128.72,
+        130.52
+      ]
+    ]
+  },
+  {
+    "episode": 1,
+    "proposal": "candidate_replacement",
+    "reason": "target_cluster_found",
+    "target_cluster_id": 7,
+    "evidence_turns": 241,
+    "cluster_passed_turns": 8,
+    "candidate_count": 10,
+    "baseline_final_count": 55,
+    "changes": {
+      "removed": 61,
+      "promoted": 0,
+      "cropped": 0
+    },
+    "diagnostics": {
+      "cluster_count": 18,
+      "qualified_count": 3,
+      "largest_cluster_id": 2,
+      "largest_qualified_cluster_id": 2,
+      "outlier_count": 7,
+      "narration_candidates": [],
+      "temporal_rejected_count": 9,
+      "accepted_spans": [
+        [
+          116.02000000000001,
+          119.97999999999999
+        ],
+        [
+          117.92,
+          119.62
+        ],
+        [
+          309.9825,
+          312.2825
+        ],
+        [
+          309.9825,
+          312.283
+        ],
+        [
+          469.39,
+          471.19
+        ],
+        [
+          788.03,
+          791.93
+        ],
+        [
+          975.77,
+          977.97
+        ],
+        [
+          1321.48,
+          1323.68
+        ]
+      ]
+    },
+    "review_source_matches": false,
+    "review_check": {
+      "whole_wrong_count": 0,
+      "whole_wrong_inside_target": 0,
+      "whole_wrong_elsewhere": 0,
+      "whole_wrong_caught_by_outlier_rule": 0,
+      "whole_wrong_unresolved": 0,
+      "whole_wrong_withheld_no_target": 0,
+      "mixed_clips_in_target": 0,
+      "mixed_clips_unresolved": 0,
+      "mixed_clips_withheld_no_target": 0,
+      "mixed_clips_total": 0,
+      "verdict": "no_review_overlap",
+      "notes": "按人工试听片段计数，不按轮次计数。mixed 只检查已标注的负例区间；覆盖不足单列 unresolved。簇内保留不等于最终导出，零目标不算成功。此结果不测召回，也不是未见集泛化证据。"
+    },
+    "accepted_spans": [
+      [
+        116.02000000000001,
+        117.22
+      ],
+      [
+        116.02000000000001,
+        119.97999999999999
+      ],
+      [
+        117.92,
+        119.62
+      ],
+      [
+        309.9825,
+        312.2825
+      ],
+      [
+        309.9825,
+        312.283
+      ],
+      [
+        469.39,
+        471.19
+      ],
+      [
+        788.03,
+        791.93
+      ],
+      [
+        975.77,
+        977.97
+      ],
+      [
+        1321.48,
+        1323.68
+      ],
+      [
+        1321.48,
+        1323.68
+      ]
+    ]
+  },
+  {
+    "episode": 2,
+    "proposal": "canonical",
+    "reason": "target_cluster_found",
+    "target_cluster_id": 5,
+    "evidence_turns": 297,
+    "cluster_passed_turns": 16,
+    "candidate_count": 16,
+    "baseline_final_count": 39,
+    "changes": {
+      "removed": 44,
+      "promoted": 0,
+      "cropped": 8
+    },
+    "diagnostics": {
+      "cluster_count": 18,
+      "qualified_count": 4,
+      "largest_cluster_id": 5,
+      "largest_qualified_cluster_id": 5,
+      "outlier_count": 21,
+      "narration_candidates": [],
+      "temporal_rejected_count": 11,
+      "accepted_spans": [
+        [
+          151.165,
+          153.905
+        ],
+        [
+          176.34,
+          180.76
+        ],
+        [
+          205.04,
+          209.0675
+        ],
+        [
+          228.44,
+          231.3875
+        ],
+        [
+          235.6975,
+          237.7475
+        ],
+        [
+          695.57,
+          698.97
+        ],
+        [
+          740.3225,
+          743.0
+        ],
+        [
+          814.14,
+          818.675
+        ],
+        [
+          859.07,
+          863.1325
+        ],
+        [
+          1101.2375,
+          1104.0375
+        ],
+        [
+          1205.7825,
+          1207.66
+        ],
+        [
+          1242.9175,
+          1246.0875
+        ],
+        [
+          1273.4,
+          1276.69
+        ],
+        [
+          1276.97,
+          1280.265
+        ],
+        [
+          1314.4,
+          1315.86
+        ],
+        [
+          1326.695,
+          1328.66
+        ]
+      ]
+    },
+    "review_source_matches": false,
+    "review_check": {
+      "whole_wrong_count": 0,
+      "whole_wrong_inside_target": 0,
+      "whole_wrong_elsewhere": 0,
+      "whole_wrong_caught_by_outlier_rule": 0,
+      "whole_wrong_unresolved": 0,
+      "whole_wrong_withheld_no_target": 0,
+      "mixed_clips_in_target": 0,
+      "mixed_clips_unresolved": 0,
+      "mixed_clips_withheld_no_target": 0,
+      "mixed_clips_total": 0,
+      "verdict": "no_review_overlap",
+      "notes": "按人工试听片段计数，不按轮次计数。mixed 只检查已标注的负例区间；覆盖不足单列 unresolved。簇内保留不等于最终导出，零目标不算成功。此结果不测召回，也不是未见集泛化证据。"
+    },
+    "accepted_spans": [
+      [
+        205.04,
+        209.06750000000002
+      ],
+      [
+        229.68,
+        231.38750000000002
+      ],
+      [
+        235.6975,
+        237.7475
+      ],
+      [
+        696.97,
+        698.27
+      ],
+      [
+        740.3225,
+        743.0
+      ],
+      [
+        859.07,
+        863.1324999999999
+      ],
+      [
+        1101.2575,
+        1104.0375
+      ],
+      [
+        1326.695,
+        1328.66
+      ],
+      [
+        814.14,
+        818.675
+      ],
+      [
+        176.34,
+        180.76
+      ],
+      [
+        1276.97,
+        1280.265
+      ],
+      [
+        1273.4,
+        1276.69
+      ],
+      [
+        151.165,
+        153.905
+      ],
+      [
+        1243.7800000000002,
+        1246.0875
+      ],
+      [
+        1205.7825,
+        1207.66
+      ],
+      [
+        1314.4,
+        1315.86
+      ]
+    ]
+  },
+  {
+    "episode": 2,
+    "proposal": "candidate_replacement",
+    "reason": "target_cluster_found",
+    "target_cluster_id": 5,
+    "evidence_turns": 289,
+    "cluster_passed_turns": 15,
+    "candidate_count": 14,
+    "baseline_final_count": 39,
+    "changes": {
+      "removed": 38,
+      "promoted": 0,
+      "cropped": 0
+    },
+    "diagnostics": {
+      "cluster_count": 18,
+      "qualified_count": 4,
+      "largest_cluster_id": 5,
+      "largest_qualified_cluster_id": 5,
+      "outlier_count": 19,
+      "narration_candidates": [],
+      "temporal_rejected_count": 12,
+      "accepted_spans": [
+        [
+          173.85,
+          180.76
+        ],
+        [
+          205.04,
+          209.06750000000002
+        ],
+        [
+          214.73,
+          218.0275
+        ],
+        [
+          229.68,
+          231.38750000000002
+        ],
+        [
+          235.6975,
+          237.7475
+        ],
+        [
+          292.38,
+          294.64
+        ],
+        [
+          696.97,
+          698.27
+        ],
+        [
+          740.3225,
+          743.0
+        ],
+        [
+          859.07,
+          863.1324999999999
+        ],
+        [
+          1105.0275,
+          1109.315
+        ],
+        [
+          1178.455,
+          1181.255
+        ],
+        [
+          1243.7800000000002,
+          1248.16
+        ],
+        [
+          1273.4,
+          1281.94
+        ],
+        [
+          1283.94,
+          1287.38
+        ],
+        [
+          1326.695,
+          1328.66
+        ]
+      ]
+    },
+    "review_source_matches": false,
+    "review_check": {
+      "whole_wrong_count": 0,
+      "whole_wrong_inside_target": 0,
+      "whole_wrong_elsewhere": 0,
+      "whole_wrong_caught_by_outlier_rule": 0,
+      "whole_wrong_unresolved": 0,
+      "whole_wrong_withheld_no_target": 0,
+      "mixed_clips_in_target": 0,
+      "mixed_clips_unresolved": 0,
+      "mixed_clips_withheld_no_target": 0,
+      "mixed_clips_total": 0,
+      "verdict": "no_review_overlap",
+      "notes": "按人工试听片段计数，不按轮次计数。mixed 只检查已标注的负例区间；覆盖不足单列 unresolved。簇内保留不等于最终导出，零目标不算成功。此结果不测召回，也不是未见集泛化证据。"
+    },
+    "accepted_spans": [
+      [
+        205.04,
+        209.06750000000002
+      ],
+      [
+        229.68,
+        231.38750000000002
+      ],
+      [
+        235.6975,
+        237.7475
+      ],
+      [
+        696.97,
+        698.27
+      ],
+      [
+        740.3225,
+        743.0
+      ],
+      [
+        859.07,
+        863.1324999999999
+      ],
+      [
+        1326.695,
+        1328.66
+      ],
+      [
+        173.85,
+        180.76
+      ],
+      [
+        292.38,
+        294.64
+      ],
+      [
+        1105.0275,
+        1109.315
+      ],
+      [
+        1178.455,
+        1181.255
+      ],
+      [
+        1243.7800000000002,
+        1248.16
+      ],
+      [
+        1283.94,
+        1287.38
+      ],
+      [
+        1273.4,
+        1281.94
+      ]
+    ]
+  },
+  {
+    "episode": 3,
+    "proposal": "canonical",
+    "reason": "target_cluster_found",
+    "target_cluster_id": 9,
+    "evidence_turns": 254,
+    "cluster_passed_turns": 11,
+    "candidate_count": 14,
+    "baseline_final_count": 28,
+    "changes": {
+      "removed": 37,
+      "promoted": 0,
+      "cropped": 5
+    },
+    "diagnostics": {
+      "cluster_count": 17,
+      "qualified_count": 4,
+      "largest_cluster_id": 9,
+      "largest_qualified_cluster_id": 9,
+      "outlier_count": 16,
+      "narration_candidates": [],
+      "temporal_rejected_count": 11,
+      "accepted_spans": [
+        [
+          158.8,
+          164.17
+        ],
+        [
+          164.45,
+          169.56
+        ],
+        [
+          169.96,
+          172.68
+        ],
+        [
+          173.9,
+          177.91
+        ],
+        [
+          179.39,
+          184.04
+        ],
+        [
+          184.86,
+          188.36
+        ],
+        [
+          188.69,
+          192.86
+        ],
+        [
+          1264.1,
+          1267.38
+        ],
+        [
+          1268.37,
+          1272.07
+        ],
+        [
+          1313.66,
+          1316.82
+        ],
+        [
+          1319.47,
+          1322.63
+        ]
+      ]
+    },
+    "review_source_matches": true,
+    "review_check": {
+      "whole_wrong_count": 10,
+      "whole_wrong_inside_target": 0,
+      "whole_wrong_elsewhere": 7,
+      "whole_wrong_caught_by_outlier_rule": 3,
+      "whole_wrong_unresolved": 0,
+      "whole_wrong_withheld_no_target": 0,
+      "mixed_clips_in_target": 0,
+      "mixed_clips_unresolved": 0,
+      "mixed_clips_withheld_no_target": 0,
+      "mixed_clips_total": 1,
+      "verdict": "review_errors_blocked",
+      "notes": "按人工试听片段计数，不按轮次计数。mixed 只检查已标注的负例区间；覆盖不足单列 unresolved。簇内保留不等于最终导出，零目标不算成功。此结果不测召回，也不是未见集泛化证据。"
+    },
+    "accepted_spans": [
+      [
+        174.5,
+        177.91
+      ],
+      [
+        175.6,
+        177.91
+      ],
+      [
+        1264.1,
+        1265.4
+      ],
+      [
+        1264.1,
+        1267.38
+      ],
+      [
+        1265.9,
+        1267.38
+      ],
+      [
+        1268.37,
+        1272.07
+      ],
+      [
+        1268.37,
+        1272.07
+      ],
+      [
+        1313.66,
+        1316.16
+      ],
+      [
+        1313.66,
+        1316.16
+      ],
+      [
+        158.8,
+        164.17
+      ],
+      [
+        179.39,
+        184.04
+      ],
+      [
+        188.69,
+        192.86
+      ],
+      [
+        184.86,
+        188.36
+      ],
+      [
+        1319.47,
+        1322.63
+      ]
+    ]
+  },
+  {
+    "episode": 3,
+    "proposal": "candidate_replacement",
+    "reason": "target_cluster_found",
+    "target_cluster_id": 6,
+    "evidence_turns": 258,
+    "cluster_passed_turns": 10,
+    "candidate_count": 13,
+    "baseline_final_count": 28,
+    "changes": {
+      "removed": 33,
+      "promoted": 0,
+      "cropped": 0
+    },
+    "diagnostics": {
+      "cluster_count": 17,
+      "qualified_count": 3,
+      "largest_cluster_id": 6,
+      "largest_qualified_cluster_id": 6,
+      "outlier_count": 23,
+      "narration_candidates": [],
+      "temporal_rejected_count": 9,
+      "accepted_spans": [
+        [
+          158.8,
+          164.8
+        ],
+        [
+          169.96,
+          172.68
+        ],
+        [
+          174.5,
+          177.91
+        ],
+        [
+          175.6,
+          177.91
+        ],
+        [
+          486.79,
+          491.54
+        ],
+        [
+          1133.59,
+          1136.89
+        ],
+        [
+          1137.49,
+          1140.49
+        ],
+        [
+          1264.1,
+          1267.38
+        ],
+        [
+          1268.37,
+          1272.07
+        ],
+        [
+          1313.66,
+          1316.16
+        ]
+      ]
+    },
+    "review_source_matches": true,
+    "review_check": {
+      "whole_wrong_count": 10,
+      "whole_wrong_inside_target": 0,
+      "whole_wrong_elsewhere": 3,
+      "whole_wrong_caught_by_outlier_rule": 3,
+      "whole_wrong_unresolved": 4,
+      "whole_wrong_withheld_no_target": 0,
+      "mixed_clips_in_target": 1,
+      "mixed_clips_unresolved": 0,
+      "mixed_clips_withheld_no_target": 0,
+      "mixed_clips_total": 1,
+      "verdict": "incomplete_review_coverage",
+      "notes": "按人工试听片段计数，不按轮次计数。mixed 只检查已标注的负例区间；覆盖不足单列 unresolved。簇内保留不等于最终导出，零目标不算成功。此结果不测召回，也不是未见集泛化证据。"
+    },
+    "accepted_spans": [
+      [
+        158.8,
+        164.8
+      ],
+      [
+        174.5,
+        177.91
+      ],
+      [
+        175.6,
+        177.91
+      ],
+      [
+        486.79,
+        491.54
+      ],
+      [
+        1133.59,
+        1136.89
+      ],
+      [
+        1137.49,
+        1140.49
+      ],
+      [
+        1264.1,
+        1265.4
+      ],
+      [
+        1264.1,
+        1267.38
+      ],
+      [
+        1265.9,
+        1267.38
+      ],
+      [
+        1268.37,
+        1272.07
+      ],
+      [
+        1268.37,
+        1272.07
+      ],
+      [
+        1313.66,
+        1316.16
+      ],
+      [
+        1313.66,
+        1316.16
+      ]
+    ]
+  }
+]

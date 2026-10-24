@@ -50,11 +50,14 @@ def verify_exports(manifest_path: Path, stem: Path) -> dict:
             if abs(len(actual) - len(expected)) > 1:
                 errors.append("sample_count")
             count = min(len(actual), len(expected))
-            left = np.asarray(actual[:count], dtype=np.float64)
-            right = np.asarray(expected[:count], dtype=np.float64)
+            # 导出统一带 15ms 半余弦淡入淡出；比对核心区段，跳过边缘。
+            fade = int(round(0.015 * 16000))
+            core_end = max(fade + 1, count - fade)
+            left = np.asarray(actual[fade:core_end], dtype=np.float64)
+            right = np.asarray(expected[fade:core_end], dtype=np.float64)
             correlation = None
             max_residual = None
-            if count and np.isfinite(left).all() and np.isfinite(right).all():
+            if left.size and np.isfinite(left).all() and np.isfinite(right).all():
                 left -= left.mean()
                 right -= right.mean()
                 denominator = np.linalg.norm(left) * np.linalg.norm(right)

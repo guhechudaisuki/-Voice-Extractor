@@ -17,8 +17,10 @@ output/app.log
 # Runtime, model weights and caches (never commit these)
 models/
 model/
+/cache/
 work/
 output/
+annotations/
 training/data/
 training/cache/
 training/checkpoints/
@@ -74,3 +76,7 @@ Thumbs.db
 提取_错误段排除后_1236632/
 提取_错误段排除后_v2_00/
 提取_重训第一版试听_20260928_2ed2ea/
+
+# Local agent/tool state
+.serena/
+voice_extractor_settings.json

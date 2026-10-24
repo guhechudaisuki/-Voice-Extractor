@@ -1,0 +1,81 @@
+{
+  "scope": "engineering_checks_only_not_acoustic_accuracy",
+  "verified_at_utc": "2026-09-29T21:31:51.358867+00:00",
+  "unittest": {
+    "passed": true,
+    "tests": 396,
+    "seconds": 13.776,
+    "log": "X:\\AboutAI\\voice\\voice apart\\提取\\work\\cluster_p0p2_logs\\34_final_unittest.log"
+  },
+  "browser_smoke": {
+    "passed": true,
+    "checks": [
+      "summary",
+      "filter",
+      "override_on_disk",
+      "audio_playback",
+      "next_clip_within_filter",
+      "removed_clip_playback",
+      "legacy_degradation"
+    ],
+    "page_errors": [],
+    "verified_at_utc": "2026-09-29T20:14:27.468323+00:00"
+  },
+  "python_compilation": {
+    "passed": true,
+    "files": 56,
+    "evidence": "work/cluster_p0p2_logs/34_python_compilation.json"
+  },
+  "node_syntax": {
+    "passed": true,
+    "files": [
+      "launcher/webui_static/js/studio.js",
+      "evaluation/cluster_ui_smoke.cjs"
+    ]
+  },
+  "git_diff_check_passed": true,
+  "real_batch_removed_audio": {
+    "batch": "20260930_020902_batch_d20b0a",
+    "playable_removed_clips": 44,
+    "manifest_modified": false
+  },
+  "files_sha256": {
+    "extractor\\pipeline.py": "874510ff62d0bfbbe63b439d8555ad76070d2d03033f0e2323cdccd9c4672130",
+    "extractor\\nextgen\\cluster_gate.py": "7b9aef6889645785c6ddab0d6edfcf36df0c1bcab365536713d1b7adffc0fd92",
+    "extractor\\nextgen\\cluster_reporting.py": "df837a6aee5a54f93b2a3e85f94ef86c2bdda33370fa0ce2e92fc2e6201a72f3",
+    "extractor\\nextgen\\cluster_runtime.py": "90de3b58db906848077539bbcb1b008c84c3f961e0eebef223deaa724e45a58f",
+    "extractor\\nextgen\\identity_cluster.py": "7daf0a857ca43b4233276a922728420f4d47e699c771ae66a7d90aa468ed6e90",
+    "extractor\\nextgen\\embedding_cache.py": "eed55daa980eca447a8f9cd5727a015270b08da0729ca9b87c1a051a75589096",
+    "extractor\\nextgen\\bootstrap_bank.py": "b07f35f3418a07b45ca41fe64a756dc8a87b4e1f75f57e7301ec8f9cc30e900b",
+    "launcher\\webui_server.py": "e63d6bff0e304d9ae9368ea712c2eb91813d0027ca9816a5fee32121051dea70",
+    "launcher\\webui_static\\js\\studio.js": "cd20c88422ac7a8fa809771c951592ba1e017c4b9b1e336585d09ba5c2d979cd",
+    "evaluation\\cluster_acceptance_report.py": "7d0bced78c02607af4af2d83c9df96867bf850b69ecd9cd2ba3dd3dea3f856c0",
+    "evaluation\\verify_cluster_plan.py": "594e41133fae475b28b735460be4760ed168ca32c485d1bb4710c17aa0520ddd",
+    "run_cluster_p0p2.ps1": "0051107139f2ab8f3f8f8c40dd3a72bfa0ac25f46ab085dc643724c3325c4318",
+    "evaluation/cluster_environment.py": "f526297251fce220b77259e880e13fae5640fbab4e24448c2aedc46bc8d76c6a",
+    "evaluation/export_episode_embeddings.py": "f08fbbf82018e7b0858c85c688720784c488cd34803941b77791c9d78a8a02ea",
+    "evaluation/cluster_report.py": "457ac44e554997a0d29368a84e5f285d94a4a683529bdc44193c44f07b3b015e"
+  },
+  "limitations": [
+    "P4/P6 results are separate reports.",
+    "Browser playback does not label identity, singing, or overlap."
+  ],
+  "local_review": {
+    "scope": "acceptance_report_listening_queue_and_cluster_review_UI",
+    "critical_or_required_findings": [],
+    "notes": [
+      "Source identity and non-cluster options are checked before P4 count comparison.",
+      "Human review fields remain null and existing listening queues are preserved.",
+      "Outlier playback resolves within the batch and verifies interval sidecars.",
+      "The paired validation driver resumes finished episodes and completed verification steps.",
+      "Offline feature extraction is pinned to the pipeline FunASR CPU thread setting; real cached/uncached embeddings and decisions match."
+    ]
+  },
+  "cache_parity": {
+    "passed": true,
+    "turn_count": 254,
+    "maximum_embedding_absolute_error": 0.0,
+    "membership_and_accepted_intervals_identical": true,
+    "scope": "real_audio_cluster_decisions_before_STT"
+  }
+}

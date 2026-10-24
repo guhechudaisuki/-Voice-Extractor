@@ -137,7 +137,14 @@ class SubtitleTimingTests(unittest.TestCase):
         waveform = torch.full((8 * 16000,), .1)
         waveform[round(3.5 * 16000):round(3.65 * 16000)] = 0
         guide = guide_for(SubtitleCue(1, 1, 3.7, "first"))
-        self.assertEqual(split_at_subtitle_pauses(pipeline, guide, [TimeSpan(1, 7)], waveform, Mock()), [TimeSpan(1, 7)])
+        # 零静音谷底切分（铁律 A）：字幕 Cue 边界附近的真实声学停顿
+        # （此处 0.15s < 静音下限 0.3s）也是有效切点——切在能量谷而非
+        # 硬性静音下限；平坦连续语音（无谷证据）仍不切。
+        refined = split_at_subtitle_pauses(pipeline, guide, [TimeSpan(1, 7)], waveform, Mock())
+        self.assertEqual(len(refined), 2)
+        self.assertGreaterEqual(refined[0].end, 3.50)
+        self.assertLessEqual(refined[0].end, 3.66)
+        self.assertEqual((refined[0].start, refined[1].end), (1, 7))
 
     def test_translation_is_provenance_only(self):
         guide = guide_for(SubtitleCue(1, 1, 4, "中文字幕"))

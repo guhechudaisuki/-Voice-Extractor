@@ -232,6 +232,12 @@ def write_clip(
             if gain_db > 0.0:
                 finite = finite * (10.0 ** (gain_db / 20.0))
             clip = np.clip(finite, -1.0, 1.0)
+    # 15ms 半余弦淡入淡出：消除裁切边界的截断爆音（De-click）。
+    fade = max(1, int(round(0.015 * sr)))
+    if clip.shape[0] > 2 * fade:
+        ramp = 0.5 - 0.5 * np.cos(np.linspace(0.0, np.pi, fade, dtype=np.float32))
+        clip[:fade] *= ramp[:, None]
+        clip[-fade:] *= ramp[::-1][:, None]
     destination.parent.mkdir(parents=True, exist_ok=True)
     sf.write(str(destination), clip, sr, subtype="PCM_16")
     return destination

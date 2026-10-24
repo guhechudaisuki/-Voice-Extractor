@@ -1,0 +1,61 @@
+{
+  "passed": true,
+  "checks": [
+    "waits_for_window",
+    "disables_both_buttons",
+    "failure_keeps_page_and_allows_retry",
+    "real_native_handoff"
+  ],
+  "ready": {
+    "status": "ok",
+    "message": "桌面窗口已显示，WebUI 正在退出",
+    "pid": 21432,
+    "visible": true,
+    "mode": "tkinter"
+  },
+  "page_errors": [],
+  "native_windows": [
+    {
+      "handle": 69908,
+      "title": "Voice Extractor",
+      "rect": [
+        332,
+        110,
+        1588,
+        969
+      ]
+    }
+  ],
+  "native_responds_to_wm_null": true,
+  "verified_at_utc": "2026-09-30T02:18:21.773743+00:00",
+  "root_cause": "Repeated ttk selection_set requeued TreeviewSelect, starving Tk window painting and timers.",
+  "unittest": {
+    "passed": true,
+    "count": 434,
+    "seconds": 16.033,
+    "log": "work/cluster_p0p2_logs/47_desktop_handoff_unittest.log"
+  },
+  "syntax_checks": {
+    "python_files": 7,
+    "node_scripts": [
+      "launcher/webui_static/js/studio.js",
+      "evaluation/desktop_switch_ui_smoke.cjs"
+    ]
+  },
+  "desktop_left_open": true,
+  "foreground_requested": true,
+  "stopped_invisible_idle_processes": [
+    12640,
+    28008,
+    17932
+  ],
+  "files_sha256": {
+    "launcher/desktop_review_tab.py": "6c4ca6a40cb5dea1986c9ca6cc2e971749679b5769aee521e28c22faddac0e2a",
+    "launcher/desktop_handoff.py": "7c14b2ba0ac355f4b61c257d0ecafcfcb37a4248397c586ff795926c8dc52dbe",
+    "launcher/voice_extractor_desktop.py": "60067f7f4bd944b045f07e55e128957b05502fd5b9616c4d3b18f97016b48d0f",
+    "launcher/webui_server.py": "db0477d337b948f4dcebbb66d2c291e85866aae893798966d1dc66a983a1683e",
+    "tests/test_desktop_selection.py": "14af0f88414ea12fe19fea531bdc4bafd327ba5b78e4ceec538f73e7b9d532ce",
+    "tests/test_desktop_handoff.py": "531527470fc40a6ff6bf436365c03752258dec0478ba640c57eb6133d67a2a80",
+    "evaluation/desktop_visibility_probe.py": "8d91b4b9f819075e217632f6552ef888efac9a66e64d62192ed9307a81d34952"
+  }
+}

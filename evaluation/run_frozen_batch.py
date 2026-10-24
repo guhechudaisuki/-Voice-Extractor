@@ -38,6 +38,8 @@ def main() -> int:
     parser.add_argument("--request", required=True, type=Path)
     parser.add_argument("--target", required=True, type=Path)
     parser.add_argument("--subtitle", type=Path)
+    parser.add_argument("--cluster-mode", choices=("off", "audit", "enforce"))
+    parser.add_argument("--no-cluster-cache", action="store_true")
     parser.add_argument(
         "--experimental-adjacent-domain-rescue", action="store_true",
         help="Research-only local identity join; never changes desktop defaults",
@@ -70,6 +72,10 @@ def main() -> int:
     if missing:
         parser.error("Missing input files: " + ", ".join(missing))
     effective_options = dict(request["options"])
+    if args.cluster_mode:
+        effective_options["cluster_identity_mode"] = args.cluster_mode
+    if args.no_cluster_cache:
+        effective_options["cluster_embedding_cache"] = False
     target_sha256 = sha256(target)
     if args.exclude_spans:
         marked = json.loads(args.exclude_spans.read_text(encoding="utf-8"))
@@ -86,7 +92,7 @@ def main() -> int:
         effective_options["experimental_final_island_consensus"] = True
     options = PipelineOptions(**effective_options)
     code_hashes = {str(path.relative_to(ROOT)): sha256(path)
-                   for path in sorted((ROOT / "extractor").glob("*.py"))}
+                   for path in sorted((ROOT / "extractor").rglob("*.py"))}
     commit = subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True,
     ).strip()

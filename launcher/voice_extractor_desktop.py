@@ -1,5 +1,17 @@
 from __future__ import annotations
 
+import os
+import sys
+from pathlib import Path
+
+_LAUNCHER_DIR = str(Path(__file__).resolve().parent)
+if _LAUNCHER_DIR not in sys.path:
+    sys.path.insert(0, _LAUNCHER_DIR)
+
+_ROOT_DIR = str(Path(__file__).resolve().parent.parent)
+if _ROOT_DIR not in sys.path:
+    sys.path.insert(0, _ROOT_DIR)
+
 import json
 import os
 import queue
@@ -44,7 +56,7 @@ MEDIA_TYPES = (
 class VoiceExtractorDesktop:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("Voice Extractor")
+        self.root.title("Voice Extractor Desktop")
         self.root.geometry("1240x820")
         self.root.minsize(1040, 700)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -55,6 +67,7 @@ class VoiceExtractorDesktop:
         self.boot_running = False
         self.scan_running = False
         self.running_job = False
+        self.closing = False
         self.last_result: dict[str, object] = {}
         self.last_scan_result: dict[str, object] = {}
         self.job_log_path: Path | None = None
@@ -86,6 +99,7 @@ class VoiceExtractorDesktop:
         self.singing_var = tk.BooleanVar(value=True)
         self.all_sentences_var = tk.BooleanVar(value=False)
         self.video_segments_var = tk.BooleanVar(value=False)
+        self.cluster_bootstrap_var = tk.BooleanVar(value=False)
         self.subtitle_status_var = tk.StringVar(value="字幕：未绑定（可选）")
 
         self._configure_style()
@@ -107,12 +121,29 @@ class VoiceExtractorDesktop:
             style.theme_use("clam")
         except tk.TclError:
             pass
-        bg = "#f5f7fb"
-        card = "#ffffff"
-        accent = "#5b5bd6"
-        text = "#202331"
-        muted = "#666b7a"
+        bg = "#101724"
+        card = "#192338"
+        accent = "#587bdb"
+        text = "#edf3ff"
+        muted = "#a5b5cf"
         self.root.configure(bg=bg)
+        self.root.option_add('*Listbox.background', card)
+        self.root.option_add('*Listbox.foreground', text)
+        self.root.option_add('*Listbox.selectBackground', '#355794')
+        self.root.option_add('*Listbox.selectForeground', text)
+        style.configure('.', background=bg, foreground=text, fieldbackground=card,
+                        font=('Microsoft YaHei UI', 9), bordercolor='#30415e')
+        style.configure('TLabel', background=bg, foreground=text)
+        style.configure('TLabelframe', background=card)
+        style.configure('TLabelframe.Label', background=card, foreground=muted)
+        style.configure('TNotebook', background=bg, tabmargins=(0, 6, 0, 0))
+        style.configure('TNotebook.Tab', padding=(22, 10), background=card, foreground=muted)
+        style.map('TNotebook.Tab', background=[('selected', '#294570')], foreground=[('selected', text)])
+        for control in ('TEntry', 'TCombobox', 'TSpinbox'):
+            style.configure(control, fieldbackground=card, foreground=text, padding=5)
+            style.map(control, fieldbackground=[('readonly', card)], foreground=[('readonly', text)])
+        style.configure('Treeview', background=card, fieldbackground=card, foreground=text)
+        style.map('Treeview', background=[('selected', '#355794')], foreground=[('selected', text)])
         style.configure("TFrame", background=bg)
         style.configure("Card.TFrame", background=card)
         style.configure(
@@ -149,9 +180,10 @@ class VoiceExtractorDesktop:
         )
         style.map(
             "Accent.TButton",
-            background=[("active", "#4747c2"), ("disabled", "#aaaad4")],
+            background=[("active", "#6b8ceb"), ("disabled", "#364360")],
         )
         style.configure("TButton", font=("Microsoft YaHei UI", 9), padding=(10, 6))
+        style.map('TButton', background=[('active', '#304568')], foreground=[('disabled', '#73809a')])
         style.configure("TCheckbutton", background=card, font=("Microsoft YaHei UI", 9))
         style.configure("Treeview", font=("Microsoft YaHei UI", 9), rowheight=28)
         style.configure(
@@ -270,7 +302,7 @@ class VoiceExtractorDesktop:
         ttk.Button(
             button_row,
             text="停止安装",
-            command=self.root.destroy,
+            command=self._on_close,
         ).pack(side="left", padx=(0, 8))
         self.install_button = ttk.Button(
             button_row,
@@ -300,10 +332,16 @@ class VoiceExtractorDesktop:
             side="right"
         )
 
-        body = ttk.Panedwindow(self.main_page, orient="horizontal")
+        self.main_notebook = ttk.Notebook(self.main_page)
+        self.main_notebook.pack(fill="both", expand=True)
+
+        extract_tab = ttk.Frame(self.main_notebook, padding=6)
+        self.main_notebook.add(extract_tab, text=" ⚡ 音色提取工作台 ")
+
+        body = ttk.Panedwindow(extract_tab, orient="horizontal")
         body.pack(fill="both", expand=True)
         controls_panel = ttk.Frame(body, style="Card.TFrame")
-        controls_canvas = tk.Canvas(controls_panel, highlightthickness=0, background="#ffffff")
+        controls_canvas = tk.Canvas(controls_panel, highlightthickness=0, background="#192338")
         controls_scroll = ttk.Scrollbar(controls_panel, orient="vertical", command=controls_canvas.yview)
         controls_canvas.configure(yscrollcommand=controls_scroll.set)
         controls_scroll.pack(side="right", fill="y")
@@ -332,6 +370,16 @@ class VoiceExtractorDesktop:
 
         self._build_input_controls(controls)
         self._build_results_panel(results)
+
+        from desktop_review_tab import DesktopReviewTab
+        from desktop_settings_tab import DesktopSettingsTab
+        from launcher.desktop_training_tab import DesktopTrainingTab
+        output_base = Path(__file__).resolve().parent.parent / "output"
+        self.review_tab = DesktopReviewTab(self.main_notebook, self.root, output_base)
+        self.training_tab = DesktopTrainingTab(self.main_notebook, self.root,
+            python_provider=lambda: self.context.python if self.context else sys.executable,
+            environment_provider=lambda: self.context.backend_environment() if self.context else {})
+        self.settings_tab = DesktopSettingsTab(self.main_notebook, self.root, close_callback=self._on_close)
 
     def _list_card(
         self,
@@ -436,6 +484,9 @@ class VoiceExtractorDesktop:
             options, text="过滤有人唱歌", variable=self.singing_var
         ).grid(row=0, column=2, columnspan=2, sticky="w")
         ttk.Label(options, text="声纹阈值").grid(row=1, column=0, sticky="w", pady=(8, 2))
+        ttk.Checkbutton(options, text="自动扩充参考并应用（单文件可用，耗时增加）",
+                        variable=self.cluster_bootstrap_var).grid(
+                            row=5, column=0, columnspan=4, sticky="w", pady=(8, 0))
         ttk.Spinbox(
             options,
             from_=0.50,
@@ -862,7 +913,7 @@ class VoiceExtractorDesktop:
         ttk.Button(
             buttons,
             text="停止安装",
-            command=self.root.destroy,
+            command=self._on_close,
         ).pack(side="right")
         dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
         dialog.update_idletasks()
@@ -1068,6 +1119,8 @@ class VoiceExtractorDesktop:
                 "use_singing_detector": bool(self.singing_var.get()),
                 "export_all_sentences": bool(self.all_sentences_var.get()),
                 "export_video_clips": bool(self.video_segments_var.get()),
+                "cluster_bootstrap": bool(self.cluster_bootstrap_var.get()),
+                "cluster_identity_mode": "enforce" if self.cluster_bootstrap_var.get() else "audit",
             },
         }
 
@@ -1395,11 +1448,24 @@ class VoiceExtractorDesktop:
                     self._append_job_log(str(payload))
                 elif event_type == "job_exit":
                     self._finish_job(int(payload))
+                elif event_type == 'close_complete':
+                    self.root.destroy()
+                    return
+                elif event_type == 'close_error':
+                    self.closing = False
+                    self.training_tab.busy = False
+                    messagebox.showerror('清理失败', str(payload) + '\n请重试关闭。', parent=self.root)
         except queue.Empty:
             pass
         self.root.after(100, self._poll_events)
 
     def _on_close(self) -> None:
+        if self.closing:
+            return
+        if self.review_tab.export_busy or self.training_tab.busy:
+            self.main_status_var.set('正在完成导出或清理操作，完成后自动关闭…')
+            self.root.after(500, self._on_close)
+            return
         if self.running_job:
             if not messagebox.askyesno("退出", "任务仍在运行，确定停止任务并退出吗？"):
                 return
@@ -1414,12 +1480,23 @@ class VoiceExtractorDesktop:
                     )
                 except OSError:
                     process.terminate()
-        self.root.destroy()
+        self.closing = True
+        self.training_tab.busy = True
+        self.main_status_var.set('正在清理训练临时文件…')
+        def close():
+            try:
+                self.training_tab.session.close()
+                self.events.put(('close_complete', None))
+            except Exception as exc:
+                self.events.put(('close_error', str(exc)))
+        threading.Thread(target=close, daemon=True).start()
 
 
 def main() -> int:
     root = tk.Tk()
     VoiceExtractorDesktop(root)
+    from desktop_handoff import announce_ready
+    root.after(100, lambda: announce_ready(root))
     root.mainloop()
     return 0
 

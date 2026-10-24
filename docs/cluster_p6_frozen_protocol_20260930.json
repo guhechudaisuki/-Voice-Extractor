@@ -1,0 +1,165 @@
+{
+  "schema_version": 1,
+  "episodes": [
+    6,
+    9,
+    12
+  ],
+  "p4_passed": false,
+  "p4_report_sha256": "4ba61a6250be5af5b95217f61fdcd10d784943f9e085a38aab235ddbcea483f1",
+  "purpose": "complete_fixed_version_machine_evaluation_without_tuning",
+  "overall_acceptance": "blocked_by_p4",
+  "human_listening": "not_done",
+  "bootstrap_enabled": false,
+  "code_sha256": {
+    "extractor\\__init__.py": "26a81a486a07554dc015c63976f00ac06e56283d9f3ea7d8e3c2751d70b962f3",
+    "extractor\\anime_identity.py": "702261e7d45525d6dd3c7c96da8af51827d81c282f349ebb3c3f601baf44a610",
+    "extractor\\audio.py": "916ebec4a5a6553f43e088d169ae4355c3094f19c8faf837995f812209520523",
+    "extractor\\boundary_proposals.py": "8ac741fd9b541147a9c00aeb4956442d83d93cdf1c4646b2cf99779cc711020c",
+    "extractor\\candidate_lattice.py": "b1396a5df3bc8ccaf717d70c24cf768a62363ee960959778a4bcac3916c5790a",
+    "extractor\\candidate_selection.py": "e484106c48d85cf7d68006a384e793b035742a31b4c3dc0b6d33fcc3d0ac1310",
+    "extractor\\config.py": "4173d3740e58de742895253e8da9ef55e5c2f6587e3008f3c77bf370f3133c1a",
+    "extractor\\content_dedup.py": "35eaceb647baf88fd4c6e3ee93cae39be32cf6c56545b9d74615668a43199c70",
+    "extractor\\filters.py": "69f85ada40666689e6d02116c5e26d44b1de0535782f9593fdc4f04d26fe0df5",
+    "extractor\\local_identity_classifier.py": "17dcf382bad344920175c200eb592cb5666b5a6dbe16ee60b7a5eb1712051a31",
+    "extractor\\nextgen\\__init__.py": "09cabb9ecdcece3b0d4d15ced77d5aaf265b60f5def2ed2a95b8628a5babe6e5",
+    "extractor\\nextgen\\acoustic_gaps.py": "732f77dbb621a1439f1fc43712cd2381ace2c30b563c53bcc81b039b17fffa22",
+    "extractor\\nextgen\\anime_embedding.py": "ce6ced3a64e524d694ce34ebb16168e52c45a8184ba2b25d9fb0489b9c0fc97d",
+    "extractor\\nextgen\\artifacts.py": "b21e1ffe346d5c91d82e3fbe036643b77074fa29e7ad5a4a6096699d18360e1c",
+    "extractor\\nextgen\\bootstrap_bank.py": "b07f35f3418a07b45ca41fe64a756dc8a87b4e1f75f57e7301ec8f9cc30e900b",
+    "extractor\\nextgen\\boundary_decoder.py": "298e7752766cfcca36748a1e4b1d130c8215491e68f3ff907aed26640eecb308",
+    "extractor\\nextgen\\cluster_gate.py": "7b9aef6889645785c6ddab0d6edfcf36df0c1bcab365536713d1b7adffc0fd92",
+    "extractor\\nextgen\\cluster_reporting.py": "df837a6aee5a54f93b2a3e85f94ef86c2bdda33370fa0ce2e92fc2e6201a72f3",
+    "extractor\\nextgen\\cluster_runtime.py": "90de3b58db906848077539bbcb1b008c84c3f961e0eebef223deaa724e45a58f",
+    "extractor\\nextgen\\decision_policy.py": "75d7329b72175ec49b2e6691610edc09f10aab994ac1c108e0c3333abda856d4",
+    "extractor\\nextgen\\domain_identity.py": "c8ec1f74b370d5047e1310a3ec3d86c9d120201a9c2231c9df98694b7b3b3cf7",
+    "extractor\\nextgen\\embedding_cache.py": "eed55daa980eca447a8f9cd5727a015270b08da0729ca9b87c1a051a75589096",
+    "extractor\\nextgen\\engine.py": "ab5e00aeaa912a8fd9d0e598ee64c7093539afa06a10c2718d5b6adf01c9948c",
+    "extractor\\nextgen\\features.py": "1ecae7ac867f7059908cbfe9b31caa94abb8864a99d7662df7eb0f4166327722",
+    "extractor\\nextgen\\finalization.py": "5b1f18d2611f21fb107d0f4181d1cf802d10d3756ed08acc75c4cf4b7a29f8dd",
+    "extractor\\nextgen\\identity_cluster.py": "7daf0a857ca43b4233276a922728420f4d47e699c771ae66a7d90aa468ed6e90",
+    "extractor\\nextgen\\identity_model.py": "ea12f780aaa19f919fee02b7a334906a12ad36b712eefaf36f9b6459087a6363",
+    "extractor\\nextgen\\inference.py": "1306ccd41c1755e357228993c2912b623b893b5c32c61bd2d03bac0a80e1c909",
+    "extractor\\nextgen\\internal_pauses.py": "ca2b101e0202d42cf5239780109859c0020c715dd367e62b559935217e651a68",
+    "extractor\\nextgen\\ledger.py": "bab0d8ad276ea1ea42e59694f278dbba5bbdb2abaa6e70cd06de6d693ed77f45",
+    "extractor\\nextgen\\prepare_media.py": "5c6657e90074f405bf6a6b1947b9783c49cd2bcaf46a9b0068fcec1cb9156b54",
+    "extractor\\nextgen\\prepared_audio.py": "bf06c4da35ff4e95e03fc9857ed9d5d6beea2f1689c177bfdb12854388f51079",
+    "extractor\\nextgen\\purity_consensus.py": "a6300ad170dae15779575214b9112c9271ec255a0a08215281d84fe3d1928844",
+    "extractor\\nextgen\\reference_bank.py": "e6e3489b4d1c2a0c7e4c735c1afdb38df4c46ae636f84443545f84b5a15caabb",
+    "extractor\\nextgen\\reference_preparation.py": "768563712e0699e4db092abc0a0b5e4d9eca0f691f37db5bfa9d4ae1da3efeaf",
+    "extractor\\nextgen\\runtime.py": "875f06ea169c32b6f0ba647f27e15ae518201d34be4b7f9690847da525101047",
+    "extractor\\nextgen\\scene_adapter.py": "5d1c2013e2040ba33152b78a0af70f2baae7d9999f204c6daa46dcaade17b449",
+    "extractor\\nextgen\\timeline.py": "b670c632d93095e58905c3b951ebd4f18ce66acce1dc52724a87c071a32c4a44",
+    "extractor\\pipeline.py": "874510ff62d0bfbbe63b439d8555ad76070d2d03033f0e2323cdccd9c4672130",
+    "extractor\\speaker.py": "531b24eeef3a851ab3ba184d075390459dafbbc04199cd626081c9c4da5ae017",
+    "extractor\\subtitle_assistance.py": "f64c4bc76d9cb53076f7396ffbcd2288a4b408cb09dc496c9a4ad7f4f223ffe8",
+    "extractor\\subtitles.py": "f3d7aaca4999c27d043259d7906a687bc94e323af985cedbb9f2b08527798ff5",
+    "extractor\\transcription.py": "f359863566b48d187412154dbda6690fdc25354900a5f4db74bc431ad347df52",
+    "extractor\\types.py": "9be2843a5e1b8006b21ec58f9c3feecbb7637352d1ffa81e55f03f1dbc6f1815"
+  },
+  "options": {
+    "cluster_identity_mode": "enforce",
+    "cluster_target_margin": 0.06,
+    "cluster_keep_narration": true,
+    "cluster_embedding_cache": true,
+    "cluster_require_dominant": false,
+    "speaker_threshold": 0.68,
+    "silence_min_seconds": 0.2,
+    "silence_split_seconds": 0.85,
+    "silence_max_seconds": 0.85,
+    "overlap_threshold": 0.35,
+    "singing_threshold": 0.22,
+    "min_sentence_seconds": 0.55,
+    "min_output_seconds": 1.2,
+    "max_sentence_seconds": 45.0,
+    "pad_seconds": 0.1,
+    "keep_rejected": false,
+    "use_singing_detector": true,
+    "use_overlap_detector": true,
+    "use_raw_speaker_rescue": true,
+    "export_all_sentences": false,
+    "export_video_clips": false,
+    "cleanup_work": false,
+    "experimental_internal_reassembly": false,
+    "experimental_adjacent_domain_rescue": false,
+    "experimental_final_island_consensus": true,
+    "user_excluded_spans": []
+  },
+  "model_and_reference_inputs": [
+    {
+      "path": "X:\\AboutAI\\voice\\voice apart\\提取\\model\\speaker\\eres2net\\pretrained_eres2netv2w24s4ep4.ckpt",
+      "sha256": "4f5a0bf73c61eb41b174e1bb54e7ee3c83233892be8e0af1f187024e8e581a35"
+    },
+    {
+      "path": "X:\\AboutAI\\voice\\voice apart\\提取\\model\\speaker\\campplus_voxceleb\\campplus_voxceleb.bin",
+      "sha256": "5b1a88b6f8d85826fabef804779c3372b42f3af21457fa48bd5c097c0686b2de"
+    },
+    {
+      "path": "X:\\AboutAI\\voice\\voice apart\\提取\\京吹原片音频\\kumiko\\0002_確かに言わなくてもいい一言だったのかもしれないけどあの時本気で全国に行けるって思ってた子は少なかったと思うんだよね.wav",
+      "sha256": "59861dd63417cf1de0d043adab0ec78cee98630efa78a54080645a4cf6e80cbe"
+    },
+    {
+      "path": "X:\\AboutAI\\voice\\voice apart\\提取\\京吹原片音频\\kumiko\\0006_私はその言葉が何を意味しているのか葵ちゃんがその時どんな思いでいたのか.wav",
+      "sha256": "edd006f9c5d701871a84a11a4a85f7e94dccb72eb043ae25a6c6c37018d51d7c"
+    },
+    {
+      "path": "X:\\AboutAI\\voice\\voice apart\\提取\\京吹原片音频\\kumiko\\0007_ダメだここにいると強引に巻き込まれる.wav",
+      "sha256": "a5d53acbee2822378ab952d65d6d96254f6d7dc29fb99cd7bce859824de778e7"
+    },
+    {
+      "path": "X:\\AboutAI\\voice\\voice apart\\提取\\京吹原片音频\\kumiko\\0008_帰宅だったんだね全然知らなかった.wav",
+      "sha256": "af40a329035f04dddf2502cf100988b9e25361266d5c6c58ab4819faadac1fff"
+    },
+    {
+      "path": "X:\\AboutAI\\voice\\voice apart\\提取\\京吹原片音频\\kumiko\\0009_部活前の机の運び出しは1年生の役割なの終わったらまた元に戻る.wav",
+      "sha256": "919b2b7a7c0e4d1f75a66417cfca5676168755880cfa5594f9d49e8edaa254e9"
+    },
+    {
+      "path": "X:\\AboutAI\\voice\\voice apart\\提取\\京吹原片音频\\kumiko\\2年間ずっと思ってきたけど でも、どうしてもそこに届かなかった.mp3",
+      "sha256": "e7e67033837c19914910a1d101c44ab7081fae72073edcc85b1445b07150b416"
+    },
+    {
+      "path": "X:\\AboutAI\\voice\\voice apart\\提取\\京吹原片音频\\其他人物\\傻逼爱举手.wav",
+      "sha256": "8104fbd5936c20464d8a98ca9d44816c94b6ee9d920ffd3c0b163f32fe9df9d1"
+    },
+    {
+      "path": "X:\\AboutAI\\voice\\voice apart\\提取\\京吹原片音频\\其他人物\\傻逼高坂.wav",
+      "sha256": "12b31cd6997f3d1cac2a090cd78a2fa2fc030ac1943c11fa7542c5180445705a"
+    },
+    {
+      "path": "X:\\AboutAI\\voice\\voice apart\\提取\\京吹原片音频\\其他人物\\明日香！.wav",
+      "sha256": "51656dc6ad7b655358869e2ad532e20414a09cb5bb8e2a46e7b8fff6635de9ae"
+    },
+    {
+      "path": "X:\\AboutAI\\voice\\voice apart\\提取\\京吹原片音频\\其他人物\\晴香！.wav",
+      "sha256": "40d5385aa8f4f6a713d5b45870e012f1166dda0d81e7d3b4e58065270cdb1499"
+    },
+    {
+      "path": "X:\\AboutAI\\voice\\voice apart\\提取\\京吹原片音频\\其他人物\\绿.wav",
+      "sha256": "70bb7c4f2f21d8687f05f452ee1ed91a0c40c1b3989d0c1705be9914b406bfb3"
+    }
+  ],
+  "requests": [
+    {
+      "episode": 6,
+      "path": "X:\\AboutAI\\voice\\voice apart\\提取\\work\\cluster_p0p2_logs\\frozen_ep06_held_out_request.json",
+      "sha256": "d500cc612c9e9b6399ec418a1288fce7f07dc04c2b9fe621f78165592a3a36e5",
+      "target_sha256": "6550c8a2584d9cb92a4a97ebcbf3b8db55ae762b41953faf611054850caf9047",
+      "subtitle_sha256": "4d2bb571210a4cdc91d7470bfd46643d38eac690e9de2233e0087aa26eed399b"
+    },
+    {
+      "episode": 9,
+      "path": "X:\\AboutAI\\voice\\voice apart\\提取\\work\\cluster_p0p2_logs\\frozen_ep09_held_out_request.json",
+      "sha256": "fffc1f564dac5f93d3d6ccf9e15365bd9b636c2cd156e11c2fed2d8b8627ea3c",
+      "target_sha256": "0db39e788e4f905f61497fb440acfdd29d9a7f5104e5f1e028113108e45c8d5e",
+      "subtitle_sha256": "da2b31a3f52882c5e200fa37a70bba11b5a7396f5b9e33ec3fd1dc3baea14fe0"
+    },
+    {
+      "episode": 12,
+      "path": "X:\\AboutAI\\voice\\voice apart\\提取\\work\\cluster_p0p2_logs\\frozen_ep12_held_out_request.json",
+      "sha256": "f27e949b53c1e38a594feb282a479be89c1afe9d639ea41314e69e7c22d70229",
+      "target_sha256": "d9824b17d13f16f9afb99efc65efbd19b922407491bc6201ff10145046593704",
+      "subtitle_sha256": "c9f35b6dd54d06e7c83a08296c8a54820761f9ba7b767a0a4e8172ab9e349775"
+    }
+  ]
+}

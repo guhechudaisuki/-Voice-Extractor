@@ -1,0 +1,52 @@
+{
+  "verified_at": "2026-10-24",
+  "scope": "plan_completion_stage4_subtitle_stt_wespeaker_raw_aam",
+  "replay": {
+    "channels": "ERes2Net + CAM++ + WavLM + WeSpeaker + Raw crosscheck",
+    "interception_rate": 0.9756,
+    "leaked": 1,
+    "known_wrong": 41,
+    "average_recall_factor": 2.857,
+    "episode_tier_a": {
+      "001": 22,
+      "002": 28,
+      "003": 18,
+      "004": 25,
+      "005": 19,
+      "006": 33
+    },
+    "wespeaker_demoted": {
+      "001": 1,
+      "002": 0,
+      "003": 2,
+      "004": 3,
+      "005": 2,
+      "006": 1
+    },
+    "raw_rescued": {
+      "001": 0,
+      "002": 0,
+      "003": 0,
+      "004": 0,
+      "005": 1,
+      "006": 1
+    },
+    "gates": {
+      "precision": true,
+      "recall": true,
+      "coverage": true
+    }
+  },
+  "subtitle_offline_validation": {
+    "test_ass": "energy_valley vs documented clean boundaries within 0.1s (12/12 sampled)",
+    "overlap_zone": "[774.92,778.72] detected = Ep1 #18 contamination region"
+  },
+  "unittest": {
+    "count": 518,
+    "new": "tests/test_plan_completion.py (12)"
+  },
+  "smokes": {
+    "training_workflow (AAM real training)": "passed",
+    "desktop_subtitle_smoke": "passed"
+  }
+}

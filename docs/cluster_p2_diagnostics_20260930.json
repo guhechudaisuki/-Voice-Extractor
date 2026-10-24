@@ -1,0 +1,812 @@
+{
+  "scope": "P2 development diagnostics only, fixed thresholds, no pipeline changes",
+  "current_input_checks": {
+    "turn_count": 254,
+    "usable_count": 254,
+    "primary_shape": [
+      254,
+      192
+    ],
+    "secondary_shape": [
+      254,
+      512
+    ],
+    "finite_vectors": true,
+    "primary_max_norm_error": 1.1920928955078125e-07,
+    "secondary_max_norm_error": 1.1920928955078125e-07,
+    "indexes_contiguous": true,
+    "current_source_matches_review_sha256": true,
+    "current_audit_spans_match_cache": true,
+    "current_primary_model_matches_cache_digest": true,
+    "current_secondary_model_matches_cache_digest": true,
+    "current_exclusion_ids_match_cache": false,
+    "same_exclusion_role_partition_matches_cache": true,
+    "cached_to_current_role_ids": {
+      "1": [
+        4
+      ],
+      "2": [
+        1
+      ],
+      "3": [
+        2
+      ],
+      "4": [
+        0
+      ]
+    },
+    "current_exclusion_score_max_difference": 7.132942936305398e-08
+  },
+  "exclusion_strong_turn_count": 103,
+  "exclusion_strong_counts_by_cached_role_id": {
+    "1": 3,
+    "2": 27,
+    "3": 6,
+    "4": 67
+  },
+  "cannot_link_pair_count": 2580,
+  "variants": [
+    {
+      "name": "current_rules",
+      "cluster_count": 29,
+      "clustered_turn_count": 169,
+      "reason": "dominance_conflict",
+      "accepted_turn_count": 0,
+      "target_cluster_id": null,
+      "largest_cluster": {
+        "id": 21,
+        "members": 37,
+        "speech_seconds": 99.4929
+      },
+      "highest_target_score_cluster": {
+        "id": 19,
+        "score": 0.843964
+      },
+      "review_check": {
+        "whole_wrong_count": 10,
+        "whole_wrong_inside_target": 0,
+        "whole_wrong_elsewhere": 0,
+        "whole_wrong_caught_by_outlier_rule": 0,
+        "whole_wrong_unresolved": 0,
+        "whole_wrong_withheld_no_target": 10,
+        "mixed_clips_in_target": 0,
+        "mixed_clips_unresolved": 0,
+        "mixed_clips_withheld_no_target": 1,
+        "mixed_clips_total": 1,
+        "verdict": "no_target_cluster",
+        "notes": "按人工试听片段计数，不按轮次计数。mixed 只检查已标注的负例区间；覆盖不足单列 unresolved。簇内保留不等于最终导出，零目标不算成功。此结果不测召回，也不是未见集泛化证据。",
+        "details": {
+          "entire_other": [
+            {
+              "ordinal": 3,
+              "span": [
+                209.75,
+                211.59
+              ],
+              "kind": "entire_other",
+              "evaluated_span": [
+                209.75,
+                211.59
+              ],
+              "coverage_ratio": 1.0,
+              "status": "withheld_no_target",
+              "in_target_cluster": false,
+              "turns": [
+                {
+                  "index": 27,
+                  "span": [
+                    209.75,
+                    211.59
+                  ],
+                  "overlap_seconds": 1.84,
+                  "cluster_id": 10,
+                  "accepted_by_cluster": false,
+                  "is_outlier": false
+                }
+              ]
+            },
+            {
+              "ordinal": 4,
+              "span": [
+                249.86,
+                253.34
+              ],
+              "kind": "entire_other",
+              "evaluated_span": [
+                249.86,
+                253.34
+              ],
+              "coverage_ratio": 1.0,
+              "status": "withheld_no_target",
+              "in_target_cluster": false,
+              "turns": [
+                {
+                  "index": 36,
+                  "span": [
+                    249.86,
+                    253.34
+                  ],
+                  "overlap_seconds": 3.48,
+                  "cluster_id": -1,
+                  "accepted_by_cluster": false,
+                  "is_outlier": false
+                }
+              ]
+            },
+            {
+              "ordinal": 5,
+              "span": [
+                337.455,
+                339.275
+              ],
+              "kind": "entire_other",
+              "evaluated_span": [
+                337.455,
+                339.275
+              ],
+              "coverage_ratio": 1.0,
+              "status": "withheld_no_target",
+              "in_target_cluster": false,
+              "turns": [
+                {
+                  "index": 64,
+                  "span": [
+                    337.455,
+                    339.275
+                  ],
+                  "overlap_seconds": 1.82,
+                  "cluster_id": -1,
+                  "accepted_by_cluster": false,
+                  "is_outlier": false
+                }
+              ]
+            },
+            {
+              "ordinal": 9,
+              "span": [
+                498.91,
+                501.8
+              ],
+              "kind": "entire_other",
+              "evaluated_span": [
+                498.91,
+                501.8
+              ],
+              "coverage_ratio": 1.0,
+              "status": "withheld_no_target",
+              "in_target_cluster": false,
+              "turns": [
+                {
+                  "index": 97,
+                  "span": [
+                    498.91,
+                    501.8
+                  ],
+                  "overlap_seconds": 2.89,
+                  "cluster_id": 22,
+                  "accepted_by_cluster": false,
+                  "is_outlier": false
+                }
+              ]
+            },
+            {
+              "ordinal": 10,
+              "span": [
+                535.84,
+                537.84
+              ],
+              "kind": "entire_other",
+              "evaluated_span": [
+                535.84,
+                537.84
+              ],
+              "coverage_ratio": 1.0,
+              "status": "withheld_no_target",
+              "in_target_cluster": false,
+              "turns": [
+                {
+                  "index": 104,
+                  "span": [
+                    534.54,
+                    548.64
+                  ],
+                  "overlap_seconds": 2.0,
+                  "cluster_id": -1,
+                  "accepted_by_cluster": false,
+                  "is_outlier": false
+                }
+              ]
+            },
+            {
+              "ordinal": 11,
+              "span": [
+                550.44,
+                555.74
+              ],
+              "kind": "entire_other",
+              "evaluated_span": [
+                550.44,
+                555.74
+              ],
+              "coverage_ratio": 1.0,
+              "status": "withheld_no_target",
+              "in_target_cluster": false,
+              "turns": [
+                {
+                  "index": 106,
+                  "span": [
+                    550.44,
+                    563.89
+                  ],
+                  "overlap_seconds": 5.3,
+                  "cluster_id": -1,
+                  "accepted_by_cluster": false,
+                  "is_outlier": false
+                }
+              ]
+            },
+            {
+              "ordinal": 12,
+              "span": [
+                560.64,
+                563.89
+              ],
+              "kind": "entire_other",
+              "evaluated_span": [
+                560.64,
+                563.89
+              ],
+              "coverage_ratio": 1.0,
+              "status": "withheld_no_target",
+              "in_target_cluster": false,
+              "turns": [
+                {
+                  "index": 106,
+                  "span": [
+                    550.44,
+                    563.89
+                  ],
+                  "overlap_seconds": 3.25,
+                  "cluster_id": -1,
+                  "accepted_by_cluster": false,
+                  "is_outlier": false
+                }
+              ]
+            },
+            {
+              "ordinal": 16,
+              "span": [
+                616.685,
+                619.26
+              ],
+              "kind": "entire_other",
+              "evaluated_span": [
+                616.685,
+                619.26
+              ],
+              "coverage_ratio": 1.0,
+              "status": "withheld_no_target",
+              "in_target_cluster": false,
+              "turns": [
+                {
+                  "index": 121,
+                  "span": [
+                    615.585,
+                    619.26
+                  ],
+                  "overlap_seconds": 2.575,
+                  "cluster_id": -1,
+                  "accepted_by_cluster": false,
+                  "is_outlier": false
+                }
+              ]
+            },
+            {
+              "ordinal": 18,
+              "span": [
+                1083.96,
+                1088.86
+              ],
+              "kind": "entire_other",
+              "evaluated_span": [
+                1083.96,
+                1088.86
+              ],
+              "coverage_ratio": 1.0,
+              "status": "withheld_no_target",
+              "in_target_cluster": false,
+              "turns": [
+                {
+                  "index": 218,
+                  "span": [
+                    1083.96,
+                    1090.25
+                  ],
+                  "overlap_seconds": 4.9,
+                  "cluster_id": 9,
+                  "accepted_by_cluster": false,
+                  "is_outlier": false
+                }
+              ]
+            },
+            {
+              "ordinal": 20,
+              "span": [
+                1145.76,
+                1149.96
+              ],
+              "kind": "entire_other",
+              "evaluated_span": [
+                1145.76,
+                1149.96
+              ],
+              "coverage_ratio": 1.0,
+              "status": "withheld_no_target",
+              "in_target_cluster": false,
+              "turns": [
+                {
+                  "index": 228,
+                  "span": [
+                    1145.76,
+                    1152.68
+                  ],
+                  "overlap_seconds": 4.2,
+                  "cluster_id": -1,
+                  "accepted_by_cluster": false,
+                  "is_outlier": false
+                }
+              ]
+            }
+          ],
+          "mixed": [
+            {
+              "ordinal": 8,
+              "span": [
+                486.79,
+                493.19
+              ],
+              "kind": "mixed",
+              "evaluated_span": [
+                490.79,
+                493.19
+              ],
+              "coverage_ratio": 1.0,
+              "status": "withheld_no_target",
+              "in_target_cluster": false,
+              "turns": [
+                {
+                  "index": 96,
+                  "span": [
+                    481.09,
+                    497.01
+                  ],
+                  "overlap_seconds": 2.4,
+                  "cluster_id": -1,
+                  "accepted_by_cluster": false,
+                  "is_outlier": false
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "diagnostic_only_without_same_exclusion_cannot_link",
+      "cluster_count": 17,
+      "clustered_turn_count": 238,
+      "reason": "target_cluster_found",
+      "accepted_turn_count": 30,
+      "target_cluster_id": 9,
+      "largest_cluster": {
+        "id": 9,
+        "members": 42,
+        "speech_seconds": 228.4378
+      },
+      "highest_target_score_cluster": {
+        "id": 9,
+        "score": 0.913791
+      },
+      "review_check": {
+        "whole_wrong_count": 10,
+        "whole_wrong_inside_target": 5,
+        "whole_wrong_elsewhere": 4,
+        "whole_wrong_caught_by_outlier_rule": 1,
+        "whole_wrong_unresolved": 0,
+        "whole_wrong_withheld_no_target": 0,
+        "mixed_clips_in_target": 1,
+        "mixed_clips_unresolved": 0,
+        "mixed_clips_withheld_no_target": 0,
+        "mixed_clips_total": 1,
+        "verdict": "partially_solved",
+        "notes": "按人工试听片段计数，不按轮次计数。mixed 只检查已标注的负例区间；覆盖不足单列 unresolved。簇内保留不等于最终导出，零目标不算成功。此结果不测召回，也不是未见集泛化证据。",
+        "details": {
+          "entire_other": [
+            {
+              "ordinal": 3,
+              "span": [
+                209.75,
+                211.59
+              ],
+              "kind": "entire_other",
+              "evaluated_span": [
+                209.75,
+                211.59
+              ],
+              "coverage_ratio": 1.0,
+              "status": "retained",
+              "in_target_cluster": true,
+              "turns": [
+                {
+                  "index": 27,
+                  "span": [
+                    209.75,
+                    211.59
+                  ],
+                  "overlap_seconds": 1.84,
+                  "cluster_id": 9,
+                  "accepted_by_cluster": true,
+                  "is_outlier": false
+                }
+              ]
+            },
+            {
+              "ordinal": 4,
+              "span": [
+                249.86,
+                253.34
+              ],
+              "kind": "entire_other",
+              "evaluated_span": [
+                249.86,
+                253.34
+              ],
+              "coverage_ratio": 1.0,
+              "status": "rejected_elsewhere",
+              "in_target_cluster": false,
+              "turns": [
+                {
+                  "index": 36,
+                  "span": [
+                    249.86,
+                    253.34
+                  ],
+                  "overlap_seconds": 3.48,
+                  "cluster_id": 7,
+                  "accepted_by_cluster": false,
+                  "is_outlier": false
+                }
+              ]
+            },
+            {
+              "ordinal": 5,
+              "span": [
+                337.455,
+                339.275
+              ],
+              "kind": "entire_other",
+              "evaluated_span": [
+                337.455,
+                339.275
+              ],
+              "coverage_ratio": 1.0,
+              "status": "rejected_with_outlier",
+              "in_target_cluster": false,
+              "turns": [
+                {
+                  "index": 64,
+                  "span": [
+                    337.455,
+                    339.275
+                  ],
+                  "overlap_seconds": 1.82,
+                  "cluster_id": 9,
+                  "accepted_by_cluster": false,
+                  "is_outlier": true
+                }
+              ]
+            },
+            {
+              "ordinal": 9,
+              "span": [
+                498.91,
+                501.8
+              ],
+              "kind": "entire_other",
+              "evaluated_span": [
+                498.91,
+                501.8
+              ],
+              "coverage_ratio": 1.0,
+              "status": "rejected_elsewhere",
+              "in_target_cluster": false,
+              "turns": [
+                {
+                  "index": 97,
+                  "span": [
+                    498.91,
+                    501.8
+                  ],
+                  "overlap_seconds": 2.89,
+                  "cluster_id": 1,
+                  "accepted_by_cluster": false,
+                  "is_outlier": false
+                }
+              ]
+            },
+            {
+              "ordinal": 10,
+              "span": [
+                535.84,
+                537.84
+              ],
+              "kind": "entire_other",
+              "evaluated_span": [
+                535.84,
+                537.84
+              ],
+              "coverage_ratio": 1.0,
+              "status": "retained",
+              "in_target_cluster": true,
+              "turns": [
+                {
+                  "index": 104,
+                  "span": [
+                    534.54,
+                    548.64
+                  ],
+                  "overlap_seconds": 2.0,
+                  "cluster_id": 9,
+                  "accepted_by_cluster": true,
+                  "is_outlier": false
+                }
+              ]
+            },
+            {
+              "ordinal": 11,
+              "span": [
+                550.44,
+                555.74
+              ],
+              "kind": "entire_other",
+              "evaluated_span": [
+                550.44,
+                555.74
+              ],
+              "coverage_ratio": 1.0,
+              "status": "retained",
+              "in_target_cluster": true,
+              "turns": [
+                {
+                  "index": 106,
+                  "span": [
+                    550.44,
+                    563.89
+                  ],
+                  "overlap_seconds": 5.3,
+                  "cluster_id": 9,
+                  "accepted_by_cluster": true,
+                  "is_outlier": false
+                }
+              ]
+            },
+            {
+              "ordinal": 12,
+              "span": [
+                560.64,
+                563.89
+              ],
+              "kind": "entire_other",
+              "evaluated_span": [
+                560.64,
+                563.89
+              ],
+              "coverage_ratio": 1.0,
+              "status": "retained",
+              "in_target_cluster": true,
+              "turns": [
+                {
+                  "index": 106,
+                  "span": [
+                    550.44,
+                    563.89
+                  ],
+                  "overlap_seconds": 3.25,
+                  "cluster_id": 9,
+                  "accepted_by_cluster": true,
+                  "is_outlier": false
+                }
+              ]
+            },
+            {
+              "ordinal": 16,
+              "span": [
+                616.685,
+                619.26
+              ],
+              "kind": "entire_other",
+              "evaluated_span": [
+                616.685,
+                619.26
+              ],
+              "coverage_ratio": 1.0,
+              "status": "retained",
+              "in_target_cluster": true,
+              "turns": [
+                {
+                  "index": 121,
+                  "span": [
+                    615.585,
+                    619.26
+                  ],
+                  "overlap_seconds": 2.575,
+                  "cluster_id": 9,
+                  "accepted_by_cluster": true,
+                  "is_outlier": false
+                }
+              ]
+            },
+            {
+              "ordinal": 18,
+              "span": [
+                1083.96,
+                1088.86
+              ],
+              "kind": "entire_other",
+              "evaluated_span": [
+                1083.96,
+                1088.86
+              ],
+              "coverage_ratio": 1.0,
+              "status": "rejected_elsewhere",
+              "in_target_cluster": false,
+              "turns": [
+                {
+                  "index": 218,
+                  "span": [
+                    1083.96,
+                    1090.25
+                  ],
+                  "overlap_seconds": 4.9,
+                  "cluster_id": 7,
+                  "accepted_by_cluster": false,
+                  "is_outlier": false
+                }
+              ]
+            },
+            {
+              "ordinal": 20,
+              "span": [
+                1145.76,
+                1149.96
+              ],
+              "kind": "entire_other",
+              "evaluated_span": [
+                1145.76,
+                1149.96
+              ],
+              "coverage_ratio": 1.0,
+              "status": "rejected_elsewhere",
+              "in_target_cluster": false,
+              "turns": [
+                {
+                  "index": 228,
+                  "span": [
+                    1145.76,
+                    1152.68
+                  ],
+                  "overlap_seconds": 4.2,
+                  "cluster_id": 7,
+                  "accepted_by_cluster": false,
+                  "is_outlier": false
+                }
+              ]
+            }
+          ],
+          "mixed": [
+            {
+              "ordinal": 8,
+              "span": [
+                486.79,
+                493.19
+              ],
+              "kind": "mixed",
+              "evaluated_span": [
+                490.79,
+                493.19
+              ],
+              "coverage_ratio": 1.0,
+              "status": "retained",
+              "in_target_cluster": true,
+              "turns": [
+                {
+                  "index": 96,
+                  "span": [
+                    481.09,
+                    497.01
+                  ],
+                  "overlap_seconds": 2.4,
+                  "cluster_id": 9,
+                  "accepted_by_cluster": true,
+                  "is_outlier": false
+                }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "provenance": [
+    {
+      "path": "X:\\AboutAI\\voice\\voice apart\\提取\\work\\cluster_p0p2_logs\\profile_probe.py",
+      "sha256": "81257aab23735cfb62fa38c788e7917422290f026247326c7adcd20cdbc57570"
+    },
+    {
+      "path": "X:\\AboutAI\\voice\\voice apart\\提取\\work\\embeddings\\5bd1f3.npz",
+      "sha256": "524e6e579b6b255e7f2cd2ea87955a1d0e077e1ecd3b59941b45df9b78266ce3"
+    },
+    {
+      "path": "X:\\AboutAI\\voice\\voice apart\\提取\\output\\20260928_214330_batch_5bd1f3\\001_DBD-Raws_Hibike_Euphonium_03_1080P_BDRip_HEVC-10bit_FLACx3\\stage_audit.json",
+      "sha256": "0321b59e6c09b52aaf5c2ddb5e5d6d8001e6b1ce8a87fec0390fb532abd8f346"
+    },
+    {
+      "path": "X:\\AboutAI\\voice\\voice apart\\提取\\evaluation\\episode3_user_review_20260928_5bd1f3.json",
+      "sha256": "4695ccfe295f90d8dfa41f4811c94b1a45af62be57df01a87568a9fa12fb0032"
+    },
+    {
+      "path": "X:\\AboutAI\\voice\\voice apart\\提取\\extractor\\nextgen\\identity_cluster.py",
+      "sha256": "58b4d0bcbcc4a339283349f678f5afe985829fd2d0e181bd50965dbdc8661a13"
+    },
+    {
+      "path": "X:\\AboutAI\\voice\\voice apart\\提取\\evaluation\\cluster_report.py",
+      "sha256": "122ebc4762d0e23566b648a7d8378a01bfb0eb22e417c2e7477e16537623669f"
+    },
+    {
+      "path": "X:\\AboutAI\\voice\\voice apart\\提取\\京吹原片音频\\kumiko\\0002_確かに言わなくてもいい一言だったのかもしれないけどあの時本気で全国に行けるって思ってた子は少なかったと思うんだよね.wav",
+      "sha256": "59861dd63417cf1de0d043adab0ec78cee98630efa78a54080645a4cf6e80cbe"
+    },
+    {
+      "path": "X:\\AboutAI\\voice\\voice apart\\提取\\京吹原片音频\\kumiko\\0006_私はその言葉が何を意味しているのか葵ちゃんがその時どんな思いでいたのか.wav",
+      "sha256": "edd006f9c5d701871a84a11a4a85f7e94dccb72eb043ae25a6c6c37018d51d7c"
+    },
+    {
+      "path": "X:\\AboutAI\\voice\\voice apart\\提取\\京吹原片音频\\kumiko\\0007_ダメだここにいると強引に巻き込まれる.wav",
+      "sha256": "a5d53acbee2822378ab952d65d6d96254f6d7dc29fb99cd7bce859824de778e7"
+    },
+    {
+      "path": "X:\\AboutAI\\voice\\voice apart\\提取\\京吹原片音频\\kumiko\\0008_帰宅だったんだね全然知らなかった.wav",
+      "sha256": "af40a329035f04dddf2502cf100988b9e25361266d5c6c58ab4819faadac1fff"
+    },
+    {
+      "path": "X:\\AboutAI\\voice\\voice apart\\提取\\京吹原片音频\\kumiko\\0009_部活前の机の運び出しは1年生の役割なの終わったらまた元に戻る.wav",
+      "sha256": "919b2b7a7c0e4d1f75a66417cfca5676168755880cfa5594f9d49e8edaa254e9"
+    },
+    {
+      "path": "X:\\AboutAI\\voice\\voice apart\\提取\\京吹原片音频\\kumiko\\2年間ずっと思ってきたけど でも、どうしてもそこに届かなかった.mp3",
+      "sha256": "e7e67033837c19914910a1d101c44ab7081fae72073edcc85b1445b07150b416"
+    },
+    {
+      "path": "X:\\AboutAI\\voice\\voice apart\\提取\\京吹原片音频\\其他人物\\绿.wav",
+      "sha256": "70bb7c4f2f21d8687f05f452ee1ed91a0c40c1b3989d0c1705be9914b406bfb3"
+    },
+    {
+      "path": "X:\\AboutAI\\voice\\voice apart\\提取\\京吹原片音频\\其他人物\\明日香！.wav",
+      "sha256": "51656dc6ad7b655358869e2ad532e20414a09cb5bb8e2a46e7b8fff6635de9ae"
+    },
+    {
+      "path": "X:\\AboutAI\\voice\\voice apart\\提取\\京吹原片音频\\其他人物\\晴香！.wav",
+      "sha256": "40d5385aa8f4f6a713d5b45870e012f1166dda0d81e7d3b4e58065270cdb1499"
+    },
+    {
+      "path": "X:\\AboutAI\\voice\\voice apart\\提取\\京吹原片音频\\其他人物\\傻逼爱举手.wav",
+      "sha256": "8104fbd5936c20464d8a98ca9d44816c94b6ee9d920ffd3c0b163f32fe9df9d1"
+    },
+    {
+      "path": "X:\\AboutAI\\voice\\voice apart\\提取\\京吹原片音频\\其他人物\\傻逼高坂.wav",
+      "sha256": "12b31cd6997f3d1cac2a090cd78a2fa2fc030ac1943c11fa7542c5180445705a"
+    }
+  ],
+  "current_source_sha256": "1fa89904fe45dfd4c5acba9234644b41b481c89dbc515d7b7c7567c638c7fe97",
+  "limitation": "Legacy NPZ has no source/audit/reference content fingerprints; these checks confirm current consistency, not the original export history. No recall or held-out generalization claim."
+}

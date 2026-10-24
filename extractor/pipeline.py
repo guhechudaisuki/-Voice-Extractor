@@ -29,7 +29,7 @@ from .audio import (
     write_video_clip,
 )
 from .candidate_lattice import propose_raw_vad_subturns
-from .config import ASSET_ROOT, OUTPUT_ROOT, WORK_ROOT, ensure_local_assets
+from .config import ASSET_ROOT, OUTPUT_ROOT, WORK_ROOT, WAVLM_SV_MODEL, ensure_local_assets
 from .filters import OverlapDetector, SingingDetector
 from .speaker import (
     CAMPlusProfile,
@@ -53,6 +53,20 @@ LOGGER = logging.getLogger(__name__)
 
 @dataclass
 class PipelineOptions:
+    cluster_identity_mode: str = "audit"
+    cluster_target_margin: float = 0.06
+    cluster_keep_narration: bool = True
+    cluster_embedding_cache: bool = True
+    cluster_require_dominant: bool = False
+    cluster_bootstrap: bool = False
+    cluster_bootstrap_max_rounds: int = 3
+    # 强化后的 WavLM 作为簇门控第三通道（独立缓存，强化后自动刷新）。
+    cluster_wavlm_channel: bool = True
+    # WeSpeaker-ResNet34-LM 第四通道仲裁：救援标记候选进 Tier A 前的
+    # 异构否决票（大间隔模型与其余三模型相关性低）。
+    cluster_wespeaker_arbitration: bool = True
+    # 双轨（Stem+Raw）边缘复核：UVR 伪影误杀的边缘轮次用原轨救回（只救不杀）。
+    cluster_raw_crosscheck: bool = True
     speaker_threshold: float = 0.68
     # Gaps shorter than the lower bound are detector jitter inside one speech
     # island. Gaps within [min, max] may be joined only after same-speaker
@@ -90,6 +104,16 @@ class PipelineOptions:
     user_excluded_spans: tuple[tuple[float, float], ...] = ()
 
     def __post_init__(self) -> None:
+        if self.cluster_identity_mode not in {"off", "audit", "enforce"}:
+            raise ValueError("cluster_identity_mode 必须为 off、audit 或 enforce")
+        if not 0.0 <= self.cluster_target_margin <= 1.0:
+            raise ValueError("cluster_target_margin 必须在 0–1 之间")
+        if type(self.cluster_bootstrap_max_rounds) is not int or not 1 <= self.cluster_bootstrap_max_rounds <= 10:
+            raise ValueError("cluster_bootstrap_max_rounds 必须为 1–10 的整数")
+        if self.cluster_bootstrap and self.cluster_identity_mode == "off":
+            raise ValueError("自动扩充参考需要开启簇级判决")
+        if self.cluster_bootstrap and self.export_all_sentences:
+            raise ValueError("自动扩充参考不能与输出全部单句同时开启，请选择一种提取方式")
         if self.silence_max_seconds is None:
             self.silence_max_seconds = float(self.silence_split_seconds)
         else:
@@ -156,6 +180,8 @@ class ExtractionPipeline:
         self._raw_blocked_spans: tuple[TimeSpan, ...] = ()
         self._subtitle_guide: SubtitleGuide | None = None
         self._stage_audit: dict | None = None
+        self._cluster_report: dict | None = None
+        self._cluster_accepted_spans: list | None = None
         self._verified_fallback_registry: dict[int, list[CandidateSentence]] = {}
         self._verified_fallback_anchors: list[CandidateSentence] = []
         self._tail_scorer_cache: tuple | str | None = None
@@ -1399,6 +1425,130 @@ class ExtractionPipeline:
         accepted_turns.sort(key=lambda item: (item.start, item.end))
         return rescued
 
+    # Whisper 在静音/呼吸上的常见幻觉文本（中日字幕组水印、频道宣传等）。
+    _HALLUCINATION_PATTERN = re.compile(
+        r"^(?:谢谢[观看收]*|感谢[观听]*[看听]*|字幕[由提供做].*|译[制作者]*|仅供学习|请订阅|"
+        r"关注[我频]*[频道]*|下[集期]再见|官方?字幕|SN?S\d+|[Ss]ub\s?[Bb]y|"
+        r"ご視聴ありがとうございました|チャンネル登録|次回もお楽しみに|"
+        r"amara\.org|youtube|niconico|bilibili|[（(]?完[)）]?|[。.．…\-—~～*✦✧ ]+)$"
+    )
+
+    @staticmethod
+    def _text_similarity(left: str, right: str) -> float:
+        """去标点空格后的归一化字符 LCS 相似度（STT 分片 ↔ 字幕 Cue）。"""
+        import re as _re
+        clean = _re.compile(r"[\s\W_]+", _re.UNICODE)
+        a = clean.sub("", str(left or ""))
+        b = clean.sub("", str(right or ""))
+        if not a or not b:
+            return 0.0
+        # O(len*len) DP；分片与字幕都是短句，代价可忽略。
+        previous = [0] * (len(b) + 1)
+        for i in range(1, len(a) + 1):
+            current = [0] * (len(b) + 1)
+            ai = a[i - 1]
+            for j in range(1, len(b) + 1):
+                if ai == b[j - 1]:
+                    current[j] = previous[j - 1] + 1
+                else:
+                    current[j] = max(previous[j], current[j - 1])
+            previous = current
+        return 2.0 * previous[len(b)] / (len(a) + len(b))
+
+    @staticmethod
+    def _has_kana(text: str) -> bool:
+        return bool(re.search(r"[\u3040-\u309f\u30a0-\u30ff]", str(text or "")))
+
+    def _fragment_clean_evidence(
+        self, fragment: CandidateSentence, guide, span_cache: dict,
+    ) -> tuple[bool, str]:
+        """判断一个 STT 分片是否带有"目标正文"证据。
+
+        证据二选一：
+        1. 分片区间落在簇级滑窗已验证的干净区间内（声纹证据）；
+        2. 分片与对齐字幕 Cue 时间重叠 >=50% 且文本相似度 >=0.55
+           （字幕是原子单人台词，时间+文本双重对齐）。
+        """
+        start, end = fragment.start, fragment.end
+        for a, b in self._cluster_accepted_spans or []:
+            if a <= start + 0.06 and b >= end - 0.06:
+                return True, "cluster_clean_span"
+        if guide is not None and guide.aligned:
+            key = (round(start, 2), round(end, 2))
+            if key in span_cache:
+                return span_cache[key]
+            best = None
+            for cue in guide.cues:
+                span = guide.cue_span(cue)
+                if span is None:
+                    continue
+                overlap = min(end, span.end) - max(start, span.start)
+                if overlap < 0.5 * max(0.01, end - start):
+                    continue
+                similarity = self._text_similarity(fragment.whisper_text, cue.text)
+                if best is None or similarity > best[0]:
+                    best = (similarity, cue)
+            result = (best is not None and best[0] >= 0.55, "subtitle_aligned")
+            span_cache[key] = result
+            return result
+        return False, "no_evidence"
+
+    def _trim_turn_to_clean_fragments(
+        self, turn, sentences: list[CandidateSentence], guide,
+    ) -> tuple[float, float, list[CandidateSentence]] | None:
+        """多分片候选句精裁：只保留声纹/字幕双证据通过的最长连续分片运行。
+
+        返回 (start, end, kept_fragments)；无可保留运行时返回 None。
+        """
+        span_cache: dict = {}
+        flags = []
+        for fragment in sentences:
+            clean, _method = self._fragment_clean_evidence(fragment, guide, span_cache)
+            flags.append(clean)
+        if not any(flags):
+            return None
+        best_run, current = None, []
+        for fragment, clean in zip(sentences, flags):
+            if clean:
+                current.append(fragment)
+                if best_run is None or len(current) > len(best_run):
+                    best_run = list(current)
+            else:
+                current = []
+        if best_run is None:
+            return None
+        return best_run[0].start, best_run[-1].end, best_run
+
+    def _correct_text_with_subtitle(
+        self, text: str, language: str, start: float, end: float, guide,
+    ) -> tuple[str, dict | None]:
+        """字幕正字：日文候选与日文字幕 Cue 文本高匹配时，用字幕原文修正 STT 错字。"""
+        if guide is None or not guide.aligned or language != "ja":
+            return text, None
+        best = None
+        for cue in guide.cues:
+            if not self._has_kana(cue.text):
+                continue
+            span = guide.cue_span(cue)
+            if span is None:
+                continue
+            overlap = min(end, span.end) - max(start, span.start)
+            if overlap < 0.5 * max(0.01, end - start):
+                continue
+            similarity = self._text_similarity(text, cue.text)
+            if best is None or similarity > best[0]:
+                best = (similarity, cue)
+        if best is None or best[0] < 0.70:
+            return text, None
+        corrected = best[1].text
+        return corrected, {
+            "subtitle_text_correction": {
+                "similarity": round(best[0], 4),
+                "stt_text": text,
+                "subtitle_text": corrected,
+            }
+        }
+
     @staticmethod
     def _stt_fragment_identity_veto(
         candidate: CandidateSentence,
@@ -1840,31 +1990,44 @@ class ExtractionPipeline:
             extended_count += 1
         return extended_count
 
+    def _invalidate_changed_tail_scorer(self) -> None:
+        """Refresh between extraction jobs; one job keeps one set of weights."""
+        from .model_store import active_classifier_path
+        classifier_path = active_classifier_path(ASSET_ROOT)
+        stat = classifier_path.stat() if classifier_path.is_file() else None
+        stamp = (str(classifier_path), stat.st_mtime_ns, stat.st_size) if stat else None
+        if getattr(self, '_tail_scorer_stamp', None) != stamp:
+            self._tail_scorer_cache = None
+            self._local_identity_reject_threshold = None
+            self._local_identity_model_sha256 = ''
+        self._tail_scorer_stamp = stamp
+
     def _ensure_tail_scorer(self) -> tuple | None:
-        """Load (once) the anime-domain classifier trained on user-verified
-        spans, together with its WavLM TDNN encoder. Returns None when the
-        optional asset is absent."""
+        """Load the optional identity classifier and keep it stable for this job."""
         cached = getattr(self, "_tail_scorer_cache", None)
         if cached is not None:
             return cached if cached != "missing" else None
-        classifier_path = ASSET_ROOT / "models" / "anime_t3" / "classifier.pt"
+        self._invalidate_changed_tail_scorer()
+        from .model_store import active_classifier_path
+        classifier_path = active_classifier_path(ASSET_ROOT)
         reviewed_path = classifier_path.with_name("classifier_v2.pt")
-        if reviewed_path.is_file():
-            classifier_path = reviewed_path
-        encoder_dir = ASSET_ROOT / "model" / "speaker" / "wavlm-base-plus-sv"
+        self._local_identity_reject_threshold = None
+        self._local_identity_model_sha256 = ''
+        encoder_dir = WAVLM_SV_MODEL
         if not classifier_path.is_file() or not encoder_dir.is_dir():
             self._tail_scorer_cache = "missing"
             return None
+        checkpoint_bytes = classifier_path.read_bytes()
         payload = torch.load(
-            io.BytesIO(classifier_path.read_bytes()),
+            io.BytesIO(checkpoint_bytes),
             map_location="cpu",
-            weights_only=False,
+            weights_only=True,
         )
         if classifier_path == reviewed_path:
-            from .nextgen.features import file_digest
+            import hashlib
 
             if (
-                payload.get("calibration_status") != "passed"
+                payload.get("calibration_status") not in {"passed", "reinforced"}
                 or not self._reference_sha256
                 or sorted(payload.get("reference_sha256", [])) != self._reference_sha256
             ):
@@ -1876,7 +2039,7 @@ class ExtractionPipeline:
             reject_threshold = payload.get("reject_threshold")
             self._local_identity_reject_threshold = (
                 float(reject_threshold) if reject_threshold is not None else None)
-            self._local_identity_model_sha256 = file_digest(classifier_path)
+            self._local_identity_model_sha256 = hashlib.sha256(checkpoint_bytes).hexdigest()
         from transformers import Wav2Vec2FeatureExtractor, WavLMForXVector
 
         device = torch.device(self.device)
@@ -4390,6 +4553,11 @@ class ExtractionPipeline:
     ) -> tuple[Path, Path, Path]:
         output_dir = paths["output"]
         output_dir.mkdir(parents=True, exist_ok=True)
+        cluster_report = getattr(self, "_cluster_report", None)
+        if cluster_report is not None:
+            cluster_report["final_output_count"] = len(accepted)
+            (output_dir / "cluster_report.json").write_text(
+                json.dumps(cluster_report, ensure_ascii=False, indent=2), encoding="utf-8")
         audio_dir = output_dir / "audio"
         text_dir = output_dir / "text"
         video_dir = output_dir / "video"
@@ -4435,6 +4603,33 @@ class ExtractionPipeline:
             for index, candidate in enumerate(rejected, start=1):
                 rejected_path = rejected_dir / f"{index:04d}_{_safe_name(candidate.reject_reason, 'rejected')}.wav"
                 write_clip(stem, rejected_path, candidate.start, candidate.end, sample_rate=16000)
+        cluster_removed = [c for c in rejected
+                           if c.diagnostics.get("cluster_removed")
+                           and c.diagnostics.get("cluster_tier") != "B"]
+        if cluster_removed:
+            outlier_dir = output_dir / "cluster_outliers"
+            outlier_dir.mkdir(exist_ok=True)
+            for index, candidate in enumerate(cluster_removed, 1):
+                path = outlier_dir / f"{index:04d}.wav"
+                write_clip(stem, path, candidate.start, candidate.end, sample_rate=16000)
+                path.with_suffix(".txt").write_text(
+                    f"{candidate.start:.3f}–{candidate.end:.3f}\n{candidate.reject_reason}\n"
+                    f"簇 {candidate.diagnostics.get('cluster_ids')}；目标簇 "
+                    f"{candidate.diagnostics.get('cluster_target_id')}", encoding="utf-8")
+        # Tier B 边缘召回池：目标簇家族内置信度处于边缘的片段。不混入主输出，
+        # 单独导出音频供前端 1 分钟捡漏（无需开启 keep_rejected）。
+        borderline = [c for c in rejected if c.diagnostics.get("cluster_tier") == "B"]
+        if borderline:
+            borderline_dir = output_dir / "_borderline"
+            borderline_dir.mkdir(exist_ok=True)
+            for index, candidate in enumerate(borderline, 1):
+                path = borderline_dir / f"{index:04d}.wav"
+                write_clip(stem, path, candidate.start, candidate.end, sample_rate=16000)
+                path.with_suffix(".txt").write_text(
+                    f"{candidate.start:.3f}–{candidate.end:.3f}\n"
+                    f"{candidate.diagnostics.get('cluster_reason', '')}\n"
+                    f"簇 {candidate.diagnostics.get('cluster_ids')}", encoding="utf-8")
+                candidate.audio_file = str(path.relative_to(output_dir))
 
         subtitle_guide = getattr(self, "_subtitle_guide", None)
         if subtitle_guide is not None:
@@ -4514,10 +4709,110 @@ class ExtractionPipeline:
         partial_archive.unlink(missing_ok=True)
         with zipfile.ZipFile(partial_archive, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             for file in sorted(output_dir.rglob("*")):
-                if file.is_file():
+                if file.is_file() and '_training' not in file.relative_to(output_dir).parts:
                     archive.write(file, file.relative_to(output_dir))
         partial_archive.replace(archive_path)
         return manifest, srt_path, archive_path
+
+    def _apply_cluster_identity(self, stem, references, negative_reference_groups,
+                                verifier, profile, split_result, accepted_turns, rejected,
+                                target, job_id, progress):
+        """Audit failures are recorded; enforce failures must stop export."""
+        if self.options.cluster_identity_mode == "off":
+            return
+        try:
+            from .nextgen.cluster_runtime import ClusterAnalyzer
+            from .nextgen.cluster_reporting import summarize
+            from .nextgen.cluster_gate import apply_cluster_gate, HARD_VETOES
+            verifier._ensure_secondary(profile)
+            tertiary = None
+            if self.options.cluster_wavlm_channel:
+                # 强化后的 WavLM 作为第三通道参与门控；加载失败时退回双通道。
+                try:
+                    from .speaker import WavLMSpeakerVerifier
+                    tertiary = WavLMSpeakerVerifier(device=self.device)
+                except Exception as exc:
+                    LOGGER.warning("WavLM 第三通道加载失败，退回双通道：%s", exc)
+            quaternary = None
+            if self.options.cluster_wespeaker_arbitration:
+                try:
+                    from .speaker import WeSpeakerVerifier
+                    quaternary = WeSpeakerVerifier()
+                except Exception as exc:
+                    LOGGER.warning("WeSpeaker 第四通道加载失败，跳过仲裁：%s", exc)
+            raw_stem = target if self.options.cluster_raw_crosscheck else None
+            analyzer = ClusterAnalyzer(
+                stem, references, negative_reference_groups,
+                device=self.device, cache_enabled=self.options.cluster_embedding_cache,
+                encoders=(verifier.primary, verifier.secondary),
+                progress=lambda message: progress(0.80, message),
+                tertiary_encoder=tertiary,
+                quaternary_encoder=quaternary,
+                raw_stem=raw_stem,
+            )
+            try:
+                spans = [(t.start, t.end) for t in split_result]
+                settings = dict(margin=self.options.cluster_target_margin,
+                    keep_narration=self.options.cluster_keep_narration,
+                    require_dominant=self.options.cluster_require_dominant)
+                blocked = (*self.options.user_excluded_spans,
+                           *((s.start, s.end) for s in self._raw_blocked_spans))
+                if self.options.cluster_bootstrap:
+                    from .nextgen.bootstrap_training import analyze_with_bootstrap
+                    hard_blocked = [(c.start, c.end) for c in [*accepted_turns, *rejected]
+                                    if any(c.diagnostics.get(key) for key in HARD_VETOES)]
+                    # Training is stricter than export: even small detected
+                    # overlaps must not become reusable identity evidence.
+                    stages = (self._stage_audit or {}).get("stages", {})
+                    detected_blocks = [span for name in (
+                        "pre_uvr_singing_mask", "residual_singing_evidence", "singing_blocked_islands",
+                        "overlap_evidence", "overlap_blocked_islands")
+                        for span in stages.get(name, {}).get("spans", [])]
+                    cluster_turns, cluster_result, local = analyze_with_bootstrap(
+                        analyzer, spans, output_dir=self._job_paths(job_id)["output"] / "bootstrap",
+                        blocked_spans=(*blocked, *hard_blocked, *detected_blocks),
+                        max_rounds=self.options.cluster_bootstrap_max_rounds, **settings)
+                else:
+                    cluster_turns, cluster_result, local = analyzer.analyze(spans, **settings)
+                changes = apply_cluster_gate(
+                    accepted_turns, rejected, cluster_turns, cluster_result,
+                    mode=self.options.cluster_identity_mode,
+                    min_seconds=self.options.min_output_seconds,
+                    blocked_spans=blocked, local=local,
+                )
+                # STT 精裁阶段要用已验证干净区间判定每个文本分片的归属。
+                self._cluster_accepted_spans = list(
+                    cluster_result.diagnostics.get("accepted_spans") or [])
+                if self.options.cluster_identity_mode == "enforce":
+                    arbitrated = analyzer.wespeaker_arbitrate(accepted_turns, rejected)
+                    if arbitrated:
+                        changes = {**changes,
+                                   "wespeaker_demoted": arbitrated}
+                self._cluster_report = summarize(cluster_result, cluster_turns, [])
+                self._cluster_report.update(
+                    mode=self.options.cluster_identity_mode, changes=changes,
+                    local_windows=local, provenance=analyzer.provenance(),
+                    meta={"source_stem": str(stem), "source_name": target.name, "job_id": job_id},
+                )
+                self._trace_spans("cluster_target_members", [
+                    t for t in cluster_turns if cluster_result.membership[t.index]])
+                progress(0.80, f"簇级判决 {self.options.cluster_identity_mode}："
+                         f"目标簇 {cluster_result.target_cluster_id}，"
+                         f"通过 {sum(cluster_result.membership)} 轮，撤下 {changes['removed']} 段，"
+                         f"边缘池 {changes.get('borderline', 0)} 段")
+            finally:
+                analyzer.close()
+                if tertiary is not None:
+                    tertiary.close()
+        except Exception as exc:
+            if self.options.cluster_identity_mode != "audit":
+                raise
+            self._cluster_report = {
+                "mode": "audit", "reason": "audit_failed", "clusters": [],
+                "target_cluster_id": None, "error": f"{type(exc).__name__}: {exc}",
+                "meta": {"source_stem": str(stem), "source_name": target.name, "job_id": job_id},
+            }
+            progress(0.80, f"簇审计失败，继续原提取流程：{type(exc).__name__}: {exc}")
 
     def run(
         self,
@@ -4546,6 +4841,7 @@ class ExtractionPipeline:
         from .nextgen.features import file_digest
 
         reference_sha256 = sorted(file_digest(path) for path in references)
+        self._invalidate_changed_tail_scorer()
         if reference_sha256 != getattr(self, "_reference_sha256", None):
             self._tail_scorer_cache = None
             self._local_identity_reject_threshold = None
@@ -4553,6 +4849,7 @@ class ExtractionPipeline:
             self._reference_sha256 = reference_sha256
         self._subtitle_guide = SubtitleGuide.load(Path(subtitle)) if subtitle else None
         self._stage_audit = {"schema_version": 1, "stages": {}}
+        self._cluster_report = None
         job_id = job_id or time.strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
         paths = self._job_paths(job_id)
         paths["root"].mkdir(parents=True, exist_ok=True)
@@ -6090,6 +6387,12 @@ class ExtractionPipeline:
                             0.80,
                             f"否决后修剪：保留 {trimmed} 个撤回回合中的已验证干净段",
                         )
+                # Last identity gate: all recovery, boundary and local veto paths
+                # have finished. Nothing after this point can rescue a new span.
+                self._apply_cluster_identity(
+                    stem, references, negative_reference_groups, verifier, profile,
+                    split_result, accepted_turns, rejected, target, job_id, progress,
+                )
                 certified = sum(
                     self._install_acoustic_identity_certificate(candidate)
                     for candidate in accepted_turns
@@ -6130,6 +6433,17 @@ class ExtractionPipeline:
                         rejected.append(turn)
                         continue
                     sentences.sort(key=lambda item: (item.start, item.end))
+                    # Whisper 静音幻觉过滤：纯水印/频道宣传类文本分片不参与拼接。
+                    hallucinated = [
+                        fragment for fragment in sentences
+                        if self._HALLUCINATION_PATTERN.match(
+                            str(fragment.whisper_text or "").strip())
+                    ]
+                    if hallucinated:
+                        turn.diagnostics["stt_hallucination_filtered"] = [
+                            {"span": [f.start, f.end], "text": f.whisper_text}
+                            for f in hallucinated]
+                        sentences = [f for f in sentences if f not in hallucinated]
                     text = ""
                     languages: list[str] = []
                     for fragment in sentences:
@@ -6146,17 +6460,43 @@ class ExtractionPipeline:
                         turn,
                         fragment_count,
                     )
-                    if stt_identity_veto is not None:
-                        turn.reject_reason = (
-                            "局部身份尚未确认，暂不解除多片段导出保护"
-                            if stt_identity_veto == "local_identity_unverified"
-                            else "声学身份复核未通过"
-                        )
+                    audio_start, audio_end = turn.start, turn.end
+                    if stt_identity_veto == "local_identity_unverified":
+                        # 多分片保护不再整句枪毙：按声纹/字幕双证据精裁出
+                        # 干净正文子区间（Content-Aligned Trimming）。
+                        trimmed = self._trim_turn_to_clean_fragments(
+                            turn, sentences, self._subtitle_guide)
+                        if trimmed is not None:
+                            trim_start, trim_end, kept = trimmed
+                            coverage = (trim_end - trim_start) / max(
+                                1e-6, turn.duration)
+                            if coverage < 0.85:
+                                if trim_end - trim_start < self.options.min_output_seconds:
+                                    turn.reject_reason = "局部目标子句短于当前导出下限"
+                                    turn.diagnostics["stt_fragment_count"] = fragment_count
+                                    turn.diagnostics["stt_identity_veto"] = stt_identity_veto
+                                    rejected.append(turn)
+                                    continue
+                                audio_start, audio_end = trim_start, trim_end
+                                text = ""
+                                for fragment in kept:
+                                    text = self._join_transcript_text(text, fragment.whisper_text)
+                                text = text.strip()
+                                turn.diagnostics["stt_trimmed_span"] = [audio_start, audio_end]
+                                turn.diagnostics["stt_changed_audio_boundary"] = True
+                        else:
+                            turn.reject_reason = "局部身份尚未确认，暂不解除多片段导出保护"
+                            turn.diagnostics["stt_fragment_count"] = fragment_count
+                            turn.diagnostics["stt_identity_veto"] = stt_identity_veto
+                            rejected.append(turn)
+                            continue
+                    elif stt_identity_veto is not None:
+                        turn.reject_reason = "声学身份复核未通过"
                         turn.diagnostics["stt_fragment_count"] = fragment_count
                         turn.diagnostics["stt_identity_veto"] = stt_identity_veto
                         rejected.append(turn)
                         continue
-                    if turn.duration < self.options.min_output_seconds:
+                    if audio_end - audio_start < self.options.min_output_seconds:
                         turn.reject_reason = "讲话片段短于训练下限"
                         rejected.append(turn)
                         continue
@@ -6166,14 +6506,20 @@ class ExtractionPipeline:
                         if languages
                         else "auto"
                     )
+                    sentence_language = _language_from_text(text, language)
+                    corrected, correction_info = self._correct_text_with_subtitle(
+                        text, sentence_language, audio_start, audio_end,
+                        self._subtitle_guide)
                     sentence = CandidateSentence(
-                        start=turn.start,
-                        end=turn.end,
+                        start=audio_start,
+                        end=audio_end,
                         whisper_text=text,
-                        language=_language_from_text(text, language),
-                        text=text,
+                        language=sentence_language,
+                        text=corrected,
                         accepted=True,
                     )
+                    if correction_info:
+                        sentence.diagnostics.update(correction_info)
                     sentence.speaker_score = turn.speaker_score
                     sentence.window_min_score = turn.window_min_score
                     sentence.window_p20_score = turn.window_p20_score
@@ -6188,8 +6534,12 @@ class ExtractionPipeline:
                         {
                             "stt_fragment_count": len(sentences),
                             "stt_fragment_boundary_only": len(sentences) >= 2,
-                            "audio_boundary_source": "silence_and_speaker",
-                            "stt_changed_audio_boundary": False,
+                            "audio_boundary_source": (
+                                "stt_subtitle_aligned"
+                                if turn.diagnostics.get("stt_trimmed_span")
+                                else "silence_and_speaker"),
+                            "stt_changed_audio_boundary": bool(
+                                turn.diagnostics.get("stt_trimmed_span")),
                         }
                     )
                     accepted.append(sentence)
@@ -6227,6 +6577,8 @@ class ExtractionPipeline:
             else:
                 progress(0.92, "筛选完成：没有目标人物回合，跳过 STT")
             self._trace_spans("final_accepted", accepted)
+            from .training_context import save_training_context
+            save_training_context(paths["output"], target, reference_clips)
             manifest, transcript, archive = self._write_outputs(
                 accepted,
                 rejected,
@@ -6244,6 +6596,7 @@ class ExtractionPipeline:
             self._raw_blocked_spans = ()
             self._subtitle_guide = None
             self._stage_audit = None
+            self._cluster_report = None
             if singing_detector is not None:
                 singing_detector.close()
             if self.options.cleanup_work:
@@ -6405,7 +6758,7 @@ class ExtractionPipeline:
                 for file in batch_dir.rglob("*"):
                     # A batch download is the single archive for all targets;
                     # never nest a child archive inside it.
-                    if file.is_file() and file.suffix.lower() != ".zip":
+                    if file.is_file() and file.suffix.lower() != ".zip" and '_training' not in file.relative_to(batch_dir).parts:
                         archive.write(file, file.relative_to(batch_dir))
             with zipfile.ZipFile(temporary_archive, "r") as check:
                 bad_entry = check.testzip()

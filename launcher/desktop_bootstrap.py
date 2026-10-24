@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 
-APP_VERSION = "2.01"
+APP_VERSION = "2.02"
 APP_NAME = "Voice Extractor"
 CACHE_SCHEMA_VERSION = 1
 GLOBAL_SETTINGS = (
@@ -440,16 +440,18 @@ def suggested_install_root() -> Path:
     configured = os.environ.get("VOICE_EXTRACT_INSTALL_ROOT")
     if configured:
         return Path(configured).expanduser().resolve()
-    settings = load_global_settings()
-    stored = settings.get("install_root")
-    if stored:
-        return Path(str(stored)).expanduser().resolve()
+
     executable = current_executable()
     for candidate in (executable.parent, executable.parent.parent, Path.cwd()):
         if (
             (candidate / "models").is_dir() or (candidate / "model").is_dir()
         ) and (candidate / "output").exists():
             return candidate.resolve()
+
+    settings = load_global_settings()
+    stored = settings.get("install_root")
+    if stored:
+        return Path(str(stored)).expanduser().resolve()
     return (
         Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
         / "Programs"

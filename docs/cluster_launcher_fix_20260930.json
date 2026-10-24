@@ -1,0 +1,37 @@
+{
+  "verified_at_utc": "2026-09-30T00:45:24.887127+00:00",
+  "initial_failures": [
+    "Desktop called webview_shell.main([]), but main accepted no arguments.",
+    "Standalone embedded Python server could not import extractor for subtitle validation (HTTP 500).",
+    "Web BAT opened a fixed port before readiness; server ignored CLI --port."
+  ],
+  "regression_before_fix": "work/cluster_p0p2_logs/44_launcher_before_fix.log",
+  "unittest": {
+    "passed": true,
+    "count": 425,
+    "seconds": 23.779,
+    "log": "work\\cluster_p0p2_logs\\46_launcher_final_unittest.log"
+  },
+  "real_bat_launch": {
+    "passed": true,
+    "script": "启动WebUI.bat",
+    "exit_code": 0,
+    "url": "http://127.0.0.1:7860/",
+    "home_http_status": 200,
+    "subtitle_validation_http_status": 400,
+    "current_subtitle_and_bootstrap_controls_present": true,
+    "server_left_running_for_user": true
+  },
+  "limits": [
+    "Native WebView2 wrapper is not installed in this runtime; desktop retains tkinter fallback.",
+    "This fixes launcher/in-process imports, not acoustic model quality."
+  ],
+  "files_sha256": {
+    "launcher/app_entry.py": "2cc3402271586e3a1fbb035e0c9e99481902f16f4134127226646502a99a3a9b",
+    "launcher/webview_shell.py": "6a86548234b3e7855bbe70b25690458f8a644c42548c57f4a04f707523d22433",
+    "launcher/webui_server.py": "1d191362c9fd15678595ec2be09943e86b8a0610a5004d31c67ea1abb0cc46f9",
+    "tests/test_ui_launcher.py": "46c47fce3082b017bc83ee3d5f421f9f078338a904bcd4a9c101cc8daa7fd9bc",
+    "启动WebUI.bat": "617ca94ccbc357b313171b2cc0edcbec52b86300ece13a2999183fe6dd7c7f77",
+    "启动当前版本.bat": "1bd5e48acb87e270387fa02e9ad4830f60b5d05e52f03db74f85fe530ad6af23"
+  }
+}

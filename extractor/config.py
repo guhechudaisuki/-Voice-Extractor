@@ -27,6 +27,7 @@ def _asset_root() -> Path:
 
 
 ASSET_ROOT = _configured_path("VOICE_EXTRACT_ASSET_ROOT") or _asset_root()
+CACHE_ROOT = _configured_path("VOICE_EXTRACT_CACHE_ROOT") or ASSET_ROOT / "cache"
 MODEL_ROOT = _configured_path("VOICE_EXTRACT_MODEL_ROOT") or ASSET_ROOT / "model"
 WORKSPACE_ROOT = ASSET_ROOT.parent
 GPT_ROOT = (

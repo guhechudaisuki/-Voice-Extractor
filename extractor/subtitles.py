@@ -36,6 +36,9 @@ class SubtitleCue:
     end: float
     text: str
     kind: str = "speech"
+    # ASS/SSA 的 Actor（角色名）字段。多数字幕组留空；带角色名的字幕
+    # 可直接辅助锁定目标/排除角色的正文区间。
+    actor: str = ""
 
 
 def read_subtitles(path: Path) -> list[SubtitleCue]:
@@ -77,7 +80,8 @@ def read_subtitles(path: Path) -> list[SubtitleCue]:
         if key in seen:
             continue
         seen.add(key)
-        cues.append(SubtitleCue(index, event.start / 1000, event.end / 1000, plain, kind))
+        actor = str(getattr(event, "name", "") or "").strip()
+        cues.append(SubtitleCue(index, event.start / 1000, event.end / 1000, plain, kind, actor))
     if not cues:
         raise ValueError("字幕中没有有效的时间轴条目")
     return sorted(cues, key=lambda cue: (cue.start, cue.end))
@@ -109,8 +113,47 @@ class SubtitleGuide:
             "cue_count": len(cues),
             "lyrics_hints": sum(cue.kind == "lyrics" for cue in cues),
             "screen_text_hints": sum(cue.kind == "screen_text" for cue in cues),
+            "actor_cues": sum(1 for cue in cues if cue.actor),
+            "actors": sorted({cue.actor for cue in cues if cue.actor}),
+            "overlapping_speech_pairs": sum(
+                1 for left, right in zip(cues, cues[1:])
+                if left.kind == "speech" and right.kind == "speech"
+                and min(left.end, right.end) - max(left.start, right.start) >= 0.25),
             "text_used_for_stt": False,
         })
+
+    def overlapping_speech_spans(self, minimum: float = 0.25) -> list[TimeSpan]:
+        """两条 speech 字幕在同一时间重叠 → 多人同时说话的禁区。
+
+        动画里的前后景同时喊话（如背景喊「楽譜 返して」+ 前景对话）在字幕上
+        表现为时间重叠的双 Cue；这些区间不得当作单人干净语音切分或拼接。
+        返回合并后的重叠区间（已应用对齐偏移）。
+        """
+        speech = sorted(
+            (cue for cue in self.cues if cue.kind == "speech"),
+            key=lambda cue: (cue.start, cue.end))
+        spans: list[TimeSpan] = []
+        for left, right in zip(speech, speech[1:]):
+            overlap = min(left.end, right.end) - max(left.start, right.start)
+            if overlap < minimum:
+                continue
+            if self.aligned:
+                left_span = self.cue_span(left)
+                right_span = self.cue_span(right)
+                if left_span is None or right_span is None:
+                    continue
+                start = max(left_span.start, right_span.start)
+                end = min(left_span.end, right_span.end)
+            else:
+                start = max(left.start, right.start)
+                end = min(left.end, right.end)
+            if end - start < minimum:
+                continue
+            if spans and start <= spans[-1].end:
+                spans[-1] = TimeSpan(spans[-1].start, max(spans[-1].end, end))
+            else:
+                spans.append(TimeSpan(start, end))
+        return spans
 
     def calibrate(self, speech: Sequence[TimeSpan]) -> None:
         """Estimate one offset from paired onset/offset anchors, not nearest silence alone."""

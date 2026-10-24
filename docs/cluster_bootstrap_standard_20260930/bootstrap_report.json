@@ -1,0 +1,86 @@
+{
+  "schema": 1,
+  "scope": "current_file_only",
+  "human_labels_used": false,
+  "acoustic_acceptance": "not_established",
+  "self_and_descendants_excluded": true,
+  "max_rounds": 3,
+  "seed_turn_count": 5,
+  "seed_vector_count": 5,
+  "baseline_accepted_turns": 6,
+  "rounds": [
+    {
+      "round": 1,
+      "used_vectors": 5,
+      "used_bank_sha256": "5c4a2cd9e7cb25a395f952a36fb2bf2d1a52feab74ea2bbdb25cf7ecfe576177",
+      "new_accepted_turns": 1,
+      "accepted_turns": 7,
+      "saved_vectors": 6
+    },
+    {
+      "round": 2,
+      "used_vectors": 6,
+      "used_bank_sha256": "fdc7ef2e24c7f89f4b6c1fbbf7d9f8abcb992938002cb15e20fdc8fff57e3e91",
+      "new_accepted_turns": 0,
+      "accepted_turns": 7,
+      "saved_vectors": 6
+    }
+  ],
+  "thresholds": {
+    "target_score": 0.75,
+    "target_margin": 0.15,
+    "local_margin": 0.06,
+    "primary_floor": 0.5814926421147089,
+    "secondary_floor": 0.5071202510380888
+  },
+  "identity": {
+    "encoding_version": "fe7602640054f36512edc57596485b9ecab958470adf44c434b4eb1171d47743",
+    "models": [
+      "4f5a0bf73c61eb41b174e1bb54e7ee3c83233892be8e0af1f187024e8e581a35",
+      "5b1a88b6f8d85826fabef804779c3372b42f3af21457fa48bd5c097c0686b2de"
+    ],
+    "references": [
+      "59861dd63417cf1de0d043adab0ec78cee98630efa78a54080645a4cf6e80cbe",
+      "919b2b7a7c0e4d1f75a66417cfca5676168755880cfa5594f9d49e8edaa254e9",
+      "a5d53acbee2822378ab952d65d6d96254f6d7dc29fb99cd7bce859824de778e7",
+      "af40a329035f04dddf2502cf100988b9e25361266d5c6c58ab4819faadac1fff",
+      "e7e67033837c19914910a1d101c44ab7081fae72073edcc85b1445b07150b416",
+      "edd006f9c5d701871a84a11a4a85f7e94dccb72eb043ae25a6c6c37018d51d7c"
+    ],
+    "negative_groups": [
+      [
+        "12b31cd6997f3d1cac2a090cd78a2fa2fc030ac1943c11fa7542c5180445705a"
+      ],
+      [
+        "40d5385aa8f4f6a713d5b45870e012f1166dda0d81e7d3b4e58065270cdb1499"
+      ],
+      [
+        "51656dc6ad7b655358869e2ad532e20414a09cb5bb8e2a46e7b8fff6635de9ae"
+      ],
+      [
+        "70bb7c4f2f21d8687f05f452ee1ed91a0c40c1b3989d0c1705be9914b406bfb3"
+      ],
+      [
+        "8104fbd5936c20464d8a98ca9d44816c94b6ee9d920ffd3c0b163f32fe9df9d1"
+      ]
+    ]
+  },
+  "source_sha256": "106d9ea00c47572a191768ac7f24a1d3ac05b42b4e6e0e7cf727b11476ffd381",
+  "qualification": {
+    "qualified": true,
+    "original_reference_scores": [
+      0.8841056412951526,
+      0.8895647834992708
+    ],
+    "original_reference_margins": [
+      0.15258700138977932,
+      0.30295692230213245
+    ]
+  },
+  "status": "converged_no_new_turns",
+  "bank": "bank_round_02.npz",
+  "bank_sha256": "e956a174379d6e86387a330886efa11a8f7e80e14a63ef348bbbf58c646fd215",
+  "final_accepted_turns": 7,
+  "vector_count": 6,
+  "added_turns": 1
+}

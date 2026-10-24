@@ -42,6 +42,17 @@ def main() -> int:
         ]
         options_data = request.get("options", {})
         options = PipelineOptions(
+            cluster_identity_mode=str(options_data.get("cluster_identity_mode",
+                "enforce" if options_data.get("cluster_bootstrap", False) else "audit")),
+            cluster_bootstrap=bool(options_data.get("cluster_bootstrap", False)),
+            cluster_bootstrap_max_rounds=options_data.get("cluster_bootstrap_max_rounds", 3),
+            cluster_target_margin=float(options_data.get("cluster_target_margin", .06)),
+            cluster_keep_narration=bool(options_data.get("cluster_keep_narration", True)),
+            cluster_embedding_cache=bool(options_data.get("cluster_embedding_cache", True)),
+            cluster_require_dominant=bool(options_data.get("cluster_require_dominant", False)),
+            cluster_wavlm_channel=bool(options_data.get("cluster_wavlm_channel", True)),
+            cluster_wespeaker_arbitration=bool(options_data.get("cluster_wespeaker_arbitration", True)),
+            cluster_raw_crosscheck=bool(options_data.get("cluster_raw_crosscheck", True)),
             speaker_threshold=float(options_data.get("speaker_threshold", 0.68)),
             silence_min_seconds=float(options_data.get("silence_min_seconds", 0.20)),
             silence_split_seconds=float(options_data.get("silence_max_seconds", 0.85)),

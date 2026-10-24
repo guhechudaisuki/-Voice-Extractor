@@ -1,0 +1,47 @@
+{
+  "schema": 1,
+  "scope": "current_file_only",
+  "human_labels_used": false,
+  "acoustic_acceptance": "not_established",
+  "self_and_descendants_excluded": true,
+  "max_rounds": 3,
+  "seed_turn_count": 0,
+  "seed_vector_count": 0,
+  "baseline_accepted_turns": 0,
+  "rounds": [],
+  "thresholds": {
+    "target_score": 0.75,
+    "target_margin": 0.15,
+    "local_margin": 0.06,
+    "primary_floor": 0.68,
+    "secondary_floor": 0.64
+  },
+  "identity": {
+    "encoding_version": "fe7602640054f36512edc57596485b9ecab958470adf44c434b4eb1171d47743",
+    "models": [
+      "4f5a0bf73c61eb41b174e1bb54e7ee3c83233892be8e0af1f187024e8e581a35",
+      "5b1a88b6f8d85826fabef804779c3372b42f3af21457fa48bd5c097c0686b2de"
+    ],
+    "references": [
+      "59861dd63417cf1de0d043adab0ec78cee98630efa78a54080645a4cf6e80cbe"
+    ],
+    "negative_groups": []
+  },
+  "source_sha256": "106d9ea00c47572a191768ac7f24a1d3ac05b42b4e6e0e7cf727b11476ffd381",
+  "qualification": {
+    "qualified": false,
+    "original_reference_scores": [
+      0.6957539101152326,
+      0.7303606576803667
+    ],
+    "original_reference_margins": [
+      1.6957539101152326,
+      1.7303606576803667
+    ]
+  },
+  "status": "no_eligible_evidence",
+  "bank": null,
+  "final_accepted_turns": 0,
+  "vector_count": 0,
+  "added_turns": 0
+}
