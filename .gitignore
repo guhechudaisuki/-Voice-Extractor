@@ -82,6 +82,8 @@ Thumbs.db
 # Local agent/tool state
 .serena/
 voice_extractor_settings.json
+# Local development instructions, prompts, and handoff notes
+/docs/
 
 # === v3.0: 只保留可运行程序，不提交素材/证据/日志/构建产物 ===
 docs/*.json
