@@ -4980,7 +4980,7 @@ class ExtractionPipeline:
             target_duration = pad_for_separator(target_for_separator)
 
             # Stage 22：UVR/VAD/歌声 内容寻址持久化缓存检查
-            from .features import file_digest as _fd
+            from .model_store import file_sha256 as _fd
             _src_sha = _fd(target_for_separator)
             _mc_dir = media_cache_dir(_src_sha, self.options.singing_threshold,
                                       self.options.use_singing_detector,
