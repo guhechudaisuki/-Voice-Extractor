@@ -18,7 +18,9 @@ class AcousticQCTests(unittest.TestCase):
     def test_clean_speech_is_gold_or_silver(self):
         sr = 16000
         t = np.linspace(0, 3.0, sr * 3, dtype=np.float32)
-        wave = 0.5 * np.sin(2 * np.pi * 220 * t)
+        # 模拟语音包络：载波 × 语音包络（有高低起伏 → SNR > 0）
+        envelope = 0.4 * (1 + np.sin(2 * np.pi * 3 * t))  # 3Hz 调制
+        wave = (envelope * np.sin(2 * np.pi * 220 * t)).astype(np.float32)
         qc = evaluate_clip_acoustics(wave, sr, speaker_score=0.8, window_min=0.7)
         self.assertIn(qc["quality_grade"], ("Gold", "Silver"))
         self.assertGreater(qc["snr_db"], 10.0)
