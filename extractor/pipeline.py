@@ -42,6 +42,8 @@ from .speaker import (
     SpeakerProfile,
 )
 from .transcription import FunASRTools, WhisperSegmenter
+from .media_cache import (media_cache_hit, media_cache_dir,
+                           save_media_cache, load_media_cache)
 from .subtitles import SubtitleGuide, discover_subtitle_for_target, validate_subtitle_bindings
 from .subtitle_assistance import (
     restore_subtitle_sentences, retry_subtitle_vad, split_at_subtitle_pauses,
@@ -4977,8 +4979,33 @@ class ExtractionPipeline:
             self._trace_spans("pre_uvr_singing_mask", pre_singing_spans)
             target_duration = pad_for_separator(target_for_separator)
 
-            progress(0.16, "提取参考与目标人声：准备 UVR 分块")
-            separator = UVR5Separator(self.device)
+            # Stage 22：UVR/VAD/歌声 内容寻址持久化缓存检查
+            from .features import file_digest as _fd
+            _src_sha = _fd(target_for_separator)
+            _mc_dir = media_cache_dir(_src_sha, self.options.singing_threshold,
+                                      self.options.use_singing_detector,
+                                      self.options.use_overlap_detector)
+            _mc_hit = media_cache_hit(_src_sha, self.options.singing_threshold,
+                                      self.options.use_singing_detector,
+                                      self.options.use_overlap_detector)
+            if _mc_hit is not None:
+                progress(0.16, "UVR 缓存命中！跳过分离/歌声/VAD 前处理（同一集已处理过）")
+                cached_stem = _mc_hit / "target_vocals.wav"
+                stem_path = paths["stems"] / "target_vocals.wav"
+                paths["stems"].mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(cached_stem, stem_path)
+                _mc_data = load_media_cache(_mc_hit)
+                self._media_cache_data = _mc_data
+                self._media_cache_hit = True
+            else:
+                self._media_cache_hit = False
+                self._media_cache_dir = _mc_dir
+                self._media_cache_src_sha = _src_sha
+            if not getattr(self, '_media_cache_hit', False):
+                pass  # 正常执行 UVR
+            if not getattr(self, '_media_cache_hit', False):
+                progress(0.16, "提取参考与目标人声：准备 UVR 分块")
+                separator = UVR5Separator(self.device)
             reference_precleaned_stems: dict[int, Path] = {}
             separation_items = []
             paths["reference_stems"].mkdir(parents=True, exist_ok=True)
@@ -5052,8 +5079,12 @@ class ExtractionPipeline:
                 negative_stem_groups.append(group_stems)
             trim_audio_in_place(stem, target_duration)
 
-            progress(0.40, "UVR 完成：按每一段静音检测最小讲话片段")
-            vad_tools = FunASRTools(self.device)
+            if getattr(self, '_media_cache_hit', False):
+                progress(0.40, "VAD 缓存命中")
+                vad_tools = FunASRTools(self.device)
+            else:
+                progress(0.40, "UVR 完成：按每一段静音检测最小讲话片段")
+                vad_tools = FunASRTools(self.device)
             # Run original-channel VAD on the same 16 kHz mono timeline used
             # by the independent scene adapter. Direct VAD on the 44.1 kHz
             # stereo source can conceal short internal pauses.
