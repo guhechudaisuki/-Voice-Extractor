@@ -251,10 +251,18 @@ def apply_cluster_gate(accepted, rejected, turns, result, *, mode, min_seconds=1
     # 合并后即可成为完整 Tier A 产出。
     merged_accepted_spans: list[list[float]] = []
     merged_constituents: list[list[tuple[float, float]]] = []
+    target_ids = set(result.target_cluster_ids) or (
+        {result.target_cluster_id} if result.target_cluster_id is not None else set())
+    non_target_turns = [
+        t for t in turns
+        if result.cluster_of[t.index] not in target_ids and result.cluster_of[t.index] != -1
+    ]
     for span_a, span_b in sorted(accepted_spans):
-        if (merged_accepted_spans and span_a - merged_accepted_spans[-1][1] <= 0.35
+        if (merged_accepted_spans and span_a - merged_accepted_spans[-1][1] <= 0.55
                 and not any(min(span_a, mark[1]) - max(merged_accepted_spans[-1][1], mark[0]) > 0.02
-                            for mark in blocked_spans)):
+                            for mark in blocked_spans)
+                and not any(min(span_a, nt.end) - max(merged_accepted_spans[-1][1], nt.start) > 0.02
+                            for nt in non_target_turns)):
             merged_accepted_spans[-1][1] = max(merged_accepted_spans[-1][1], span_b)
             merged_constituents[-1].append((span_a, span_b))
             continue
@@ -516,6 +524,18 @@ def apply_cluster_gate(accepted, rejected, turns, result, *, mode, min_seconds=1
             accepted.sort(key=lambda c: (c.start, c.end))
     refined_b = sum(
         1 for c in borderline if c.diagnostics.get("cluster_tier") == "B")
+    # Stage 21：四模型自适应校准融合打分器
+    for c in [*accepted, *rejected, *borderline]:
+        if not hasattr(c, 'diagnostics') or not isinstance(c.diagnostics, dict):
+            continue
+        p_sc = float(getattr(c, "speaker_score", 0.0) or 0.0)
+        s_sc = float(c.diagnostics.get("camplus_score") or 0.0)
+        w_sc = float(c.diagnostics.get("wavlm_score") or 0.0)
+        floors = result.diagnostics.get("profile_floors") or {}
+        p_n = (p_sc - floors.get("primary", 0.58)) / max(0.15, 1.0 - floors.get("primary", 0.58))
+        s_n = (s_sc - floors.get("secondary", 0.51)) / max(0.15, 1.0 - floors.get("secondary", 0.51))
+        fusion = 0.4 * max(0.0, min(1.0, p_n)) + 0.3 * max(0.0, min(1.0, s_n)) + 0.3 * max(0.0, min(1.0, w_sc))
+        c.diagnostics["calibrated_fusion_score"] = round(fusion, 4)
     return {"removed": len(removed), "promoted": len(promoted),
             "cropped": len(cropped), "borderline": refined_b,
             "synthesized": sum(1 for c in accepted

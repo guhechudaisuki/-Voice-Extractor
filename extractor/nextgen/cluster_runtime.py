@@ -115,7 +115,8 @@ class ClusterAnalyzer:
             self.quaternary_centroid = _torch.nn.functional.normalize(
                 ref_embeddings.mean(dim=0), dim=0)
             self_scores = ref_embeddings @ self.quaternary_centroid
-            self.quaternary_floor = float(max(0.60, self_scores.min().item() - 0.05))
+            # 上限封顶 0.66：防止同质化平静参考把自评分顶到 0.78+ 从而误杀同角色的情绪/对话句
+            self.quaternary_floor = float(min(0.66, max(0.58, self_scores.min().item() - 0.06)))
         # ── 双轨（Stem+Raw）边缘复核 ──────────────────────────
         # UVR 剥 BGM 常把轻声齿音/尾音当乐器抹掉，导致真目标在分离轨上掉分。
         # 对分离轨副通道贴线的边缘轮次，用时间对齐的原轨嵌入交叉复核：
@@ -197,6 +198,14 @@ class ClusterAnalyzer:
         for candidate in list(accepted):
             if not any(candidate.diagnostics.get(key) for key in RESCUE_KEYS):
                 continue
+            # 若候选在主/副双通道上均显著高于参考下限（无争议强匹配），豁免 WeSpeaker 降级
+            profile = getattr(self, "profile", None)
+            if profile is not None:
+                p_sc = float(getattr(candidate, "speaker_score", 0.0) or 0.0)
+                s_sc = float(candidate.diagnostics.get("camplus_score") or 0.0)
+                if (p_sc >= profile.primary_reference_floor + 0.12
+                        and s_sc >= profile.secondary_reference_floor + 0.10):
+                    continue
             score = self.wespeaker_score(candidate.start, candidate.end)
             if score is None or score >= self.quaternary_floor:
                 continue
@@ -504,6 +513,14 @@ class ClusterAnalyzer:
                     or (cm_p >= 0.0 and cm_s >= WINDOW_COHORT_STRONG)
                     or cm_p >= WINDOW_COHORT_STRONG + 0.045)
 
+        def analyzer_self_embed(a, b):
+            p_e, s_e = self.embed(a, b)
+            p_prof = profile_score(unit(p_e), self.profile.primary_centroid,
+                                   self.profile.primary_references)
+            s_prof = profile_score(unit(s_e), self.profile.secondary_centroid,
+                                   self.profile.secondary_references)
+            return p_prof, s_prof
+
         def turn_cohort_margin(turn):
             """轮次整体对目标簇联盟的竞争余量；无非目标簇时返回 +inf。"""
             if not non_union:
@@ -554,8 +571,12 @@ class ClusterAnalyzer:
                             and s_prof >= profile.secondary_reference_floor - .10):
                         profile_ok = True
                 score, negative = self.scores(p, s, profile)
+                # Stage 18 双通道互补排除余量：允许主通道极强时副通道贴线（容差 0.03），
+                # 防止混合排除组（如含目标自身背景音的杂谈簇）因副通道微差 0.01 一票否决真目标。
                 margins_ok = all(
-                    score[0] - n[1] >= margin and score[1] - n[2] >= margin
+                    (score[0] - n[1] >= margin and score[1] - n[2] >= margin)
+                    or (score[0] - n[1] >= margin + 0.06 and score[1] - n[2] >= margin - 0.01)
+                    or (score[0] - n[1] >= margin - 0.01 and score[1] - n[2] >= margin + 0.06)
                     for n in negative)
                 return bool(profile_ok and margins_ok and cohort_ok(p, s)), score
 
@@ -657,27 +678,53 @@ class ClusterAnalyzer:
                     cross_rescued.append(turn.index)
             clean = extract_spans(turn, rows)
             if clean and turn.duration <= SHORT_TURN_SECONDS:
-                # 短句 + 副通道贴近下限（或竞争余量弱 / 窗口部分未过）：
-                # 证据不足以进主输出（Tier A），降入 Tier B 边缘池待人工
-                # 捡漏/多通道仲裁。
+                # Stage 17：日常对话台词常在 1.2s~2.9s 之间。若短句具备以下任一强目标证据，
+                # 则豁免短句降级，保留其 clean 区间进入 Tier A。
                 turn_scores, _ = self.scores(turn.primary, turn.secondary)
+                p_slack = turn_scores[0] - self.profile.primary_reference_floor
                 slack = turn_scores[1] - self.profile.secondary_reference_floor
                 partial_windows = any(
                     span != [turn.start, turn.end] for span in clean)
-                if (slack < WEAK_SECONDARY_SLACK / 2
+                t_score = self.tertiary_score(turn)
+                t_strong = (t_score is not None
+                            and t_score >= self.profile.tertiary_reference_floor + 0.03
+                            and slack >= -0.02)
+                accepted_rows = [r for r in rows if r.get("accepted")]
+                cm_s_strong = bool(accepted_rows) and all(
+                    isinstance(r.get("cm_s"), (int, float)) and r["cm_s"] >= 0.25
+                    and isinstance(r.get("cm_p"), (int, float)) and r["cm_p"] >= 0.12
+                    for r in accepted_rows)
+                # Stage 17 豁免前先过局部分类器否决：高相似负例短句只有
+                # 局部分类器能区分，其他通道都会给高分。
+                strong_short_dialogue = (
+                    p_slack >= 0.12 and cm_s_strong and t_strong
+                )
+                if not strong_short_dialogue and (
+                        slack < WEAK_SECONDARY_SLACK / 2
                         or (slack < WEAK_SECONDARY_SLACK
                             and (turn_cohort_margin(turn) < WINDOW_COHORT_PRIMARY
                                  or partial_windows))):
                     borderline[turn.index] = True
                     demoted.append(turn.index)
                     clean = []
-                    # 降级后该轮窗口不得再为候选句作 Tier A 证明。
                     for row in rows:
                         row["accepted"] = False
                         row["demoted"] = True
             if not clean:
                 # 簇级会员但全部窗口未过：不直接丢弃，进 Tier B 待试听。
                 borderline[turn.index] = True
+            elif clean and len(clean) == 1 and turn.duration <= SHORT_TURN_SECONDS + 1.5:
+                # Stage 19：边界窗口精细剥离——当轮次仅提取出 1 个高分 1.8s 干净
+                # 子段且其双通道分数 >= floor + 0.06 时，保留该干净核心段不被
+                # partial_windows 降级逻辑抹杀（脏的那半秒已经在 extract_spans 里切掉了）。
+                core_span = clean[0]
+                core_a, core_b = core_span
+                core_p, core_s = analyzer_self_embed(core_a, core_b)
+                if (core_p >= self.profile.primary_reference_floor + 0.06
+                        and core_s >= self.profile.secondary_reference_floor + 0.04):
+                    pass  # 干净核心段有效，保留 clean 不降级
+                else:
+                    borderline[turn.index] = True
             turn_clean_spans[key] = clean
             membership[turn.index] = bool(clean)
             local[key] = rows
