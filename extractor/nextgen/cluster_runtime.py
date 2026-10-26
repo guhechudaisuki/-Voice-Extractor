@@ -246,7 +246,24 @@ class ClusterAnalyzer:
             raise ValueError("Cluster analysis requires target references")
         vectors = [self._file_embedding(p) for p in self.references]
         p, s = [np.stack([v[channel] for v in vectors]) for channel in (0, 1)]
-        pc, sc = unit(p.mean(axis=0)), unit(s.mean(axis=0))
+        p_unit = np.stack([unit(row) for row in p])
+        s_unit = np.stack([unit(row) for row in s])
+        keep_mask = np.ones(len(self.references), dtype=bool)
+        if len(self.references) >= 3:
+            # Stage 24.1 毒丸参考剔除：Leave-One-Out 一致性检查
+            sim_matrix = p_unit @ p_unit.T
+            medians = np.array([
+                np.median(np.delete(sim_matrix[i], i)) for i in range(len(self.references))
+            ])
+            best_med = float(medians.max())
+            if best_med >= 0.55:
+                valid = medians >= max(0.42, best_med - 0.22)
+                if int(valid.sum()) >= 2:
+                    keep_mask = valid
+        p_clean, s_clean = p[keep_mask], s[keep_mask]
+        pc, sc = unit(p_clean.mean(axis=0)), unit(s_clean.mean(axis=0))
+        self.purified_reference_indexes = tuple(
+            int(i) for i, ok in enumerate(keep_mask) if ok)
         profile = TargetProfile(
             pc, sc,
             float(np.clip(np.quantile(p @ pc, 0.10) - 0.22, 0.52, 0.68)),
