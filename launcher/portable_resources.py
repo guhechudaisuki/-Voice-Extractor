@@ -11,7 +11,7 @@ import tempfile
 import urllib.request
 import zipfile
 
-from launcher.release_manifest import RESOURCE_SHA256, RESOURCE_URL
+from launcher.release_manifest import REQUIRED_MODEL_FILES, RESOURCE_SHA256, RESOURCE_URL
 
 
 def portable_environment(root: Path) -> dict[str, str]:
@@ -111,9 +111,57 @@ def program_ready(resource: Path) -> bool:
     try:
         marker = json.loads((resource / 'program_manifest.json').read_text(encoding='utf-8'))
         return (marker.get('sha256') == RESOURCE_SHA256 and bool(RESOURCE_SHA256)
+                and all((resource / file).is_file() for file in REQUIRED_MODEL_FILES)
                 and all((resource / file).is_file() for file in marker['files']))
     except (OSError, ValueError, KeyError, TypeError):
         return False
+
+
+def copy_if_missing(source: Path, destination: Path) -> bool:
+    """Copy a supplied file without replacing any existing installation file."""
+    if destination.exists() or destination.is_symlink():
+        return False
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with source.open('rb') as incoming:
+        try:
+            outgoing = destination.open('xb')
+        except FileExistsError:
+            return False
+        try:
+            with outgoing:
+                shutil.copyfileobj(incoming, outgoing)
+        except BaseException:
+            destination.unlink(missing_ok=True)
+            raise
+    return True
+
+
+def ensure_source_dependencies(root: Path, reporter) -> None:
+    """Install missing tools/backends while keeping the current source and models."""
+    if not RESOURCE_SHA256:
+        raise RuntimeError('缺少运行文件校验清单，请下载完整发布版本')
+    resource = (root / 'resource').resolve()
+    resource.mkdir(parents=True, exist_ok=True)
+    required = ('tools/ffmpeg.exe', 'tools/ffprobe.exe', 'dependencies/uvr5/vr.py',
+                'dependencies/eres2net/ERes2NetV2.py')
+    with tempfile.TemporaryDirectory(prefix='dependencies_', dir=resource) as directory:
+        temporary = Path(directory)
+        archive = temporary / 'program.zip'
+        download(RESOURCE_URL, archive, reporter, RESOURCE_SHA256)
+        unpacked = temporary / 'unpacked'
+        extract_checked(archive, unpacked)
+        if not all((unpacked / name).is_file() for name in required):
+            raise RuntimeError('运行文件缺少 FFmpeg 或 UVR/ERes2Net 后端')
+        for source in unpacked.rglob('*'):
+            if not source.is_file():
+                continue
+            relative = source.relative_to(unpacked)
+            if relative.parts[0] != 'dependencies' and relative.as_posix() not in required[:2]:
+                continue
+            destination = resource / relative
+            if not destination.resolve().is_relative_to(resource):
+                raise RuntimeError('依赖安装路径超出资源目录')
+            copy_if_missing(source, destination)
 
 
 def ensure_program_files(root: Path, reporter) -> Path:
@@ -133,7 +181,7 @@ def ensure_program_files(root: Path, reporter) -> Path:
             extract_checked(archive, staged)
             required = ('desktop_worker.py', 'extractor/pipeline.py', 'launcher/model_reinforcement.py',
                         'tools/ffmpeg.exe', 'tools/ffprobe.exe', 'dependencies/uvr5/vr.py',
-                        'dependencies/eres2net/ERes2NetV2.py')
+                        'dependencies/eres2net/ERes2NetV2.py', *REQUIRED_MODEL_FILES)
             if not all((staged / name).is_file() for name in required):
                 raise RuntimeError('运行文件不完整，请重新下载发布版本')
             files = []

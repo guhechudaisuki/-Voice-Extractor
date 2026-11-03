@@ -15,11 +15,7 @@ def run_scene(scene: PreparedScene, session: IdentitySession,
               encoder: WavLMSpeakerFeatures, *,
               cancelled: Callable[[], bool] = lambda: False,
               progress: Callable[[int, int, str], None] = lambda *args: None) -> EngineResult:
-    """Run only with a matching fingerprinted model/calibration session.
-
-    There is intentionally no random/default model or old-score stand-in.
-    Calling code must have loaded a validated bundle and encoded references.
-    """
+    """Run a prepared scene with validated weights, calibration and encoded references."""
     if encoder.digest != session.card.backbone_digest:
         raise ValueError("Scene encoder does not match the identity model")
     if not scene.candidates:

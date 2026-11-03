@@ -1,10 +1,4 @@
-"""Local-only, frozen WavLM speaker TDNN features before statistics pooling.
-
-Frame cells describe decision sampling, not identity accuracy. The TDNN's
-convolution support is wider; transformer attention also sees the entire input
-context. Edges without cells remain missing evidence, never repeated/padded
-scores. No third-party module is modified and no downloads are initiated.
-"""
+"""Extract frozen WavLM TDNN features with explicit frame cells and input context."""
 from __future__ import annotations
 
 from dataclasses import dataclass

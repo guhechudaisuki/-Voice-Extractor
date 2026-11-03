@@ -1,9 +1,4 @@
-"""Convert verified preprocessing events into one source-timeline scene.
-
-This module is deliberately independent of the desktop pipeline. Singing must
-have been checked before separation. Subtitle text never reaches identity or
-STT; aligned cue times may only request another acoustic VAD pass upstream.
-"""
+"""Map preprocessing events and acoustic proposals onto the source timeline."""
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
@@ -82,8 +77,7 @@ class PreparedScene:
         if (candidate.source_sha256 != self.audio.source.source_sha256
                 or candidate.sample_rate != self.audio.source.sample_rate):
             raise ValueError("Change proposal belongs to another source")
-        # A subtitle edge is never itself a cut. The independent dual-VAD and
-        # waveform check must find a real pause inside this candidate.
+        # Subtitle times request a pause check; VAD and waveform evidence set the cut.
         return find_confirmed_gaps(
             candidate, _within(self.raw_voice, candidate.context),
             _within(self.stem_voice, candidate.context), self.audio,
@@ -99,13 +93,7 @@ def make_scene(audio: PairedAudio, *, raw_voice: tuple[SampleSpan, ...],
                silence: SilenceRange | None = None,
                maximum_samples: int = 16 * 16000,
                context_samples: int = 6000) -> PreparedScene:
-    """Build a recall-oriented lattice; this does not accept any voice.
-
-    Stem VAD is primary, but raw-only speech gets an independent proposal so
-    UVR damage cannot erase it before identity review. Hard singing/overlap
-    masks are never converted into a joinable silence gap. All final decisions
-    still require a calibrated identity session and endpoint review.
-    """
+    """Build stem and raw speech proposals while preserving singing and overlap masks."""
     if audio.source.sample_rate != 16000:
         raise ValueError("Prepared scene needs the verified 16 kHz source timeline")
     silence = silence or SilenceRange(3200, 13600)
@@ -114,8 +102,7 @@ def make_scene(audio: PairedAudio, *, raw_voice: tuple[SampleSpan, ...],
     subtitle_hints = _ordered(subtitle_hints, audio)
     if type(maximum_samples) is not int or maximum_samples < 1:
         raise ValueError("Invalid maximum candidate duration")
-    # The unpooled TDNN has a wide receptive field. Enough real surrounding
-    # audio is required for every output sample to receive model evidence.
+    # Supply real context for the TDNN's full receptive field.
     if type(context_samples) is not int or context_samples < 4000:
         raise ValueError("Candidate context must contain real TDNN edge support")
     blocked = _ordered((*singing, *overlap), audio)
@@ -129,8 +116,7 @@ def make_scene(audio: PairedAudio, *, raw_voice: tuple[SampleSpan, ...],
             blocked=blocked,
         )
         for item in proposed:
-            # Keep stem provenance when both views propose exactly the same
-            # audio; otherwise raw-only alternatives remain available.
+            # Prefer stem provenance for duplicate spans; retain raw-only alternatives.
             key = item.output, item.speech
             if key in candidates:
                 previous = candidates[key]
@@ -143,8 +129,7 @@ def make_scene(audio: PairedAudio, *, raw_voice: tuple[SampleSpan, ...],
                         origin=previous.origin + "+cross_view_boundary_conflict",
                     )
                 continue
-            # Aligned subtitle time is provenance for a VAD-created
-            # proposal, never a speaker label or an acoustic cut.
+            # Cue times record proposal provenance without supplying identity labels.
             hinted = any((part := item.output.intersection(hint)) is not None
                          and part.length >= min(3200, item.output.length // 4)
                          for hint in subtitle_hints)

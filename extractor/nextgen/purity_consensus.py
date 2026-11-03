@@ -1,10 +1,4 @@
-"""Conservative, reference-conditioned local identity conflict rules.
-
-The rules produce an *abstain* signal, never a positive identity certificate.
-They require independent evidence from the production verifier and the frozen
-anime character/voice-actor encoders; a high parent score cannot clear a
-short embedded speech island. No episode-specific labels or times are used.
-"""
+"""Combine independent local identity conflicts into abstention decisions."""
 
 from __future__ import annotations
 
@@ -25,19 +19,13 @@ def local_other_witnesses(
     domain_margins: Mapping[str, object],
     production_exclusion: Mapping[str, object],
 ) -> tuple[str, ...]:
-    """Return independent reasons to withhold a locally mixed parent.
-
-    The production exclusion requires user-supplied negative examples. Missing
-    or contradictory evidence returns no witness, not a target verdict.
-    """
+    """Return local conflict witnesses; missing evidence leaves identity unresolved."""
     reasons = []
     if _all_views_prefer_other(domain_margins):
         if _negative(production_exclusion.get("excluded_primary_margin")):
             reasons.append("domain_all_four_and_production_primary_negative")
         elif production_exclusion.get("excluded_role_rejected") is True:
-            # The production exclusion decision combines multiple model and
-            # channel votes. A single positive component margin does not
-            # invalidate its explicit rejection of this local speech island.
+            # A single positive component cannot override a joint exclusion verdict.
             reasons.append("domain_all_four_and_production_exclusion_rejected")
     return tuple(reasons)
 
@@ -47,19 +35,16 @@ def whole_identity_conflict(
     alternate_margins: Mapping[str, object],
     production_primary_direct_margin: float | None,
 ) -> bool:
-    """Abstain on unstable character-stem sign plus a production near tie.
-
-    0.02 is the existing production exclusion tie tolerance, not a tuned
-    target-similarity threshold. The same query is decoded by two legitimate
-    resampling paths; a changed sign is uncertainty, not another-person proof.
-    """
+    """Abstain on an unstable character score near the production exclusion tie."""
     if production_primary_direct_margin is None:
         return False
     exact = domain_margins.get("char_stem")
     alternate = alternate_margins.get("char_stem")
-    if exact is None or alternate is None:
+    va_stem = domain_margins.get("va_stem")
+    if exact is None or alternate is None or va_stem is None:
         return False
-    return (production_primary_direct_margin <= 0.02
+    return (production_primary_direct_margin <= 0.01
+            and float(va_stem) <= 0.02
             and _negative(exact) != _negative(alternate))
 
 

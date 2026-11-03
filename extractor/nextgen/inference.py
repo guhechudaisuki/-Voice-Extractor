@@ -110,8 +110,7 @@ class IdentitySession:
         for i, cell in enumerate(raw.cells):
             if cell.intersection(reviewed.output) is None:
                 continue
-            # Includes VAD-negative internal gaps: a short unknown voice cannot
-            # disappear merely because the initial VAD missed it.
+            # Include internal gaps where VAD may have missed another voice.
             risks = ((EvidenceKind.SINGING, column["singing"][i] >= self.calibration.singing_max),
                      (EvidenceKind.OVERLAP, column["overlap"][i] >= self.calibration.overlap_max),
                      (EvidenceKind.UNCERTAIN, column["change"][i] >= self.calibration.change_min),

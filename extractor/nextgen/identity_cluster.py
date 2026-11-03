@@ -1,26 +1,4 @@
-"""整集说话轮次的簇级身份判决。
-
-现有流程按单个片段判决身份：拿一段音频对参考集算相似度、比阈值、过。单段
-相似度的方差很大，0.4 秒的短句和 3 秒的完整句即使同一人分数也差得远，换一集
-录音条件变了分数还会整体漂移。用一个高方差的量做逐段硬判决，阈值高一点就漏，
-低一点就进错人。
-
-本模块把判决粒度换成"人"：先把整集的说话轮次聚成若干簇（每个簇近似一个人），
-再用目标声纹去匹配**簇统计量**，最后整簇接受或整簇拒绝。一个不在排除集里的
-相似女声会自然形成自己的簇，只要它不是目标簇，它的每一段都被同一句话拒掉。
-
-为什么不用单链：真实嵌入上实测过，单链会一穿到底。第三集 254 个
-说话轮次的主通道两两余弦中位数是 0.369、1% 分位是 0.038，任意两人之间都存在
-足够高的边，于是哪怕阈值取到 0.50 也会把全部 254 个并成 1 个簇。单链的传递性
-对说话人嵌入是危险的：A 像 B、B 像 C 不代表 A 像 C。目前使用主通道平均连接，
-副通道最低配对相似度及排除角色约束否决合并；这不保证每个簇都是单一人物。
-
-设计约束：
-
-* 纯函数，无 IO、无模型、无全局状态 —— 因此可以被完整单测覆盖，不必跑整集。
-* 只用整数索引引用轮次，不用对象引用。调用方维持 index -> 对象 的映射。
-* ERes2NetV2 192 维决定亲和度，CAM++ 512 维提供独立否决。
-"""
+"""Cluster episode turns and select target speakers using independent channel evidence."""
 
 from __future__ import annotations
 
@@ -29,50 +7,85 @@ from typing import Literal, Sequence
 
 import numpy as np
 
+from .exclusion_reliability import margin_consensus
+
 Channel = Literal["primary", "secondary"]
 
-# 合并阈值。**主通道决定能否合并，副通道只做否决**。
-#
-# 实测（第三集 254 个轮次）：主通道两两余弦中位 0.369、99% 分位 0.769；
-# 副通道中位 0.177、99% 分位 0.694。副通道整体低一大截，如果要求"两通道都
-# 达标"，它就成了主要约束——同一人跨情绪、跨音量的轮次会因为它给分不够而
-# 拒绝合并，结果是 254 个轮次被碎成 60 个簇。一集动画没有 60 个说话人。
-#
-# 0.50 是第三集开发扫描的起点；簇数随锚点约束而变化，不能用簇数本身证明身份正确。
+
+def cohort_as_norm_z(vec: np.ndarray, target_centroids: Sequence[np.ndarray],
+                     impostor_centroids: Sequence[np.ndarray], top_k: int = 5) -> float | None:
+    """Return a probe-side cohort Z-score with a variance floor of .04."""
+    if type(top_k) is not int or top_k < 1:
+        raise ValueError("top_k must be a positive integer")
+    def normalized(value):
+        value = np.asarray(value, dtype=np.float64)
+        if value.ndim != 1 or not value.size or not np.isfinite(value).all():
+            raise ValueError("cohort embeddings must be finite non-empty vectors")
+        norm = float(np.linalg.norm(value))
+        if norm <= 1e-12:
+            raise ValueError("cohort embeddings must be non-zero")
+        return value / norm
+    probe = normalized(vec)
+    targets = [normalized(v) for v in target_centroids]
+    impostors = [normalized(v) for v in impostor_centroids]
+    if any(v.shape != probe.shape for v in [*targets, *impostors]):
+        raise ValueError("cohort embedding dimensions differ")
+    if not targets or not impostors:
+        return None
+    target = max(float(probe @ v) for v in targets)
+    cohort = np.sort([float(probe @ v) for v in impostors])[-top_k:]
+    return float((target - cohort.mean()) / max(float(cohort.std()), .04))
+
+
+def cohort_z_probability(z: float | None) -> float:
+    """Calibrated confidence, with neutral .5 for unavailable cohort evidence."""
+    if z is None:
+        return .5
+    if not np.isfinite(z):
+        raise ValueError("cohort z must be finite")
+    return float(1. / (1. + np.exp(-np.clip((z - 1.5) * 1.2, -30., 30.))))
+
+
+def cohort_as_norm_score(vec: np.ndarray, target_centroids: Sequence[np.ndarray],
+                        impostor_centroids: Sequence[np.ndarray], top_k: int = 5) -> float:
+    """Return sigmoid((z - 1.5) * 1.2); see cohort_as_norm_z for the Z-score."""
+    return cohort_z_probability(cohort_as_norm_z(vec, target_centroids, impostor_centroids, top_k))
+
+# Primary affinity drives clustering; the secondary channel can veto a merge.
 LINK_PRIMARY = 0.50
-# 副通道地板：低于此值视为强烈反对，禁止合并。取值明显低于副通道中位数
-# 相关的同人区间，只拦"两个模型都认为不像"的情况。
 SECONDARY_VETO_FLOOR = 0.05
 
-# 簇的最小规模。一集里的女性龙套可能只有一两句，把它们当成"人"没有意义，
-# 更可能是嵌入噪声。低于此规模的簇不参与目标簇竞争。
-MIN_CLUSTER_MEMBERS = 3
-MIN_CLUSTER_SPEECH_SECONDS = 6.0
+# Retained as API defaults; acoustic support, not sample count, qualifies a role.
+MIN_TARGET_CLUSTER_MEMBERS = 1
+MIN_CLUSTER_MEMBERS = MIN_TARGET_CLUSTER_MEMBERS
+MIN_CLUSTER_SPEECH_SECONDS = 0.0
 
-# 目标簇判定的余量下限：目标分数减去最强排除角色的分数。
-# 0.06 是开发集验证的起点，需结合双通道绝对下限及整轮局部一致性，不能单独作证。
+
+def eligible_competitor(cluster, turns):
+    """Target discovery is permissive; a rival needs independent speech support."""
+    if len(cluster.members) >= 2 and cluster.total_speech_seconds >= 2.5:
+        return True
+    members = set(cluster.members)
+    return any(t.index in members and t.anchor_role not in (None, 'target') for t in turns)
+
+# Target similarity must exceed the nearest excluded role by this margin.
 TARGET_MARGIN_FLOOR = 0.06
 
-# 簇内成员与目标分数的最大允许落差。超出者标记为离群并不输出。
-# 0.18 沿用 SpeakerVerifier.verify_waveform 里 p20 >= threshold - 0.18 的量级。
+# Member scores are compared with the cluster median and reference floors.
 CLUSTER_OUTLIER_DROP = 0.18
 
-# 簇内一致性下限。当前平均连接不保证最低成员的相似度，故需另外检查。
+# Average linkage needs a separate minimum-cohesion check.
 CLUSTER_COHESION_FLOOR = 0.30
 
-# ── 目标簇联盟（Target Cluster Union）─────────────────────
-# 同一角色在一集里常分裂成"日常 / 独白 / 情绪"多个声线子簇。质心亲和达到
-# 以下双通道阈值即视为同声线家族，直接并入目标簇集合，不再触发整集弃权。
+# Compatible voice registers can join the same target family.
 UNION_PRIMARY_AFFINITY = 0.72
 UNION_SECONDARY_AFFINITY = 0.70
-# 双通道对参考集同时强匹配的子簇即使与核心簇亲和略低也可并入，但仍需
-# 保持最低质心亲和——亲和过低说明是另一位说话人，参考分再高也不并。
+# Strong reference matches still need minimum cross-cluster affinity.
 UNION_REFERENCE_BONUS = 0.10
 UNION_MARGIN_BONUS = 0.04
 UNION_REFERENCE_PRIMARY_AFFINITY = 0.55
 UNION_REFERENCE_SECONDARY_AFFINITY = 0.50
-# 绝对强参考直达：参考分达到绝对高位（与真实参考下限尺度对齐）时豁免
-# 亲和度要求——同一角色的独白/情绪声线在嵌入空间可能漂得很远。
+# Absolute reference support can establish a distant voice register.
 UNION_STRONG_PRIMARY = 0.66
 UNION_STRONG_SECONDARY = 0.60
 # 与核心簇质心低于该亲和的达标簇是"另一位说话人"，仅在分数咬得很紧时仲裁。
@@ -80,8 +93,7 @@ RIVAL_PRIMARY_AFFINITY = 0.68
 RIVAL_SECONDARY_AFFINITY = 0.65
 RIVAL_SCORE_GAP = 0.015
 
-# Cohort AS-Norm：以本集非目标簇为天然冒认者队列。目标分数高出最强非目标
-# 簇至少该余量即视为具备竞争排他性。
+# Non-target clusters provide the episode cohort.
 COHORT_MARGIN_FLOOR = 0.01
 # 竞争守卫：主通道明显败给非目标簇且副通道也不占优 → 判为混入外人。
 COHORT_PRIMARY_GUARD = 0.01
@@ -141,6 +153,9 @@ class Cluster:
     secondary_target_margin: float = -1.0
     is_target: bool = False
     outliers: tuple[int, ...] = ()
+    posterior_primary: np.ndarray | None = None
+    posterior_secondary: np.ndarray | None = None
+    prior_weight: float = 0.
 
 
 @dataclass(frozen=True)
@@ -183,13 +198,21 @@ class TargetProfile:
     primary_reference_floor: float
     secondary_reference_floor: float
     source: str = "user_reference"
-    # 多原型参考：各段参考音频自身的单位向量 [M, D]。均值质心会把不同声线
-    # 参考中和成四不像，Top-K 原型匹配允许"极像某两段特定声线参考"的子簇。
+    # Unit reference rows preserve distinct voice registers.
     primary_references: np.ndarray | None = None
     secondary_references: np.ndarray | None = None
     # 可选第三通道（强化后的 WavLM）质心与准入下限。
     tertiary_centroid: np.ndarray | None = None
     tertiary_reference_floor: float = 0.72
+    quaternary_centroid: np.ndarray | None = None
+    quaternary_reference_floor: float = 0.58
+    anime_char_centroid: np.ndarray | None = None
+    anime_va_centroid: np.ndarray | None = None
+    anime_char_reference_floor: float = 0.45
+    anime_va_reference_floor: float = 0.35
+    anime_char_references: np.ndarray | None = None
+    anime_va_references: np.ndarray | None = None
+    tertiary_references: np.ndarray | None = None
 
 
 def _unit(vector: np.ndarray) -> np.ndarray:
@@ -225,11 +248,7 @@ def _unit_rows(matrix: np.ndarray | None) -> np.ndarray | None:
 
 def profile_score(vector: np.ndarray, centroid: np.ndarray,
                   references: np.ndarray | None = None) -> float:
-    """对目标参考集的多原型打分。
-
-    全局质心分会稀释特定声线子簇；与最匹配的 Top-2 参考原型的均值分取较大值
-    （带 0.02 折减防单参考噪声），两者哪个高算哪个。
-    """
+    """Use the stronger of centroid similarity and the discounted top-two reference mean."""
     u = _unit(vector)
     c_score = float(u @ _unit(centroid))
     rows = _unit_rows(references)
@@ -246,16 +265,7 @@ def trimmed_centroid(
     min_size: int = 10,
     drop_floor: float = 0.25,
 ) -> np.ndarray:
-    """算质心前先丢掉偏离最远的那一档成员。
-
-    一个簇里混进一两个"像目标但其实是别人"的段时，普通均值会把质心拖向他们；
-    质心一旦被拖走，后续所有成员的分都会下降，形成自证循环。参考集构建里用
-    leave-one-out 中位数解决同一个问题，这里用修剪均值。
-
-    修剪只在成员够多（min_size）时才做，而且只丢"确实偏离"的成员
-    （分数低于 drop_floor）。纯按分位数截断会把排在最末的正常成员也丢掉——
-    20 个成员的簇里固定丢 10% 就是丢 2 个好人。
-    """
+    """Trim low-affinity members from sufficiently large clusters before averaging."""
     matrix = np.asarray(vectors, dtype=np.float64)
     if matrix.ndim != 2 or matrix.shape[0] == 0:
         raise ValueError("质心需要二维非空矩阵")
@@ -276,6 +286,17 @@ def _exclusion_blocks(left: TurnEvidence, right: TurnEvidence) -> bool:
             and left.anchor_role != right.anchor_role)
 
 
+def reference_posterior(centroid, reference, speech_seconds, members, prior_seconds=6.):
+    """vMF mean direction with a finite reference pseudo-count.
+
+    Call only after qualification on unshrunk acoustic evidence. Cap per-turn
+    mass so one long, possibly mixed sentence cannot overwhelm the prior.
+    """
+    mass = min(max(0., speech_seconds), max(0, members) * 3.)
+    weight = prior_seconds / (prior_seconds + mass)
+    return _unit(weight * _unit(reference) + (1. - weight) * _unit(centroid)), weight
+
+
 def agglomerative(
     primary: np.ndarray,
     secondary: np.ndarray,
@@ -284,19 +305,7 @@ def agglomerative(
     veto_floor: float,
     blocked: np.ndarray | None = None,
 ) -> list[list[int]]:
-    """平均连接的凝聚聚类：主通道决定合并，副通道只否决。
-
-    簇间亲和度用**平均连接**（所有成员对的平均）而不是完全连接。完全连接只由
-    "最远一对"决定，目标簇里混进一个情绪波动大的轮次就会把整个簇拆开——实测
-    254 个轮次被碎成 91 个簇。平均连接让多数成员投票，同时因为要求平均相似度
-    达标，不会像单链那样把不相似的人串起来。
-
-    副通道（CAM++）不参与"该不该合并"的判断，只在它强烈反对时禁止合并。它
-    整体给分比主通道低一大截（中位 0.177 对 0.369），若与主通道并列要求达标，
-    它会成为主要约束，导致同一人的轮次被拆开。
-
-    blocked 是形状 [n, n] 的禁止合并矩阵（排除角色闸门）。
-    """
+    """Average linkage with secondary-channel and symmetric identity constraints."""
     count = primary.shape[0]
     members: list[list[int]] = [[i] for i in range(count)]
     score = primary @ primary.T
@@ -358,10 +367,7 @@ def cluster_turns(
     min_speech_seconds: float = MIN_CLUSTER_SPEECH_SECONDS,
     cohesion_floor: float = CLUSTER_COHESION_FLOOR,
 ) -> tuple[Cluster, ...]:
-    """把一集的说话轮次聚成"人"。只做聚类，不做目标判定。
-
-    分离聚类与目标判定，是为了让"聚类好不好"和"目标选对没选对"能分别评估。
-    """
+    """Cluster usable turns without assigning a target identity."""
     usable = [turn for turn in turns if turn.usable]
     if not usable:
         return ()
@@ -429,6 +435,27 @@ def cluster_turns(
     )
 
 
+def historical_negative_matches_target(primary, secondary, profile):
+    """A previous task's negative may be this task's protagonist.
+
+    Explicit exclusions are unaffected. One matching reference view is enough
+    to abstain from using *historical* memory as a veto.
+    """
+    for vector, centroid, references, floor in (
+        (primary, profile.primary_centroid, profile.primary_references, profile.primary_reference_floor),
+        (secondary, profile.secondary_centroid, profile.secondary_references, profile.secondary_reference_floor)):
+        if vector is None:
+            continue
+        vector = _unit(vector)
+        refs = _unit_rows(references)
+        score = float(vector @ _unit(centroid))
+        if refs is not None and len(refs):
+            score = max(score, float(np.max(refs @ vector)))
+        if score >= floor:
+            return True
+    return False
+
+
 def assign_target(
     turns: Sequence[TurnEvidence],
     clusters: Sequence[Cluster],
@@ -437,23 +464,13 @@ def assign_target(
     exclusion_secondary_centroids: Sequence[tuple[str, np.ndarray]] = (),
     *,
     exclusion_scales: Sequence[float] | None = None,
+    exclusion_audit: dict | None = None,
+    exclusion_tertiary_centroids: Sequence[tuple[str, np.ndarray]] = (),
     margin_floor: float = TARGET_MARGIN_FLOOR,
     require_dominant: bool = True,
     outlier_drop: float = CLUSTER_OUTLIER_DROP,
 ) -> AssignResult:
-    """挑出目标簇联盟，并给出每个轮次的最终归属。
-
-    这是判决的唯一出口，方向是**双向**的：目标簇内的接受、簇外的拒绝，
-    包括那些已经被单段判决接受、但不属于目标簇的段。
-
-    与旧版的三个关键差别：
-    1. 同一角色的多个声线子簇（日常 / 独白 / 情绪）并入 ``target_cluster_ids``，
-       不再因"两个达标簇"而把整集弃权（旧 ``ambiguous_target_cluster`` 自杀）。
-    2. 簇内离群基准从 ``max(scores) - 0.18`` 改为**中位数基准 + 参考下限**，
-       情绪句、感叹词不再被一句贴近质心的标准音连坐。
-    3. 引入 Cohort AS-Norm：本集全部非目标簇是天然冒认者队列，轮次必须在
-       竞争余量上压过最强非目标簇才进核心成员，否则落入边缘池。
-    """
+    """Select compatible target clusters and retain borderline turns for local verification."""
     membership = [False] * len(turns)
     borderline = [False] * len(turns)
     if any(turn.index != position for position, turn in enumerate(turns)):
@@ -481,18 +498,29 @@ def assign_target(
     secondary_by_role = {
         role: _unit(centroid) for role, centroid in exclusion_secondary_centroids
     }
+    tertiary_by_role = {
+        role: _unit(centroid) for role, centroid in exclusion_tertiary_centroids
+    }
+    tertiary_by_cluster = {}
+    if profile.tertiary_centroid is not None and tertiary_by_role:
+        for cluster in clusters:
+            vectors = [turns[index].tertiary for index in cluster.members
+                       if turns[index].usable and turns[index].tertiary is not None]
+            if vectors:
+                tertiary_by_cluster[cluster.cluster_id] = _unit(_stack(vectors).mean(axis=0))
+    exclusion_decisions = {}
 
     scales = list(exclusion_scales) if exclusion_scales is not None else [1.0] * len(exclusion_centroids)
     if len(scales) != len(exclusion_centroids):
         raise ValueError("排除余量因子数量必须与排除角色一致")
+    exempt = {role for role, centroid in exclusion_centroids if role.startswith('auto_neg_')
+              and historical_negative_matches_target(centroid, secondary_by_role.get(role), profile)}
+    filtered = [(row, scale) for row, scale in zip(exclusion_centroids, scales) if row[0] not in exempt]
+    exclusion_centroids = [row for row, _ in filtered]
+    scales = [scale for _, scale in filtered]
 
     def cluster_exclusion_ok(cluster: Cluster) -> bool:
-        """逐排除角色的双通道余量判定。
-
-        每个角色独立要求：主通道余量达标，或主通道贴线且副通道显著占优。
-        学习型负例原型（auto negatives）的余量因子为 0.75——它们来自用户
-        标注的聚类，比人工挑选的排除参考更噪，不能按同强度否决。
-        """
+        """Retain strict matches; uncertain exclusion views need independent support."""
         for (role, centroid), scale in zip(exclusion_centroids, scales):
             p_gap = (cluster.primary_target_score
                      - float(cluster.primary_centroid @ centroid))
@@ -506,6 +534,17 @@ def assign_target(
                      - float(cluster.secondary_centroid @ secondary))
             if (p_gap >= margin_floor * scale - 0.02
                     and s_gap >= margin_floor * scale + 0.02):
+                continue
+            gaps = {"primary": p_gap, "secondary": s_gap}
+            tertiary = tertiary_by_cluster.get(cluster.cluster_id)
+            if tertiary is not None and role in tertiary_by_role:
+                gaps["tertiary"] = (profile_score(
+                    tertiary, profile.tertiary_centroid, profile.tertiary_references)
+                    - float(tertiary @ tertiary_by_role[role]))
+            verdict = margin_consensus(gaps, (exclusion_audit or {}).get(role),
+                                       margin_floor * scale)
+            exclusion_decisions[f"{cluster.cluster_id}:{role}"] = verdict
+            if verdict["accepted"]:
                 continue
             return False
         return True
@@ -537,6 +576,13 @@ def assign_target(
                 nearest_secondary = (
                     float(cluster.secondary_centroid @ secondary_centroid)
                     if secondary_centroid is not None else -1.0)
+        posterior_p = posterior_s = None
+        prior_weight = 0.
+        if is_target:
+            posterior_p, prior_weight = reference_posterior(
+                cluster.primary_centroid, target_centroid, cluster.total_speech_seconds, len(cluster.members))
+            posterior_s, _ = reference_posterior(
+                cluster.secondary_centroid, target_centroid_secondary, cluster.total_speech_seconds, len(cluster.members))
         return Cluster(
             cluster_id=cluster.cluster_id,
             members=cluster.members,
@@ -560,6 +606,8 @@ def assign_target(
             ),
             is_target=is_target,
             outliers=outliers,
+            posterior_primary=posterior_p, posterior_secondary=posterior_s,
+            prior_weight=prior_weight,
         )
 
     scored = [rescore(cluster) for cluster in clusters]
@@ -575,6 +623,9 @@ def assign_target(
         "cluster_count": len(scored),
         "qualified_count": len(qualified),
         "largest_cluster_id": scored[0].cluster_id if scored else None,
+        "exclusion_reliability": exclusion_audit or {},
+        "exclusion_consensus": exclusion_decisions,
+        "historical_target_exemptions": sorted(exempt),
     }
     if qualified:
         # 供滑窗 Cohort 守卫区分"目标家族簇"与真正的冒认者簇。
@@ -610,8 +661,7 @@ def assign_target(
 
     best = max(qualified, key=lambda c: c.target_score)
 
-    # 真正的对手是"另一位不同声线的说话人"：与核心簇亲和低且分数咬得极紧。
-    # 此时按双通道平均分仲裁出优胜簇，绝不再把整集清零。
+    # Resolve similarly scored, low-affinity clusters before forming the family.
     def is_rival(candidate: Cluster) -> bool:
         if candidate.cluster_id == best.cluster_id:
             return False
@@ -655,8 +705,7 @@ def assign_target(
     largest_qualified = max(qualified, key=lambda c: c.total_speech_seconds)
     diagnostics["largest_qualified_cluster_id"] = largest_qualified.cluster_id
     if require_dominant and largest_qualified.cluster_id not in target_ids:
-        # 目标是主角，她在一集里的语音时长应当最长。判定出的目标簇（含联盟）
-        # 不是最大的簇，本身就是一个可疑信号，此时保守处理而不是硬选。
+        # The caller requires the longest qualified cluster to belong to the target family.
         diagnostics["dominance_conflict"] = True
         return AssignResult(
             clusters=tuple(scored), target_cluster_id=None, membership=tuple(membership),
@@ -664,10 +713,7 @@ def assign_target(
             diagnostics=diagnostics, borderline_membership=tuple(borderline),
         )
 
-    # ── Cohort AS-Norm：以"不像目标"的簇作为冒认者队列 ─────────
-    # 达标簇（含未入盟次级声线簇）属于目标家族；参考分达到强参考水平的簇
-    # 即使被排除角色贴近而未达标，也不得作为竞争对象——否则真目标轮次会被
-    # 同说话人的另一个子簇"竞争"掉。
+    # Exclude independently supported target registers from the impostor cohort.
     family_ids = {c.cluster_id for c in qualified} | set(target_cluster_ids)
     family_ids |= {
         c.cluster_id for c in scored
@@ -676,7 +722,7 @@ def assign_target(
     }
     non_target_clusters = [
         c for c in scored
-        if c.cluster_id not in family_ids and len(c.members) >= MIN_CLUSTER_MEMBERS
+        if c.cluster_id not in family_ids and eligible_competitor(c, turns)
     ]
     other_primary = [c.primary_centroid for c in non_target_clusters]
     other_secondary = [c.secondary_centroid for c in non_target_clusters]
@@ -764,10 +810,7 @@ def assign_target(
     if cohort_stats:
         diagnostics["cohort_membership"] = cohort_stats
 
-    # 达标但未入盟的次级簇（或未聚类的独立旁白）：双通道对参考集达标的
-    # 轮次进内部边缘池。该池是 tertiary/raw 晋升通道的输入（晋升后即离开
-    # 边缘池），导出侧的 Tier B 瘦身由 cluster_gate 的互斥 + NMS + 上限
-    # 完成——在这里收紧会连带收窄晋升通道，实测净伤 Tier A 召回。
+    # Keep near matches available for independent tertiary and raw-audio checks.
     near_miss_turns = []
     for turn in turns:
         if (turn.usable and not membership[turn.index] and not borderline[turn.index]

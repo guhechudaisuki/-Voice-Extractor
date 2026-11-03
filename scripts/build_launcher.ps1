@@ -5,12 +5,15 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$defaultGptRoot = Join-Path $root '..\GPT-SoVITS-v2pro-20250604'
+$defaultGptRoot = if ($env:VOICE_EXTRACT_GPT_ROOT) { $env:VOICE_EXTRACT_GPT_ROOT } else { Join-Path $root '..\GPT-SoVITS' }
 if (-not $GptRoot) { $GptRoot = $defaultGptRoot }
-$GptRoot = (Resolve-Path $GptRoot).Path
+$GptRoot = (Resolve-Path -LiteralPath $GptRoot).Path
 $runtime = Join-Path $GptRoot 'runtime\python.exe'
 if (-not (Test-Path $runtime)) { throw "GPT-SoVITS runtime was not found: $runtime" }
-if ($InstallPyInstaller) { & $runtime -m pip install pyinstaller }
+if ($InstallPyInstaller) {
+    & $runtime -m pip install pyinstaller
+    if ($LASTEXITCODE -ne 0) { throw 'PyInstaller installation failed' }
+}
 & $runtime -m pip show pyinstaller *> $null
 if ($LASTEXITCODE -ne 0) { throw 'PyInstaller is not installed. Run .\scripts\build_launcher.ps1 -InstallPyInstaller' }
 $required = @(

@@ -1,4 +1,4 @@
-"""Audio-verified subtitle proposals. Subtitle text never enters transcription."""
+"""Subtitle-assisted boundaries and independently verified sentence recovery."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from tempfile import TemporaryDirectory
 
 import torch
 
+from .acoustic_qc import snap_crop_boundaries_to_valley
 from .audio import write_clip
 from .speaker import LocalSpeakerTurnSplitter
 from .subtitles import SubtitleGuide, _intersection
@@ -16,38 +17,36 @@ from .types import CandidateSentence, TimeSpan
 
 def energy_valley(waveform, center: float, radius: float = 0.18,
                    frame: float = 0.01, depth_ratio: float = 0.7) -> float | None:
-    """在 [center-radius, center+radius] 内找 RMS 短时能量最低谷点。
-
-    动画对话交接常是 0.00s 无缝衔接（字幕 Cue 边界处没有静音）；此时按
-    10ms 帧长的能量包络取谷点切开，禁止把两个说话人的话粘成一段。
-    谷点能量必须显著低于窗口中位（depth_ratio）：平坦连续语音没有谷证据，
-    不在任意位置硬切。
-    """
+    """Find an energy valley, retrying at 20 ms, and align to a zero crossing."""
     samples = waveform.detach().float().cpu().flatten()
     rate = 16000
     begin = max(0, int((center - radius) * rate))
     finish = min(samples.numel(), int((center + radius) * rate))
-    if finish - begin < int(frame * rate) * 2:
-        return None
-    step = max(1, int(frame * rate))
-    energies = samples[begin:finish].unfold(0, step, step).square().mean(dim=1)
-    valley = int(torch.argmin(energies))
-    window_median = float(torch.median(energies))
-    if window_median <= 1e-12:
-        return None
-    if float(energies[valley]) > depth_ratio * window_median:
-        return None
-    return round((begin + valley * step + step / 2) / rate, 4)
+    probes = [(frame, depth_ratio)]
+    if frame == .01 and depth_ratio == .7:
+        probes.append((.02, .78))
+    for probe_frame, probe_depth in probes:
+        step = max(1, int(probe_frame * rate))
+        if finish - begin < step * 2:
+            continue
+        energies = samples[begin:finish].unfold(0, step, step).square().mean(dim=1)
+        valley = int(torch.argmin(energies))
+        window_median = float(torch.median(energies))
+        if window_median <= 1e-12 or float(energies[valley]) > probe_depth * window_median:
+            continue
+        point = (begin + valley * step + step / 2) / rate
+        _, snapped = snap_crop_boundaries_to_valley(
+            samples, begin / rate, point, sample_rate=rate,
+            max_shift=min(probe_frame, radius), pad_seconds=0,
+            hard_bounds=(begin / rate, finish / rate),
+        )
+        if snapped is not None:
+            return snapped
+    return None
 
 
 def split_at_subtitle_pauses(pipeline, guide, speech, waveform, progress):
-    """Refine overlong VAD blocks only at acoustically supported cue edges.
-
-    静音优先：附近存在 >= silence_min_seconds 的静音间隙时仍按静音切。
-    零静音回退：动画无缝接话处（0.00s 交接）没有静音，在 Cue 边界 ±0.18s
-    内取能量谷点强制切开——禁止跨不同说话人的无缝字幕粘连；双字幕重叠
-    （多人同时说话）区间内不切。
-    """
+    """Split cue boundaries at nearby silence or a local energy valley."""
     cuts = []
     valleys = []
     duration = waveform.numel() / 16000
@@ -63,8 +62,7 @@ def split_at_subtitle_pauses(pipeline, guide, speech, waveform, progress):
             continue
         if any(_intersection(TimeSpan(edge - .20, edge + .20), zone) > .10
                for zone in overlap_zones):
-            # 多人同时说话的重叠禁区：任何切点都可能切碎两个人的重叠语音，
-            # 保持整块交给后续重叠检测处理。
+            # Overlapping dialogue needs interval carving, not a shared cut point.
             continue
         _, runs = pipeline._refine_boundary_to_quiet_gap(
             waveform, TimeSpan(max(0, edge - 1), min(duration, edge + 1)),
@@ -76,15 +74,15 @@ def split_at_subtitle_pauses(pipeline, guide, speech, waveform, progress):
             and r["end"] < container.end
         ], key=lambda row: row[0])
         if choices and choices[0][0] <= .45:
-            if len(choices) > 1 and choices[1][0] - choices[0][0] < .10:
-                continue
             run = choices[0][1]
+            if len(choices) > 1 and choices[1][0] - choices[0][0] < .10:
+                run = min(choices[:2], key=lambda row: (-row[1]["duration"], row[0]))[1]
             gap = TimeSpan(run["start"], run["end"])
             if not any(_intersection(gap, old) > 0 for old in cuts):
                 cuts.append(gap)
             progress((index + 1) / max(1, len(edges)), f"字幕边界对齐 {index + 1}/{len(edges)}")
             continue
-        # 零静音回退：能量谷底强制切分（左右两侧均 >= 0.55s 才允许）。
+        # Keep both sides independently usable when no quiet gap is available.
         valley = energy_valley(waveform, edge)
         if valley is None:
             continue

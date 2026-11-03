@@ -8,9 +8,11 @@ from pathlib import Path
 
 import numpy as np
 
-from .embedding_cache import EmbeddingCache, cache_key, file_digest
+from .embedding_cache import EmbeddingCache, cache_key, file_digest, canonical_interval
+from .exclusion_reliability import audit_exclusion_views
 from .identity_cluster import (TargetProfile, TurnEvidence, cluster_turns,
-                               assign_target, profile_score)
+                               assign_target, profile_score, eligible_competitor)
+from ..recall import MIN_TARGET_SECONDS
 
 
 def unit(v):
@@ -25,22 +27,65 @@ def window_spans(start, end, width=1.8, hop=0.9):
     return [(float(a), float(a + width)) for a in starts]
 
 
-# 连续干净子区间的最短时长：短于该值的碎片不进入 accepted_spans。
-MIN_CLEAN_SUBSPAN = 1.15
-# 整轮放行的窗口通过率与首尾窗口要求。
+# Minimum independently exportable clean interval.
+MIN_CLEAN_SUBSPAN = MIN_TARGET_SECONDS
 WHOLE_TURN_PASS_RATIO = 0.80
-# 长句内部换气平滑：夹在两个高分通过窗口之间的微跌窗口视为同人换气。
+# Bridge a small score dip only between exclusive target windows.
 BREATH_DIP_TOLERANCE = 0.03
 BREATH_NEIGHBOR_FLOOR = 0.06
-# 窗口级 Cohort 竞争守卫：窗口对目标簇联盟的余量必须压过最强非目标簇。
-# 这是拦截"混入长句里的相似女声窗口"的核心防线（AS-Norm 思想）。
+# Margins against the strongest competing speaker cluster.
 WINDOW_COHORT_PRIMARY = 0.055
 WINDOW_COHORT_SECONDARY = 0.02
 WINDOW_COHORT_STRONG = 0.10
-# 短句弱副通道降级：时长 ≤ 该值且副通道贴近下限的会员轮次降入 Tier B，
-# 由多通道仲裁（pipeline 的救援严审对应轮次级同类规则）。
 SHORT_TURN_SECONDS = 3.0
 WEAK_SECONDARY_SLACK = 0.10
+
+
+def _short_dialogue_path(duration, p_slack, s_slack, rows, t_strong, cohort_margin,
+                         *, scene_distance=None):
+    """Independent complementary certificates; every window must pass."""
+    if not rows or not all(r.get("accepted") and not r.get("smoothed") for r in rows):
+        return None
+    def margins(primary, secondary):
+        return all(isinstance(r.get("cm_p"), (int, float)) and r["cm_p"] >= primary
+                   and isinstance(r.get("cm_s"), (int, float)) and r["cm_s"] >= secondary
+                   for r in rows)
+    if p_slack >= .08 - 1e-9 and s_slack >= -.02 - 1e-9 and margins(.09, .14):
+        return "A_dual_cohort"
+    if t_strong and p_slack >= .05 - 1e-9 and s_slack >= -.02 - 1e-9 and margins(.08, .10):
+        return "B_three_channel"
+    if (duration >= 1.85 and p_slack >= .04 - 1e-9
+            and s_slack >= .02 - 1e-9 and cohort_margin >= .08):
+        return "C_stable_dialogue"
+    if (p_slack >= .08 - 1e-9 and s_slack >= -.045 - 1e-9
+            and ((t_strong and margins(.10, .25)) or margins(.20, .25))):
+        return "D_cohort_dominant"
+    if (1.05 <= duration <= SHORT_TURN_SECONDS and scene_distance is not None
+            and scene_distance <= 20.0 and p_slack >= .03 - 1e-9
+            and s_slack >= -.04 - 1e-9 and margins(.08, .15)):
+        return "E_scene_dialogue"
+    return None
+
+
+def _clean_core_certified(rows, profile, t_strong):
+    """Certify only accepted core windows; complementary evidence keeps a secondary floor."""
+    p_floor, s_floor = profile.primary_reference_floor, profile.secondary_reference_floor
+    min_p = min(r["primary"] for r in rows)
+    min_s = min(r["secondary"] for r in rows)
+
+    def margins(primary, secondary):
+        return all(isinstance(r.get("cm_p"), (int, float)) and r["cm_p"] >= primary
+                   and isinstance(r.get("cm_s"), (int, float)) and r["cm_s"] >= secondary
+                   for r in rows)
+
+    dual = min_p >= p_floor + .05 and min_s >= s_floor + .02 and margins(.08, .08)
+    mean_support = (min_p >= p_floor and min_s >= s_floor
+                    and sum(r["primary"] for r in rows) / len(rows) >= p_floor + .04
+                    and sum(r["secondary"] for r in rows) / len(rows) >= s_floor + .04
+                    and margins(.15, .25))
+    complementary = (min_p >= p_floor + .14 and min_s >= s_floor - .02
+                     and margins(.12, .20) and t_strong)
+    return dual or complementary or mean_support
 
 
 class ClusterAnalyzer:
@@ -54,17 +99,30 @@ class ClusterAnalyzer:
     raw_hash = ""
     raw_cache = None
     raw_waveform = None
+    _physiology_probe = None
+    anime_encoders = None
+    anime_hash = ""
+    anime_cache = None
 
     auto_negatives: list = []
+    auto_negative_anime = None
+    auto_negative_anime_support = None
+    auto_negative_hash = ""
     cross_bank: tuple = ()
 
     def __init__(self, stem, references, negative_groups=(), *, device="cuda",
                  cache_enabled=True, encoders=None, progress=None,
-                 tertiary_encoder=None, quaternary_encoder=None, raw_stem=None):
-        from ..config import CACHE_ROOT, SV_MODEL, CAMPLUS_MODEL
+                 tertiary_encoder=None, quaternary_encoder=None, raw_stem=None, anime_encoders=None,
+                 role_key=None, geometry_guard=None):
+        from ..config import ASSET_ROOT, CACHE_ROOT, SV_MODEL, CAMPLUS_MODEL
         from ..speaker import SpeakerVerifier, CAMPlusVerifier
         self.stem = Path(stem)
         self.references = sorted(map(Path, references))
+        if geometry_guard is not None:
+            self._geometry_guard = geometry_guard
+        self._geometry_cache = {}
+        from ..model_store import reference_key
+        self.role_key = role_key or reference_key(file_digest(p) for p in self.references)
         self.negative_groups = sorted(
             [sorted(map(Path, group)) for group in negative_groups if group],
             key=lambda group: tuple(str(p.resolve()) for p in group),
@@ -86,9 +144,13 @@ class ClusterAnalyzer:
         self.owns_encoders = encoders is None
         self.encoders = encoders or (SpeakerVerifier(device=device), CAMPlusVerifier(device=device))
         self.waveform = None
-        # ── 第三通道（强化后的 WavLM）─────────────────────────
-        # 主/副通道缓存与哈希保持原样（历史 .npz 100% 命中）；WavLM 使用独立
-        # 轻量缓存，权重原地强化后自动失效重算，互不干扰。
+        self.anime_encoders = anime_encoders
+        self.owns_anime = anime_encoders is None
+        self.anime_hash = ""
+        self.anime_cache = None
+        self._init_anime(ASSET_ROOT / "models", CACHE_ROOT,
+                         cache_enabled=cache_enabled, device=device)
+        # Auxiliary models have independent cache namespaces and weight digests.
         self.tertiary = tertiary_encoder
         self.owns_tertiary = False
         self.tertiary_hash = ""
@@ -98,67 +160,99 @@ class ClusterAnalyzer:
             from ..config import WAVLM_SV_MODEL
             weight = WAVLM_SV_MODEL / "pytorch_model.bin"
             digest = file_digest(weight) if weight.exists() else "external"
-            self.tertiary_hash = hashlib.sha256(digest.encode()).hexdigest()[:16]
+            self.tertiary_hash = hashlib.sha256((digest + getattr(self.tertiary, "feature_version", "")).encode()).hexdigest()
             self.tertiary_cache = EmbeddingCache(CACHE_ROOT / "wavlm_embeddings",
                                                  enabled=cache_enabled)
-        # ── 第四通道（WeSpeaker-ResNet34-LM）仲裁 ──────────────
-        # 只对带高危救援标记且进入 Tier A 的候选做否决票：异构大间隔模型
-        # 与前三个模型的相关性低，是防止救援路径假阳性混入主输出的最后一道
-        # 多模型投票。参考分低于下限（相对参考自评分）→ 降级 Tier B。
         self.quaternary = quaternary_encoder
         self.quaternary_floor = 0.0
-        if self.quaternary is not None:
-            import torch as _torch
-            from ..audio import load_mono
-            ref_embeddings = self.quaternary.embeddings_from_waveforms(
-                [load_mono(path, 16000) for path in self.references])
-            self.quaternary_centroid = _torch.nn.functional.normalize(
-                ref_embeddings.mean(dim=0), dim=0)
-            self_scores = ref_embeddings @ self.quaternary_centroid
-            # 上限封顶 0.66：防止同质化平静参考把自评分顶到 0.78+ 从而误杀同角色的情绪/对话句
-            self.quaternary_floor = float(min(0.66, max(0.58, self_scores.min().item() - 0.06)))
-        # ── 双轨（Stem+Raw）边缘复核 ──────────────────────────
-        # UVR 剥 BGM 常把轻声齿音/尾音当乐器抹掉，导致真目标在分离轨上掉分。
-        # 对分离轨副通道贴线的边缘轮次，用时间对齐的原轨嵌入交叉复核：
-        # 原轨双通道显著达标 → 判定 UVR 伪影误杀并救回（只救不杀）。
+        # Aligned raw audio can recover speech distorted by source separation.
         self.raw_stem = Path(raw_stem) if raw_stem else None
         self.raw_hash = ""
         self.raw_cache = None
         self.raw_waveform = None
+        self._physiology_probe = None
         if self.raw_stem is not None and self.raw_stem.exists():
             self.raw_hash = file_digest(self.raw_stem)[:16]
             self.raw_cache = EmbeddingCache(CACHE_ROOT / "raw_embeddings",
                                             enabled=cache_enabled)
+        for encoder in (*self.encoders, *(self.anime_encoders or ()), self.tertiary, self.quaternary):
+            shared_cache = getattr(encoder, 'feature_cache', None)
+            if shared_cache is not None:
+                shared_cache.enabled = cache_enabled
+        # Encoders own persistent content-addressed vectors. Interval caches
+        # remain read-compatible with old runs, and memoize new pairs in RAM.
+        for cache, models in ((self.cache,self.encoders), (self.raw_cache,self.encoders),
+                              (self.anime_cache,self.anime_encoders or ()),
+                              (self.tertiary_cache,(self.tertiary,))):
+            if cache is not None and models and all(getattr(e,'feature_cache',None) is not None for e in models):
+                cache.writable = False
         self.profile, self.negatives = self._profiles()
         self.bootstrap_provenance = None
 
     def _load_auto_negatives(self):
-        """加载用户标注沉淀的负例原型库（模型强化时自动更新）。
-
-        余量因子 0.75：学习型原型比人工排除参考更噪，簇级资格判定按
-        margin_floor * 0.75 生效；不参与窗口级否决（避免召回回退）。
-        """
-        import numpy as np
+        """Load aligned memory views, ignoring unsupported auxiliary storage rows."""
+        from zipfile import BadZipFile
         from ..config import WAVLM_SV_MODEL
-        path = Path(WAVLM_SV_MODEL) / "auto_negatives.npz"
+        from .identity_cluster import historical_negative_matches_target
+        path = WAVLM_SV_MODEL / "auto_negatives.npz"
+        self.auto_negatives = []
+        self.auto_negative_anime = {}
+        self.auto_negative_anime_support = {}
+        self.anime_memory_audit = {}
+        self.auto_negative_hash = ""
         if not path.is_file():
             return []
         try:
-            with np.load(path) as data:
+            with np.load(path, allow_pickle=False) as data:
                 primary = np.asarray(data["primary"], dtype=np.float64)
                 secondary = np.asarray(data["secondary"], dtype=np.float64)
-        except (OSError, ValueError, KeyError):
-            return []
-        if primary.ndim != 2 or secondary.ndim != 2 or not len(primary):
+                if (primary.ndim != 2 or secondary.ndim != 2 or not len(primary)
+                        or len(primary) != len(secondary)
+                        or not primary.shape[1] or not secondary.shape[1]
+                        or not np.isfinite(primary).all() or not np.isfinite(secondary).all()
+                        or np.any(np.linalg.norm(primary, axis=1) == 0)
+                        or np.any(np.linalg.norm(secondary, axis=1) == 0)):
+                    return []
+                for name in ("anime_char", "anime_va"):
+                    if name not in data:
+                        continue
+                    try:
+                        matrix = np.asarray(data[name], dtype=np.float64)
+                        support = np.asarray(data.get(name + "_support_counts", np.ones(len(primary))),
+                                             dtype=np.float64)
+                    except (OSError, ValueError, KeyError, EOFError, TypeError, BadZipFile):
+                        self.progress(f"忽略无法读取的习得 {name} 记忆，常规声纹仍可用")
+                        continue
+                    if (matrix.shape != (len(primary), 192) or support.shape != (len(primary),)
+                            or not np.isfinite(support).all() or np.any(support < 0)
+                            or np.any(support != np.floor(support))):
+                        self.progress(f"忽略未对齐的习得 {name} 记忆，常规声纹仍可用")
+                        continue
+                    valid = ((support > 0) & np.isfinite(matrix).all(axis=1)
+                             & (np.linalg.norm(matrix, axis=1) > 0))
+                    for index in np.flatnonzero(valid):
+                        role = f"auto_neg_{index}"
+                        self.auto_negative_anime.setdefault(role, {})[name] = unit(matrix[index])
+                        self.auto_negative_anime_support.setdefault(role, {})[name] = int(support[index])
+        except (OSError, ValueError, KeyError, EOFError, TypeError, BadZipFile):
+            self.auto_negative_anime = {}
+            self.auto_negative_anime_support = {}
             return []
         roles = [(f"auto_neg_{i}", unit(primary[i]), unit(secondary[i]))
-                 for i in range(min(len(primary), len(secondary)))]
+                 for i in range(len(primary))
+                 if not historical_negative_matches_target(primary[i], secondary[i], self.profile)]
+        kept = {role for role, _, _ in roles}
+        self.auto_negative_anime = {role: views for role, views in self.auto_negative_anime.items() if role in kept}
+        self.auto_negative_anime_support = {role: views for role, views in self.auto_negative_anime_support.items() if role in kept}
+        self.auto_negatives = roles
+        self.auto_negative_hash = file_digest(path)
         self.progress(f"已加载习得排除原型 {len(roles)} 个（来自历史标注）")
         return roles
 
     def bank_context(self):
         return {"encoding_version": self.encoding_version,
                 "models": [item["sha256"] for item in self.inputs[1:3]],
+                "anime_model_hash": self.anime_hash,
                 "references": sorted(file_digest(p) for p in self.references),
                 "negative_groups": sorted(sorted(file_digest(p) for p in group)
                                           for group in self.negative_groups)}
@@ -169,6 +263,10 @@ class ClusterAnalyzer:
                 encoder.close()
         if self.owns_tertiary and self.tertiary is not None and hasattr(self.tertiary, "close"):
             self.tertiary.close()
+        if self.owns_anime:
+            for encoder in self.anime_encoders or ():
+                encoder.close()
+        self.anime_encoders = None
 
     def wespeaker_score(self, start: float, end: float):
         """候选区间对参考质心的 WeSpeaker 相似度；无第四通道时返回 None。"""
@@ -186,11 +284,7 @@ class ClusterAnalyzer:
         return float(embedding @ self.quaternary_centroid)
 
     def wespeaker_arbitrate(self, accepted, rejected) -> int:
-        """四模型仲裁：带高危救援标记的 Tier A 候选需通过 WeSpeaker 否决票。
-
-        参考分 < 下限（参考自评分最低值 - 0.05）→ 降入 Tier B 边缘池。
-        只降级救援路径候选（其余 Tier A 不受影响），返回降级数量。
-        """
+        """Demote rescued candidates rejected by the independent WeSpeaker encoder."""
         from .cluster_gate import RESCUE_KEYS
         if self.quaternary is None:
             return 0
@@ -241,6 +335,62 @@ class ClusterAnalyzer:
             load_mono(Path(path), 16000)).detach().cpu().numpy()
         return (vector, vector)
 
+    def _init_anime(self, models_root, cache_root, *, cache_enabled=True, device="cpu"):
+        from .anime_embedding import AnimeSpeakerOnnx, _MODEL_FILES
+        paths = [Path(models_root) / _MODEL_FILES[variant] for variant in ("char", "va")]
+        if not all(path.is_file() for path in paths):
+            return
+        encoders = list(self.anime_encoders or ())
+        try:
+            for variant in (() if encoders else ("char", "va")):
+                encoders.append(AnimeSpeakerOnnx(models_root, variant, device=device))
+        except Exception:
+            for encoder in encoders:
+                encoder.close()
+            raise
+        self.anime_encoders = tuple(encoders)
+        model_digests = [file_digest(path) for path in paths]
+        implementation = (file_digest(Path(__file__).with_name("anime_embedding.py"))
+                          + inspect.getsource(type(self).embed_anime)
+                          + inspect.getsource(type(self)._file_embedding_anime))
+        self.anime_hash = hashlib.sha256("|".join([
+            *model_digests, implementation, str(device), "sample-exact-16000-v2",
+        ]).encode()).hexdigest()
+        self.anime_cache = EmbeddingCache(Path(cache_root) / "anime_embeddings",
+                                          enabled=cache_enabled)
+        self.inputs.extend({"path": str(path.resolve()), "sha256": digest}
+                           for path, digest in zip(paths, model_digests))
+        self.progress("已启用动漫角色与声优声纹模型")
+
+    def _file_embedding_anime(self, path):
+        from ..audio import load_mono
+        key = cache_key(file_digest(path), 0, 0, self.anime_hash)
+        def compute():
+            waveform = load_mono(Path(path), 16000)
+            return tuple(encoder.encode(waveform, sample_rate=16000)
+                         for encoder in self.anime_encoders)
+        return self.anime_cache.get_or_compute(key, compute)
+
+    @staticmethod
+    def _reference_keep_mask(primary, secondary, anime_va=None):
+        """Remove only references rejected by every available identity channel."""
+        count = len(primary)
+        keep = np.ones(count, dtype=bool)
+        if count < 4:
+            return keep
+
+        def leave_one_out_medians(matrix):
+            similarities = matrix @ matrix.T
+            return np.array([np.median(np.delete(row, index))
+                             for index, row in enumerate(similarities)])
+
+        outliers = ((leave_one_out_medians(primary) < .38)
+                    & (leave_one_out_medians(secondary) < .22))
+        if anime_va is not None:
+            outliers &= leave_one_out_medians(anime_va) < .15
+        cleaned = ~outliers
+        return cleaned if int(cleaned.sum()) >= 2 else keep
+
     def _profiles(self):
         if not self.references:
             raise ValueError("Cluster analysis requires target references")
@@ -248,54 +398,93 @@ class ClusterAnalyzer:
         p, s = [np.stack([v[channel] for v in vectors]) for channel in (0, 1)]
         p_unit = np.stack([unit(row) for row in p])
         s_unit = np.stack([unit(row) for row in s])
-        keep_mask = np.ones(len(self.references), dtype=bool)
-        if len(self.references) >= 3:
-            # Stage 24.1 毒丸参考剔除：Leave-One-Out 一致性检查
-            sim_matrix = p_unit @ p_unit.T
-            medians = np.array([
-                np.median(np.delete(sim_matrix[i], i)) for i in range(len(self.references))
-            ])
-            best_med = float(medians.max())
-            if best_med >= 0.55:
-                valid = medians >= max(0.42, best_med - 0.22)
-                if int(valid.sum()) >= 2:
-                    keep_mask = valid
-        p_clean, s_clean = p[keep_mask], s[keep_mask]
+        anime = None
+        if self.anime_encoders is not None:
+            vectors = [self._file_embedding_anime(path) for path in self.references]
+            anime = tuple(np.stack([unit(v[channel]) for v in vectors]) for channel in (0, 1))
+        keep_mask = self._reference_keep_mask(
+            p_unit, s_unit, anime[1] if anime is not None else None)
+        p_clean, s_clean = p_unit[keep_mask], s_unit[keep_mask]
         pc, sc = unit(p_clean.mean(axis=0)), unit(s_clean.mean(axis=0))
         self.purified_reference_indexes = tuple(
             int(i) for i, ok in enumerate(keep_mask) if ok)
         profile = TargetProfile(
             pc, sc,
-            float(np.clip(np.quantile(p @ pc, 0.10) - 0.22, 0.52, 0.68)),
-            float(np.clip(np.quantile(s @ sc, 0.10) - 0.26, 0.48, 0.64)),
-            primary_references=p, secondary_references=s,
+            float(np.clip(np.quantile(p_clean @ pc, 0.10) - 0.22, 0.52, 0.68)),
+            float(np.clip(np.quantile(s_clean @ sc, 0.10) - 0.26, 0.48, 0.64)),
+            primary_references=p_clean, secondary_references=s_clean,
         )
+        target_views = {"primary": p_clean, "secondary": s_clean}
         if self.tertiary is not None:
-            tv = np.stack([self._file_embedding3(path) for path in self.references])
+            tv = np.stack([unit(self._file_embedding3(path)) for path in self.references])[keep_mask]
+            tc = unit(tv.mean(axis=0))
             profile = replace(
                 profile,
-                tertiary_centroid=unit(tv.mean(axis=0)),
+                tertiary_centroid=tc,
                 tertiary_reference_floor=float(np.clip(
-                    np.quantile(tv @ unit(tv.mean(axis=0)), 0.10) - 0.06, 0.74, 0.88)),
+                    np.quantile(tv @ tc, 0.10) - 0.06, 0.74, 0.88)),
+                tertiary_references=tv,
             )
+            target_views["tertiary"] = tv
+        if self.quaternary is not None:
+            import torch
+            from ..audio import load_mono
+            clean_paths = [path for path, keep in zip(self.references, keep_mask) if keep]
+            qv = self.quaternary.embeddings_from_waveforms(
+                [load_mono(path, 16000) for path in clean_paths])
+            qv = torch.nn.functional.normalize(qv, dim=1)
+            self.quaternary_centroid = torch.nn.functional.normalize(qv.mean(dim=0), dim=0)
+            self.quaternary_floor = float(np.clip(
+                (qv @ self.quaternary_centroid).min().item() - .06, .58, .66))
+            profile = replace(profile,
+                quaternary_centroid=self.quaternary_centroid.detach().cpu().numpy(),
+                quaternary_reference_floor=self.quaternary_floor)
+        if anime is not None:
+            char, va = (matrix[keep_mask] for matrix in anime)
+            cc, vc = unit(char.mean(axis=0)), unit(va.mean(axis=0))
+            profile = replace(profile,
+                anime_char_centroid=cc, anime_va_centroid=vc,
+                anime_char_reference_floor=float(np.clip(np.quantile(char @ cc, .10) - .30, .35, .55)),
+                anime_va_reference_floor=float(np.clip(np.quantile(va @ vc, .10) - .35, .25, .50)),
+                anime_char_references=char, anime_va_references=va)
         negatives = []
+        self.exclusion_audit = {}
+        self.exclusion_references = {}
+        self.tertiary_negatives = []
         for group in self.negative_groups:
             v = [self._file_embedding(path) for path in group]
             # Stable role identity derives from files, not enumeration order.
             role = hashlib.sha256("|".join(sorted(file_digest(path) for path in group)).encode()).hexdigest()[:16]
-            negatives.append((role, unit(np.mean([x[0] for x in v], axis=0)),
-                              unit(np.mean([x[1] for x in v], axis=0))))
-        self.tertiary_negatives = []
-        if self.tertiary is not None:
-            for group in self.negative_groups:
-                tv = np.stack([self._file_embedding3(path) for path in group])
-                role = hashlib.sha256("|".join(sorted(file_digest(path) for path in group)).encode()).hexdigest()[:16]
-                self.tertiary_negatives.append((role, unit(tv.mean(axis=0))))
+            views = {name: np.stack([unit(pair[channel]) for pair in v])
+                     for channel, name in enumerate(("primary", "secondary"))}
+            negatives.append((role, unit(views["primary"].mean(axis=0)),
+                              unit(views["secondary"].mean(axis=0))))
+            if self.tertiary is not None:
+                views["tertiary"] = np.stack([unit(self._file_embedding3(path)) for path in group])
+                self.tertiary_negatives.append((role, unit(views["tertiary"].mean(axis=0))))
+            self.exclusion_references[role] = views
+            self.exclusion_audit[role] = audit_exclusion_views(target_views, views)
         return profile, negatives
+
+    def _certification_profile(self):
+        """Calibrate short/core certificates with leave-one-out reference scores."""
+        references = self.profile.primary_references
+        if references is None or len(references) < 3:
+            return self.profile
+        indexes = getattr(self, "purified_reference_indexes", None)
+        if indexes is not None and len(indexes) < 3:
+            return self.profile
+        references = np.asarray(references)
+        scores = []
+        for index, reference in enumerate(references):
+            others = np.delete(references, index, axis=0)
+            scores.append(profile_score(reference, unit(others.mean(axis=0)), others))
+        floor = float(np.clip(np.quantile(scores, .10) - .22, .52, .68))
+        return replace(self.profile, primary_reference_floor=floor)
 
     def embed(self, start, end):
         # Use the same exact cuts in offline and pipeline analysis.
-        a, b = float(start) + 0.02, float(end) - 0.02
+        a, b = canonical_interval(start, end)
         key = cache_key(self.source_hash, a, b, self.model_hash)
         def compute():
             from ..audio import load_mono
@@ -305,11 +494,76 @@ class ClusterAnalyzer:
             return tuple(e._embedding_from_waveform(clip).detach().cpu().numpy() for e in self.encoders)
         return self.cache.get_or_compute(key, compute)
 
+    def prosody(self, start, end):
+        from .physiology import prosody_signature
+        from ..audio import load_mono
+        if not hasattr(self, '_prosody_cache'):
+            self._prosody_cache = {}
+        key = canonical_interval(start,end)
+        if key not in self._prosody_cache:
+            if self.waveform is None:
+                self.waveform = load_mono(self.stem,16000)
+            self._prosody_cache[key] = prosody_signature(
+                self.waveform[round(key[0]*16000):round(key[1]*16000)])
+        return self._prosody_cache[key]
+
+    def relative_window_energy(self, start, end, parent_start, parent_end):
+        """Silence in a speech turn must not acquire identity from model bias."""
+        from ..audio import load_mono
+        if self.waveform is None:
+            self.waveform = load_mono(self.stem,16000)
+        if not hasattr(self, '_energy_cache'):
+            self._energy_cache = {}
+        def rms(a,b):
+            key = (round(a*16000),round(b*16000))
+            if key not in self._energy_cache:
+                clip = self.waveform[key[0]:key[1]]
+                self._energy_cache[key] = float(clip.square().mean().sqrt()) if clip.numel() else 0.
+            return self._energy_cache[key]
+        energy = rms(start,end)
+        return energy / max(1e-6,rms(parent_start,parent_end))
+
+    def reference_prosody(self):
+        from .physiology import prosody_signature
+        from ..audio import load_mono
+        if not hasattr(self, '_reference_prosody'):
+            self._reference_prosody = [value for p in self.references
+                if (value := prosody_signature(load_mono(p,16000))) is not None]
+        return self._reference_prosody
+
+    def prefetch(self, spans):
+        """Batch new pyramid windows without changing the per-window cache keys."""
+        if not getattr(self, 'encoders', None) or not hasattr(self.cache, 'get_many'):
+            return
+        from ..audio import load_mono
+        if self.waveform is None:
+            self.waveform = load_mono(self.stem, 16000)
+        spans = list(dict.fromkeys(canonical_interval(a,b) for a,b in spans))
+        keys = [cache_key(self.source_hash,a,b,self.model_hash) for a,b in spans]
+        cached = self.cache.get_many(keys)
+        missing = [(key,a,b) for key,(a,b) in zip(keys,spans) if key not in cached]
+        for first in range(0,len(missing),24):
+            batch=missing[first:first+24]
+            waves=[self.waveform[round(a*16000):round(b*16000)] for _,a,b in batch]
+            values=[encoder._embeddings_from_waveforms(waves,batch_size=24).detach().cpu().numpy()
+                    for encoder in self.encoders]
+            self.cache.put_many([(key,(values[0][i],values[1][i])) for i,(key,_,_) in enumerate(batch)])
+        if self.anime_encoders and self.anime_cache is not None:
+            from .pyramid_batching import anime_batch
+            anime_keys = [cache_key(self.source_hash,a,b,self.anime_hash) for a,b in spans]
+            found = self.anime_cache.get_many(anime_keys)
+            missing = [(key,a,b) for key,(a,b) in zip(anime_keys,spans) if key not in found]
+            for first in range(0,len(missing),24):
+                batch = missing[first:first+24]
+                waves = [self.waveform[round(a*16000):round(b*16000)] for _,a,b in batch]
+                pairs = anime_batch(self.anime_encoders,waves)
+                self.anime_cache.put_many([(key,pair) for (key,_,_),pair in zip(batch,pairs) if pair is not None])
+
     def embed3(self, start, end):
         """第三通道（WavLM）嵌入；独立内容寻址缓存，强化后自动重算。"""
         if self.tertiary is None:
             return None
-        a, b = float(start) + 0.02, float(end) - 0.02
+        a, b = canonical_interval(start, end)
         key = cache_key(self.source_hash, a, b, self.tertiary_hash)
         def compute():
             import torch
@@ -325,7 +579,7 @@ class ClusterAnalyzer:
         """原轨（Raw）双通道嵌入；独立缓存命名空间，读取失败返回 None。"""
         if self.raw_cache is None:
             return None
-        a, b = float(start) + 0.02, float(end) - 0.02
+        a, b = canonical_interval(start, end)
         key = cache_key(self.raw_hash, a, b, self.model_hash)
         def compute():
             import torch
@@ -333,7 +587,7 @@ class ClusterAnalyzer:
             if self.raw_waveform is None:
                 self.raw_waveform = load_mono(self.raw_stem, 16000)
             clip = self.raw_waveform[max(0, round(a * 16000)):round(b * 16000)]
-            if clip.numel() < 8000:
+            if clip.numel() < 5600:
                 raise ValueError("原轨区间过短")
             return tuple(e._embedding_from_waveform(clip).detach().cpu().numpy()
                          for e in self.encoders)
@@ -342,6 +596,132 @@ class ClusterAnalyzer:
         except (OSError, RuntimeError, ValueError):
             self.raw_cache = None  # 原轨不可读/不可对齐时整段禁用，不影响主流程
             return None
+
+    def embed_anime(self, start: float, end: float) -> tuple[np.ndarray, np.ndarray] | None:
+        """Read only the requested audio interval on a cache miss."""
+        if self.anime_encoders is None or self.anime_cache is None:
+            return None
+        from .anime_embedding import InsufficientSpeech
+        a, b = canonical_interval(start, end)
+        if b - a < .2:
+            return None
+        key = cache_key(self.source_hash, a, b, self.anime_hash)
+        def compute():
+            import torch
+            if self.waveform is not None:
+                clip = self.waveform[max(0, round(a * 16000)):round(b * 16000)]
+            else:
+                import soundfile as sf
+                with sf.SoundFile(str(self.stem)) as source:
+                    first = min(len(source), max(0, round(a * source.samplerate)))
+                    last = min(len(source), max(first, round(b * source.samplerate)))
+                    source.seek(first)
+                    samples = source.read(last - first, dtype="float32", always_2d=True)
+                    source_rate = source.samplerate
+                clip = torch.from_numpy(samples.mean(axis=1))
+                if source_rate != 16000 and clip.numel():
+                    from torchaudio.functional import resample
+                    clip = resample(clip, source_rate, 16000)
+            return tuple(encoder.encode(clip, sample_rate=16000) for encoder in self.anime_encoders)
+        try:
+            return self.anime_cache.get_or_compute(key, compute)
+        except InsufficientSpeech:
+            return None
+
+    def physiology_evidence(self, start, end):
+        """Measure separation distortion without adding a speaker-identity vote."""
+        if self.raw_stem is None:
+            return None
+        if self._physiology_probe is None:
+            from .physiology_runtime import PhysiologyProbe
+            try:
+                root = self.cache.root.parent / "physiology"
+                self._physiology_probe = PhysiologyProbe(
+                    self.stem, self.raw_stem, self.source_hash, root,
+                    enabled=getattr(self.cache, "enabled", True))
+            except (OSError, ValueError):
+                return {"available": False, "reason": "paired_audio_unavailable",
+                        "reliability": 0., "artifact_confidence": 0.}
+        return self._physiology_probe.measure(start, end)
+
+    def vocal_geometry_evidence(self, start, end):
+        from ..extraction_guards import VocalTractGeometryGuard
+        from .physiology import vocal_tract_frames
+        from ..audio import load_mono
+        if not hasattr(self, '_geometry_guard'):
+            self._geometry_guard = VocalTractGeometryGuard(self.references)
+            self._geometry_cache = {}
+        key = canonical_interval(start,end)
+        if key not in self._geometry_cache:
+            if self.waveform is None:
+                self.waveform = load_mono(self.stem,16000)
+            self._geometry_cache[key] = self._geometry_guard.assess_frames(vocal_tract_frames(
+                self.waveform[round(start*16000):round(end*16000)]))
+        return self._geometry_cache[key]
+
+    def physiology_diagnostics(self):
+        if self._physiology_probe is not None:
+            return self._physiology_probe.diagnostics()
+        return {"enabled": self.raw_stem is not None, "measured_spans": 0}
+
+    def anime_scores(self, start: float, end: float, profile=None) -> tuple[float, float] | None:
+        """Return reference support, hedged only by corroborated learned competitors."""
+        profile = profile or self.profile
+        if profile.anime_char_centroid is None or profile.anime_va_centroid is None:
+            return None
+        vectors = self.embed_anime(start, end)
+        if vectors is None:
+            return None
+        scores = (profile_score(vectors[0], profile.anime_char_centroid, profile.anime_char_references),
+                  profile_score(vectors[1], profile.anime_va_centroid, profile.anime_va_references))
+        if not self.auto_negative_anime:
+            return scores
+        return self._anime_memory_support(start, end, vectors, scores, profile)
+
+    def _anime_memory_support(self, start, end, vectors, scores, profile):
+        """A learned rival can remove an anime rescue bonus, never supply a veto.
+
+        Both anime views must identify the same rival. A prototype matching the
+        current target references is irrelevant negative memory from another
+        target-selection session and cannot suppress that target's evidence.
+        """
+        channels = ("anime_char", "anime_va")
+        probes = tuple(unit(vector) for vector in vectors)
+        floors = (profile.anime_char_reference_floor, profile.anime_va_reference_floor)
+        ordinary = {role: (p, s) for role, p, s in self.auto_negatives}
+        competitors = []
+        for role, views in self.auto_negative_anime.items():
+            if not all(name in views for name in channels) or role not in ordinary:
+                continue
+            primary, secondary = ordinary[role]
+            reference_match = (
+                profile_score(primary, profile.primary_centroid, profile.primary_references),
+                profile_score(secondary, profile.secondary_centroid, profile.secondary_references))
+            if (reference_match[0] >= profile.primary_reference_floor
+                    and reference_match[1] >= profile.secondary_reference_floor):
+                continue
+            margins = tuple(score - float(probe @ views[name])
+                            for name, probe, score in zip(channels, probes, scores))
+            if all(margin < 0 for margin in margins):
+                competitors.append({"role": role, "margins": list(margins)})
+        adjusted = tuple(min(score, floor) for score, floor in zip(scores, floors)) if competitors else scores
+        self.anime_memory_audit[(float(start), float(end))] = {
+            "raw_scores": list(scores), "support_scores": list(adjusted),
+            "corroborated_competitors": competitors,
+        }
+        return adjusted
+
+    def anime_decision(self, scores, primary, secondary, tertiary=None, profile=None):
+        """Return positive support for a register change without rejecting existing evidence."""
+        if scores is None:
+            return {"available": False, "strong": False, "register_shift": False}
+        profile = profile or self.profile
+        char, va = scores
+        cf, vf = profile.anime_char_reference_floor, profile.anime_va_reference_floor
+        strong = char >= cf + .05 and va >= vf + .05
+        register_shift = (primary >= profile.primary_reference_floor + .04
+                          and char >= cf + .04 and va >= vf + .04)
+        return {"available": True, "strong": strong, "register_shift": register_shift}
 
     def scores(self, p, s, profile=None):
         profile = profile or self.profile
@@ -355,10 +735,10 @@ class ClusterAnalyzer:
         turns = []
         use_tertiary = self.tertiary is not None
         for index, (start, end) in enumerate(spans):
-            usable = end - start - 0.04 >= 0.55
+            usable = end - start >= .35 - 1e-9
             p, s = self.embed(start, end) if usable else (np.zeros(192), np.zeros(512))
             t = self.embed3(start, end) if (usable and use_tertiary) else None
-            scores, others = self.scores(p, s)
+            scores, others = self.scores(p, s) if usable else ((0., 0.), [])
             nearest = max(others, key=lambda row: row[1]) if others else (None, -1., -1.)
             anchor = None
             if usable:
@@ -394,6 +774,8 @@ class ClusterAnalyzer:
         result = assign_target(turns, clusters, self.profile,
                                exclusions, secondaries,
                                exclusion_scales=scales,
+                               exclusion_audit=getattr(self, "exclusion_audit", None),
+                               exclusion_tertiary_centroids=self.tertiary_negatives,
                                margin_floor=margin,
                                require_dominant=require_dominant)
         result = self._apply_tertiary_promotion(turns, result)
@@ -404,7 +786,7 @@ class ClusterAnalyzer:
             membership = list(result.membership)
             narration = []
             for turn in turns:
-                if not turn.usable or result.cluster_of[turn.index] != -1:
+                if not self._rescue_eligible(turn) or result.cluster_of[turn.index] != -1:
                     continue
                 scores, negative = self.scores(turn.primary, turn.secondary)
                 if (scores[0] >= self.profile.primary_reference_floor and
@@ -414,35 +796,55 @@ class ClusterAnalyzer:
                     narration.append(turn.index)
             result = replace(result, membership=tuple(membership), diagnostics={
                 **result.diagnostics, "narration_candidates": narration})
-        if temporal and target is not None:
+        if temporal:
             result, local = self.verify_temporal(turns, result, margin=margin)
         return turns, result, local
 
     def _apply_tertiary_promotion(self, turns, result):
-        """WavLM 第三通道边缘晋升：强匹配的边缘轮次升为核心成员。
-
-        用户在 UI 里强化过的 WavLM 在这里真正参与门控：边缘池轮次若对强化后
-        的参考质心显著高分（且不贴近任何排除角色），则晋升进核心成员，随后的
-        滑窗核验仍照常执行。没有第三通道时原样返回。
-        """
-        if self.tertiary is None or not result.borderline_membership:
+        """Recover any usable register with independent WavLM/anime support."""
+        if self.tertiary is None:
             return result
         floor = self.profile.tertiary_reference_floor
         membership = list(result.membership)
-        borderline = list(result.borderline_membership)
+        borderline = (list(result.borderline_membership) if len(result.borderline_membership) == len(turns)
+                      else [False] * len(turns))
         promoted = []
         tertiary_scores = dict(result.diagnostics.get("tertiary_scores") or {})
+        by_index = {turn.index: turn for turn in turns}
+        tertiary_rivals = []
+        for cluster in result.clusters:
+            if (cluster.cluster_id == result.target_cluster_id
+                    or cluster.cluster_id in result.target_cluster_ids
+                    or not eligible_competitor(cluster, turns)):
+                continue
+            vectors = [unit(by_index[index].tertiary) for index in cluster.members
+                       if index in by_index and self._rescue_eligible(by_index[index])
+                       and by_index[index].tertiary is not None]
+            if vectors:
+                tertiary_rivals.append((set(cluster.members), unit(np.mean(vectors, axis=0))))
         for turn in turns:
-            if not borderline[turn.index] or membership[turn.index]:
+            if not self._rescue_eligible(turn):
                 continue
             score = self.tertiary_score(turn)
             if score is None:
                 continue
             tertiary_scores[turn.index] = round(score, 5)
+            if membership[turn.index]:
+                continue
             beaten_by_negative = any(
                 score - float(unit(turn.tertiary) @ nc) < 0.02
                 for _, nc in self.tertiary_negatives)
-            if score >= floor + 0.02 and not beaten_by_negative:
+            beaten_by_negative |= any(turn.index not in members
+                and score - float(unit(turn.tertiary) @ centroid) < .02
+                for members, centroid in tertiary_rivals)
+            generic, _ = self.scores(turn.primary, turn.secondary)
+            beaten_by_negative |= self._rescue_competitor_wins(turn, result, turn.primary, turn.secondary, generic, turns)
+            anime = self.anime_scores(turn.start, turn.end) if not borderline[turn.index] else None
+            invariant = anime is not None and (
+                anime[0] >= self.profile.anime_char_reference_floor + .04
+                or anime[1] >= self.profile.anime_va_reference_floor + .04)
+            if (score >= floor + 0.02 and not beaten_by_negative
+                    and (borderline[turn.index] or invariant)):
                 membership[turn.index] = True
                 borderline[turn.index] = False
                 promoted.append(turn.index)
@@ -452,12 +854,7 @@ class ClusterAnalyzer:
                        borderline_membership=tuple(borderline), diagnostics=diagnostics)
 
     def _apply_raw_crosscheck(self, turns, result):
-        """Stem+Raw 双轨边缘复核：原轨显著达标 → UVR 伪影误杀的救回。
-
-        仅作用于分离轨副通道贴线的边缘轮次（不碰核心成员，只救不杀）：
-        原轨双通道同时高出参考下限时，判定该轮次是 UVR 伪影受害者，
-        升为核心成员并持有原轨证书（verify_temporal 不再对其跑分离轨滑窗）。
-        """
+        """Recover all usable separated turns using aligned raw-audio support."""
         if self.raw_cache is None:
             return result
         membership = list(result.membership)
@@ -465,309 +862,63 @@ class ClusterAnalyzer:
             len(result.borderline_membership) == len(turns)) else [False] * len(turns)
         rescued = []
         rescue_scores = {}
+        physiology = {}
         for turn in turns:
-            if not borderline[turn.index] or membership[turn.index] or not turn.usable:
+            if membership[turn.index] or not self._rescue_eligible(turn):
                 continue
-            scores, _negatives = self.scores(turn.primary, turn.secondary)
-            if scores[1] >= self.profile.secondary_reference_floor + 0.04:
-                continue  # 分离轨副通道并不弱，不是 UVR 伪影的形状
             raw = self.embed_raw(turn.start, turn.end)
             if raw is None:
                 continue
             raw_scores, _ = self.scores(raw[0], raw[1])
             if (raw_scores[0] >= self.profile.primary_reference_floor + 0.04
-                    and raw_scores[1] >= self.profile.secondary_reference_floor + 0.02):
+                    and raw_scores[1] >= self.profile.secondary_reference_floor + 0.02
+                    and not self._rescue_competitor_wins(turn, result, raw[0], raw[1], raw_scores, turns)):
                 membership[turn.index] = True
                 borderline[turn.index] = False
                 rescued.append(turn.index)
                 rescue_scores[turn.index] = [round(v, 4) for v in raw_scores]
+                physiology[str(turn.index)] = self.physiology_evidence(turn.start, turn.end)
         if not rescued:
             return result
         diagnostics = {**result.diagnostics,
                        "raw_rescued_turns": rescued,
+                       "raw_rescue_physiology": physiology,
                        "raw_rescue_scores": {str(i): rescue_scores[i] for i in rescued}}
         return replace(result, membership=tuple(membership),
                        borderline_membership=tuple(borderline), diagnostics=diagnostics)
 
+    def _rescue_eligible(self, turn):
+        """Singing, overlap and explicit exclusion intervals cannot be rescued."""
+        return turn.usable and not any(
+            min(turn.end, end) > max(turn.start, start)
+            for start, end in getattr(self, 'temporal_blocked_spans', ()))
+
+    def _rescue_competitor_wins(self, turn, result, primary, secondary, scores, turns):
+        """A rescue cannot override a positively identified independent speaker."""
+        _, rivals = self.scores(primary, secondary)
+        rivals += [(role, float(unit(primary) @ p), float(unit(secondary) @ s))
+                   for role, p, s in self.auto_negatives]
+        rivals += [(str(c.cluster_id), float(unit(primary) @ c.primary_centroid),
+                    float(unit(secondary) @ c.secondary_centroid)) for c in result.clusters
+                   if turn.index not in c.members and c.cluster_id not in result.target_cluster_ids
+                   and c.cluster_id != result.target_cluster_id and eligible_competitor(c, turns)]
+        return any(p >= self.profile.primary_reference_floor and s >= self.profile.secondary_reference_floor
+                   and p >= scores[0] - .02 and s >= scores[1] - .02 for _, p, s in rivals)
+
     def verify_temporal(self, turns, candidates, *, margin=.06, bank=(), previous=None):
-        """Verify fixed candidates; expanded references never select a cluster.
+        """Verify local speech, then revisit uncertain windows with clean episode evidence."""
+        from .temporal_mining import TemporalMiner
 
-        窗口核验对目标簇联盟（全部声线子簇质心）进行；长句内部换气微跌平滑；
-        不再要求父轮次 100% 窗口全过——连续通过的窗口合并为干净子区间
-        （≥ MIN_CLEAN_SUBSPAN），供候选句级门控裁切使用。
-        Earlier certificates remain valid against their recorded bank.
-        """
-        from .bootstrap_bank import independent_vectors, merge_profile, evidence_spans
-        target_union = candidates.target_clusters()
-        if not target_union:
-            return candidates, {}
-        union_ids = {c.cluster_id for c in target_union}
-        # 冒认者队列 = "不像目标"的簇。达标簇（含未入盟的次级声线簇）属于
-        # 目标家族；参考分达到强参考水平的簇即使未达标也不得作为竞争对象
-        # ——否则真目标窗口会被同说话人的另一个子簇误杀。
-        family_ids = set(candidates.diagnostics.get("qualified_cluster_ids") or ()) | union_ids
-        family_ids |= {
-            c.cluster_id for c in candidates.clusters
-            if c.primary_target_score >= 0.66 and c.secondary_target_score >= 0.60
-        }
-        non_union = [c for c in candidates.clusters if c.cluster_id not in family_ids]
-
-        def cohort_ok(p, s):
-            """窗口必须在竞争余量上压过最强非目标簇（Cohort AS-Norm）。
-
-            双通道之一显著占优即可：主通道占优（cm_p 达标且 cm_s 不崩），
-            或副通道显著占优（cm_s >= 0.10 且 cm_p 非负）。
-            """
-            if not non_union:
-                return True
-            u_p, u_s = unit(p), unit(s)
-            tcp = max(float(u_p @ c.primary_centroid) for c in target_union)
-            tcs = max(float(u_s @ c.secondary_centroid) for c in target_union)
-            othp = max(float(u_p @ c.primary_centroid) for c in non_union)
-            oths = max(float(u_s @ c.secondary_centroid) for c in non_union)
-            cm_p, cm_s = tcp - othp, tcs - oths
-            return ((cm_p >= WINDOW_COHORT_PRIMARY and cm_s >= WINDOW_COHORT_SECONDARY)
-                    or (cm_p >= 0.0 and cm_s >= WINDOW_COHORT_STRONG)
-                    or cm_p >= WINDOW_COHORT_STRONG + 0.045)
-
-        def analyzer_self_embed(a, b):
-            p_e, s_e = self.embed(a, b)
-            p_prof = profile_score(unit(p_e), self.profile.primary_centroid,
-                                   self.profile.primary_references)
-            s_prof = profile_score(unit(s_e), self.profile.secondary_centroid,
-                                   self.profile.secondary_references)
-            return p_prof, s_prof
-
-        def turn_cohort_margin(turn):
-            """轮次整体对目标簇联盟的竞争余量；无非目标簇时返回 +inf。"""
-            if not non_union:
-                return float("inf")
-            u_p = unit(turn.primary)
-            tcp = max(float(u_p @ c.primary_centroid) for c in target_union)
-            othp = max(float(u_p @ c.primary_centroid) for c in non_union)
-            return tcp - othp
-
-        membership = list(candidates.membership)
-        borderline = list(candidates.borderline_membership) if (
-            len(candidates.borderline_membership) == len(turns)) else [False] * len(turns)
-        # 原轨证书轮次：UVR 伪影受害者已由原轨双通道复核救回，分离轨滑窗
-        # 对其没有意义（分离伪影正是被救的原因），直接持有整轮区间。
-        raw_rescued = set(candidates.diagnostics.get("raw_rescued_turns") or ())
-        local, supports = {}, {}
-        diagnostics = {**candidates.diagnostics,
-            "profile_floors": {
-                "primary": self.profile.primary_reference_floor,
-                "secondary": self.profile.secondary_reference_floor},
-        }
-        turn_clean_spans = {}
-        demoted = []
-        cross_rescued = []
-
-        def check(profile, *, strict=False):
-            def window_ok(a, b, p, s):
-                u_p, u_s = unit(p), unit(s)
-                p_prof = profile_score(u_p, profile.primary_centroid,
-                                       profile.primary_references)
-                s_prof = profile_score(u_s, profile.secondary_centroid,
-                                       profile.secondary_references)
-                profile_ok = (p_prof >= profile.primary_reference_floor - .02
-                              and s_prof >= profile.secondary_reference_floor - .02)
-                # 质心一致分支允许情绪声线在簇内漂移，但仍需软参考下限兜底：
-                # 远离参考的窗口（如混入的他人插话）不能只靠贴近簇质心放行。
-                # 软兜底维持 -0.10：实测把副通道收紧到 -0.045 会把大量安静
-                # 真目标窗口（s_prof 0.40~0.46）一并误杀、 Tier A 崩掉 1/4，
-                # 而目标泄漏段会经裁切子段存活，收益为零。该类泄漏改由
-                # WeSpeaker 四模型仲裁否决。扩充参考（bank）核验一律 strict。
-                if not strict:
-                    coherent = any(
-                        float(u_p @ c.primary_centroid) >= c.primary_median - .20
-                        and float(u_s @ c.secondary_centroid) >= profile.secondary_reference_floor - .02
-                        for c in target_union)
-                    if (coherent
-                            and p_prof >= profile.primary_reference_floor - .10
-                            and s_prof >= profile.secondary_reference_floor - .10):
-                        profile_ok = True
-                score, negative = self.scores(p, s, profile)
-                # Stage 18 双通道互补排除余量：允许主通道极强时副通道贴线（容差 0.03），
-                # 防止混合排除组（如含目标自身背景音的杂谈簇）因副通道微差 0.01 一票否决真目标。
-                margins_ok = all(
-                    (score[0] - n[1] >= margin and score[1] - n[2] >= margin)
-                    or (score[0] - n[1] >= margin + 0.06 and score[1] - n[2] >= margin - 0.01)
-                    or (score[0] - n[1] >= margin - 0.01 and score[1] - n[2] >= margin + 0.06)
-                    for n in negative)
-                return bool(profile_ok and margins_ok and cohort_ok(p, s)), score
-
-            rows = []
-            for a, b, p, s in windows:
-                passes, score = window_ok(a, b, p, s)
-                cm_p = cm_s = None
-                if non_union:
-                    tcp = max(float(unit(p) @ c.primary_centroid) for c in target_union)
-                    tcs = max(float(unit(s) @ c.secondary_centroid) for c in target_union)
-                    othp = max(float(unit(p) @ c.primary_centroid) for c in non_union)
-                    oths = max(float(unit(s) @ c.secondary_centroid) for c in non_union)
-                    cm_p, cm_s = round(tcp - othp, 4), round(tcs - oths, 4)
-                rows.append({"span": [a, b], "primary": score[0],
-                             "secondary": score[1], "accepted": bool(passes),
-                             "cm_p": cm_p, "cm_s": cm_s})
-            # 长句内部换气平滑：两侧高分通过、自身仅微跌且不偏向排除角色的
-            # 窗口视为同人换气。
-            neighbor_floor = profile.primary_reference_floor + BREATH_NEIGHBOR_FLOOR
-            for k in range(1, len(rows) - 1):
-                if rows[k]["accepted"]:
-                    continue
-                left, mid, right = rows[k - 1], rows[k], rows[k + 1]
-                if not (left["accepted"] and right["accepted"]):
-                    continue
-                if (min(left["primary"], right["primary"]) >= neighbor_floor
-                        and mid["primary"] >= min(left["primary"], right["primary"]) - BREATH_DIP_TOLERANCE
-                        and mid["secondary"] >= profile.secondary_reference_floor - .12):
-                    mid["accepted"] = True
-                    mid["smoothed"] = True
-            return rows
-
-        def extract_spans(turn, rows):
-            """整轮通过率高且首尾干净 → 整轮；否则合并连续通过窗口为子区间。"""
-            accepted = [row["accepted"] for row in rows]
-            if not accepted or not any(accepted):
-                return []
-            if (sum(accepted) / len(accepted) >= WHOLE_TURN_PASS_RATIO
-                    and accepted[0] and accepted[-1]):
-                return [[turn.start, turn.end]]
-            spans, run = [], None
-            for row, ok in zip(rows, accepted):
-                if ok:
-                    run = [row["span"][0], row["span"][1]] if run is None else [run[0], row["span"][1]]
-                elif run is not None:
-                    if run[1] - run[0] >= MIN_CLEAN_SUBSPAN:
-                        spans.append(run)
-                    run = None
-            if run is not None and run[1] - run[0] >= MIN_CLEAN_SUBSPAN:
-                spans.append(run)
-            return spans
-
-        for turn in turns:
-            key = str(turn.index)
-            if not membership[turn.index]:
-                continue
-            if turn.index in raw_rescued:
-                turn_clean_spans[key] = [[turn.start, turn.end]]
-                local[key] = []
-                continue
-            previous_demoted = set(
-                (previous[0].diagnostics.get("short_weak_demoted") or ())
-                if previous else ())
-            if key in {str(i) for i in previous_demoted}:
-                # 短句弱副通道降级在自举轮次间保持：扩充参考不得把已被
-                # 降级的轮次重新拉回主输出。
-                membership[turn.index] = False
-                borderline[turn.index] = True
-                demoted.append(turn.index)
-                local[key] = previous[1].get(key, [])
-                turn_clean_spans[key] = []
-                continue
-            if previous and previous[0].membership[turn.index]:
-                local[key] = previous[1][key]
-                if key in previous[0].diagnostics.get("bootstrap_supports", {}):
-                    supports[key] = previous[0].diagnostics["bootstrap_supports"][key]
-                clean = previous[0].diagnostics.get("turn_clean_spans", {}).get(key)
-                if clean:
-                    turn_clean_spans[key] = clean
-                continue
-            windows = [(a, b, *self.embed(a, b)) for a, b in window_spans(turn.start, turn.end)]
-
-            rows = check(self.profile)
-            if bank and not all(row["accepted"] for row in rows):
-                independent = independent_vectors(bank, self.source_hash, turn.start, turn.end)
-                if independent:
-                    expanded = check(merge_profile(self.profile, independent), strict=True)
-                    if all(row["accepted"] for row in expanded):
-                        supports[key] = evidence_spans(independent)
-                        rows = [{**row, "reference": "bootstrap"} for row in expanded]
-            if not all(row["accepted"] for row in rows) and self.cross_bank:
-                # Stage 12：跨集高纯度共享池。与单文件自举同机制——合并剖面
-                # 一半权重锚在用户原始参考（merge_profile 保持参考下限不变），
-                # 且要求全部窗口在合并剖面下通过才放行，绝不降低任何阈值。
-                cross_profile = merge_profile(self.profile, list(self.cross_bank))
-                expanded = check(cross_profile, strict=True)
-                if all(row["accepted"] for row in expanded):
-                    rows = [{**row, "reference": "cross_episode"} for row in expanded]
-                    cross_rescued.append(turn.index)
-            clean = extract_spans(turn, rows)
-            if clean and turn.duration <= SHORT_TURN_SECONDS:
-                # Stage 17：日常对话台词常在 1.2s~2.9s 之间。若短句具备以下任一强目标证据，
-                # 则豁免短句降级，保留其 clean 区间进入 Tier A。
-                turn_scores, _ = self.scores(turn.primary, turn.secondary)
-                p_slack = turn_scores[0] - self.profile.primary_reference_floor
-                slack = turn_scores[1] - self.profile.secondary_reference_floor
-                partial_windows = any(
-                    span != [turn.start, turn.end] for span in clean)
-                t_score = self.tertiary_score(turn)
-                t_strong = (t_score is not None
-                            and t_score >= self.profile.tertiary_reference_floor + 0.03
-                            and slack >= -0.02)
-                accepted_rows = [r for r in rows if r.get("accepted")]
-                cm_s_strong = bool(accepted_rows) and all(
-                    isinstance(r.get("cm_s"), (int, float)) and r["cm_s"] >= 0.25
-                    and isinstance(r.get("cm_p"), (int, float)) and r["cm_p"] >= 0.12
-                    for r in accepted_rows)
-                # Stage 17 豁免前先过局部分类器否决：高相似负例短句只有
-                # 局部分类器能区分，其他通道都会给高分。
-                strong_short_dialogue = (
-                    p_slack >= 0.12 and cm_s_strong and t_strong
-                )
-                if not strong_short_dialogue and (
-                        slack < WEAK_SECONDARY_SLACK / 2
-                        or (slack < WEAK_SECONDARY_SLACK
-                            and (turn_cohort_margin(turn) < WINDOW_COHORT_PRIMARY
-                                 or partial_windows))):
-                    borderline[turn.index] = True
-                    demoted.append(turn.index)
-                    clean = []
-                    for row in rows:
-                        row["accepted"] = False
-                        row["demoted"] = True
-            if not clean:
-                # 簇级会员但全部窗口未过：不直接丢弃，进 Tier B 待试听。
-                borderline[turn.index] = True
-            elif clean and len(clean) == 1 and turn.duration <= SHORT_TURN_SECONDS + 1.5:
-                # Stage 19：边界窗口精细剥离——当轮次仅提取出 1 个高分 1.8s 干净
-                # 子段且其双通道分数 >= floor + 0.06 时，保留该干净核心段不被
-                # partial_windows 降级逻辑抹杀（脏的那半秒已经在 extract_spans 里切掉了）。
-                core_span = clean[0]
-                core_a, core_b = core_span
-                core_p, core_s = analyzer_self_embed(core_a, core_b)
-                if (core_p >= self.profile.primary_reference_floor + 0.06
-                        and core_s >= self.profile.secondary_reference_floor + 0.04):
-                    pass  # 干净核心段有效，保留 clean 不降级
-                else:
-                    borderline[turn.index] = True
-            turn_clean_spans[key] = clean
-            membership[turn.index] = bool(clean)
-            local[key] = rows
-            if (turn.index + 1) % 25 == 0:
-                self.progress(f"簇内局部核验 {turn.index + 1}/{len(turns)}")
-
-        accepted_spans = []
-        for turn in turns:
-            if membership[turn.index]:
-                spans = turn_clean_spans.get(str(turn.index)) or [[turn.start, turn.end]]
-                accepted_spans.extend(spans)
-        diagnostics["temporal_rejected_count"] = sum(candidates.membership) - sum(membership)
-        diagnostics["accepted_spans"] = sorted(accepted_spans)
-        diagnostics["turn_clean_spans"] = turn_clean_spans
-        if demoted:
-            diagnostics["short_weak_demoted"] = demoted
-        if cross_rescued:
-            diagnostics["cross_episode_rescued_turns"] = cross_rescued
-        if bank:
-            diagnostics["bootstrap_supports"] = supports
-        return replace(candidates, membership=tuple(membership),
-                       borderline_membership=tuple(borderline),
-                       diagnostics=diagnostics), local
+        return TemporalMiner(self, turns, candidates, margin, bank, previous).run()
 
     def provenance(self):
         code = [Path(__file__), Path(__file__).with_name("identity_cluster.py"),
+                Path(__file__).with_name("anime_embedding.py"),
+                Path(__file__).with_name("temporal_mining.py"),
+                *[Path(__file__).with_name(name + ".py") for name in (
+                    "identity_trajectory", "episode_manifold", "scene_dialogue",
+                    "exclusion_reliability", "candidate_topology", "physiology", "physiology_runtime",
+                    "feature_pyramid", "pyramid_batching", "score_calibration", "identity_heatmap")],
                 Path(__file__).with_name("embedding_cache.py"),
                 Path(__file__).with_name("cluster_reporting.py"),
                 Path(__file__).with_name("cluster_gate.py"),
@@ -778,9 +929,19 @@ class ClusterAnalyzer:
                 "exclusion_groups": [list(map(str, group)) for group in self.negative_groups],
                 "source_sha256": self.source_hash, "encoding_version": self.encoding_version,
                 "cache_hits": self.cache.hits, "cache_misses": self.cache.misses,
+                "purified_reference_indexes": list(getattr(self, "purified_reference_indexes", ())),
+                "anime": {"enabled": self.anime_encoders is not None,
+                          "hash": self.anime_hash or None,
+                          "cache_hits": self.anime_cache.hits if self.anime_cache else 0,
+                          "cache_misses": self.anime_cache.misses if self.anime_cache else 0},
+                "learned_exclusions": {"sha256": self.auto_negative_hash or None,
+                    "prototypes": len(self.auto_negatives),
+                    "anime_char": sum("anime_char" in views for views in (self.auto_negative_anime or {}).values()),
+                    "anime_va": sum("anime_va" in views for views in (self.auto_negative_anime or {}).values())},
                 "tertiary": {"enabled": self.tertiary is not None,
                              "hash": self.tertiary_hash or None,
                              "cache_hits": self.tertiary_cache.hits if self.tertiary_cache else 0,
                              "cache_misses": self.tertiary_cache.misses if self.tertiary_cache else 0},
                 "bootstrap": self.bootstrap_provenance,
+                "physiology": self.physiology_diagnostics(),
                 "cross_bank_size": len(self.cross_bank)}

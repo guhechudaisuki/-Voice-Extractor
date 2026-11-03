@@ -38,11 +38,7 @@ def save_app_settings(settings: dict) -> None:
 
 
 class DesktopSettingsTab:
-    """
-    桌面端系统设置与界面切换标签页
-    - 支持在 Desktop 原生模式与 WebUI 现代网页模式之间自由切换
-    - 切换为 WebUI 时，自动拉起 WebUI 前端并自动关闭当前 Desktop 桌面程序
-    """
+    """桌面偏好设置与桌面、网页界面切换。"""
 
     def __init__(self, parent_notebook: ttk.Notebook, root: tk.Tk, close_callback=None) -> None:
         self.root = root
@@ -72,7 +68,6 @@ class DesktopSettingsTab:
             style="CardText.TLabel",
         ).pack(anchor="w", pady=(2, 0))
 
-        # 模式切换卡片
         mode_box = ttk.LabelFrame(self.tab_frame, text=" 前端呈现模式 (UI Mode) ", padding=14)
         mode_box.pack(fill="x", pady=(0, 14))
 
@@ -86,13 +81,12 @@ class DesktopSettingsTab:
 
         rb_webui = ttk.Radiobutton(
             mode_box,
-            text="🌐 WebUI 现代声学网页模式 (高质感暗黑流线、实时音频频谱动画、全触控卡片)",
+            text="🌐 WebUI 网页模式 (在浏览器中提取、试听和标注)",
             variable=self.ui_mode_var,
             value="webui",
         )
         rb_webui.pack(anchor="w", pady=(0, 12))
 
-        # 切换动作按钮
         btn_bar = ttk.Frame(mode_box)
         btn_bar.pack(anchor="w", pady=(4, 0))
         ttk.Button(
@@ -108,7 +102,6 @@ class DesktopSettingsTab:
             style="CardText.TLabel",
         ).pack(anchor="w", pady=(8, 0))
 
-        # 服务端口与标注参数设置
         params_box = ttk.LabelFrame(self.tab_frame, text=" 标注与服务配置 ", padding=14)
         params_box.pack(fill="x", pady=(0, 14))
 
@@ -129,7 +122,6 @@ class DesktopSettingsTab:
             variable=self.auto_next_var,
         ).pack(anchor="w", pady=(0, 6))
 
-        # 保存按钮
         action_bar = ttk.Frame(self.tab_frame)
         action_bar.pack(fill="x", pady=(10, 0))
         ttk.Button(action_bar, text="保存偏好", width=14, command=self.save_settings).pack(side="right")
@@ -158,7 +150,6 @@ class DesktopSettingsTab:
             messagebox.showerror("启动失败", f"启动 WebUI 失败: {e}")
             return
 
-        # 优雅销毁并退出当前桌面程序
         self.root.after(300, self._exit_desktop)
 
     def _exit_desktop(self) -> None:

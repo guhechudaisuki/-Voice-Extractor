@@ -36,6 +36,11 @@ def _run(command: list[str]) -> subprocess.CompletedProcess[str]:
 
 
 def probe_duration(path: Path) -> float:
+    try:
+        info = sf.info(str(path))
+        return info.frames / info.samplerate
+    except (OSError, RuntimeError):
+        pass
     result = _run(
         [
             str(FFPROBE),
@@ -100,6 +105,29 @@ def normalize_audio(source: Path, destination: Path, sample_rate: int = 44100, s
 def extract_audio_range(source: Path, destination: Path, start: float, end: float) -> Path:
     """Decode one bounded range for long-audio processing."""
     destination.parent.mkdir(parents=True, exist_ok=True)
+    if not math.isfinite(start) or not math.isfinite(end) or end <= max(0., start):
+        raise ValueError("Invalid audio range")
+    try:
+        handle = sf.SoundFile(str(source))
+    except (OSError, RuntimeError):
+        handle = None
+    if handle is not None:
+        with handle:
+            rate = handle.samplerate
+            first = max(0, round(start * rate))
+            last = min(len(handle), round(end * rate))
+            if last <= first:
+                raise ValueError("Audio range exceeds recording")
+            handle.seek(first)
+            data = handle.read(last - first, dtype="float32", always_2d=True)
+        if data.shape[1] == 1:
+            data = np.repeat(data, 2, axis=1)
+        elif data.shape[1] > 2:
+            data = np.repeat(data.mean(axis=1, keepdims=True), 2, axis=1)
+        if rate != 44100:
+            data = torchaudio.functional.resample(torch.from_numpy(data.T), rate, 44100).T.numpy()
+        sf.write(str(destination), data, 44100, subtype="PCM_16")
+        return destination
     _run(
         [
             str(FFMPEG),

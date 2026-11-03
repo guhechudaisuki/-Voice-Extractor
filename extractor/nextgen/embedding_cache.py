@@ -3,11 +3,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import io
 import os
-import tempfile
+from collections import OrderedDict
 from pathlib import Path
+from zipfile import BadZipFile
 
 import numpy as np
+from .feature_store import FeatureStore
 
 
 def file_digest(path: Path) -> str:
@@ -27,34 +30,75 @@ def cache_key(source_sha256: str, start: float, end: float,
     ], separators=(",", ":")).encode()).hexdigest()
 
 
+def canonical_interval(start, end, sample_rate=16000):
+    """Half-open sample bounds, with no implicit edge trimming."""
+    if not np.isfinite(start) or not np.isfinite(end) or end <= max(0., start):
+        raise ValueError("Invalid audio interval")
+    return round(max(0., float(start)) * sample_rate) / sample_rate, round(float(end) * sample_rate) / sample_rate
+
+
 class EmbeddingCache:
-    def __init__(self, root: Path, enabled: bool = True):
+    def __init__(self, root: Path, enabled: bool = True, *, writable=True):
         self.root, self.enabled = Path(root), enabled
         self.hits = self.misses = 0
+        self.memory = OrderedDict()
+        self.store = None
+        self.writable = writable
+        self.persist = os.environ.get("VOICE_EXTRACT_PERSIST_CACHE") == "1"
+
+    def _store(self):
+        if self.store is None:
+            self.store = FeatureStore(self.root / "features.sqlite3")
+        return self.store
+
+    @staticmethod
+    def _valid(vectors):
+        return len(vectors) == 2 and all(
+            v.ndim == 1 and np.isfinite(v).all() and np.linalg.norm(v) > 0 for v in vectors)
+
+    def _remember(self, key, vectors):
+        self.memory[key] = vectors
+        self.memory.move_to_end(key)
+
+    def get_many(self, keys):
+        result = {key: self.memory[key] for key in keys if key in self.memory}
+        missing = list(dict.fromkeys(key for key in keys if key not in result))
+        blobs = self._store().get_many(missing) if self.enabled and self.persist and missing else {}
+        for key in missing:
+            legacy = self.root / key[:2] / (key + ".npz")
+            source = io.BytesIO(blobs[key]) if key in blobs else legacy
+            if not self.enabled or not self.persist or (key not in blobs and not legacy.is_file()):
+                continue
+            try:
+                with np.load(source, allow_pickle=False) as data:
+                    vectors = (data["primary"].copy(), data["secondary"].copy())
+                if self._valid(vectors):
+                    result[key] = vectors
+                    self._remember(key, vectors)
+            except (OSError, ValueError, KeyError, EOFError, BadZipFile):
+                continue
+        self.hits += len(result)
+        self.misses += len(set(keys) - result.keys())
+        return result
+
+    def put_many(self, values):
+        blobs = []
+        for key, vectors in values:
+            vectors = tuple(np.asarray(v, dtype=np.float32) for v in vectors)
+            if not self._valid(vectors):
+                raise ValueError("Invalid embedding; refusing to cache")
+            self._remember(key, vectors)
+            if self.enabled and self.persist and self.writable:
+                stream = io.BytesIO()
+                np.savez(stream, primary=vectors[0], secondary=vectors[1])
+                blobs.append((key, stream.getvalue()))
+        if blobs:
+            self._store().put_many(blobs)
 
     def get_or_compute(self, key: str, compute):
-        path = self.root / key[:2] / (key + ".npz")
-        if self.enabled and path.is_file():
-            try:
-                with np.load(path, allow_pickle=False) as data:
-                    vectors = (data["primary"].copy(), data["secondary"].copy())
-                    if all(v.ndim == 1 and np.isfinite(v).all() and np.linalg.norm(v) > 0 for v in vectors):
-                        self.hits += 1
-                        return vectors
-            except (OSError, ValueError, KeyError):
-                pass
-        self.misses += 1
+        cached = self.get_many([key])
+        if key in cached:
+            return cached[key]
         vectors = tuple(np.asarray(v, dtype=np.float32) for v in compute())
-        if not all(v.ndim == 1 and np.isfinite(v).all() and np.linalg.norm(v) > 0 for v in vectors):
-            raise ValueError("Invalid embedding; refusing to cache")
-        if self.enabled:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            descriptor, temporary = tempfile.mkstemp(dir=path.parent, suffix=".npz")
-            try:
-                with os.fdopen(descriptor, "wb") as stream:
-                    np.savez_compressed(stream, primary=vectors[0], secondary=vectors[1])
-                os.replace(temporary, path)
-            finally:
-                if os.path.exists(temporary):
-                    os.unlink(temporary)
+        self.put_many([(key, vectors)])
         return vectors

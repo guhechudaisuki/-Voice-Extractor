@@ -64,11 +64,7 @@ class SourceTimeline:
 
 @dataclass(frozen=True)
 class ViewAlignment:
-    """Positive delay means a source event appears later in the derived view.
-
-    Delay is measured in view samples; it is not inferred from sample rates.
-    Outward rounding preserves coverage, rather than trimming fractional edges.
-    """
+    """Measured delay in view samples; positive means the derived signal arrives later."""
     source: SourceTimeline
     view_rate: int
     view_samples: int

@@ -43,7 +43,7 @@ def main() -> int:
         options_data = request.get("options", {})
         options = PipelineOptions(
             cluster_identity_mode=str(options_data.get("cluster_identity_mode",
-                "enforce" if options_data.get("cluster_bootstrap", False) else "audit")),
+                "enforce")),
             cluster_bootstrap=bool(options_data.get("cluster_bootstrap", False)),
             cluster_bootstrap_max_rounds=options_data.get("cluster_bootstrap_max_rounds", 3),
             cluster_target_margin=float(options_data.get("cluster_target_margin", .06)),
@@ -62,6 +62,7 @@ def main() -> int:
             use_singing_detector=bool(options_data.get("use_singing_detector", True)),
             export_all_sentences=bool(options_data.get("export_all_sentences", False)),
             export_video_clips=bool(options_data.get("export_video_clips", False)),
+            export_sample_rate=int(options_data.get('export_sample_rate', 16000)),
         )
 
         def progress(value: float, message: str) -> None:

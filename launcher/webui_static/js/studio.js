@@ -31,7 +31,7 @@ const app = {
   subtitleBindings: new Map(),
   // 簇视图
   clusters: null,        // /api/batches/<id>/clusters 的返回
-  turns: [],             // stage_audit 里的说话轮次时间段
+  turns: [],            // 说话轮次时间段
   segCluster: {},        // 输出片段序号 -> 簇 id
   activeCluster: null,   // 当前筛选中的簇 id
   view: "player",        // player | cluster
@@ -68,6 +68,21 @@ function currentSegment() {
   return app.segments[app.index] || null;
 }
 
+function tierRank(seg) {
+  return [seg.tier_b_rank_score, seg.calibrated_fusion_score, seg.score]
+    .find(value => typeof value === "number" && Number.isFinite(value)) ?? -Infinity;
+}
+
+function qualityGrade(seg) {
+  const grade = seg.acoustic_qc?.quality_grade;
+  return ["Gold", "Silver", "Review"].includes(grade) ? grade : "";
+}
+
+function qualityBadge(seg) {
+  const grade = qualityGrade(seg);
+  return grade ? `<span class="quality-badge quality-${grade.toLowerCase()}">${{Gold:"🏅", Silver:"🥈", Review:"⚠️"}[grade]} ${grade}</span>` : "";
+}
+
 /* ── 面板与标签页 ───────────────────────────────────────── */
 
 document.querySelectorAll(".tab").forEach((tab) => {
@@ -89,7 +104,11 @@ function applyBlind() {
 
 $("blindBtn").addEventListener("click", () => {
   app.blind = !app.blind;
+  if (!app.blind) prefillTrimProposal();
+  else if (app.trimSuggested && !app.trimDirty) { $('trimBox').hidden = true; $('trimRanges').value = ''; }
+  drawWave(app.peaks || []);
   applyBlind();
+  renderList();
   toast(app.blind ? "盲听：已隐藏分数" : "已显示分数与判定路线");
 });
 
@@ -138,6 +157,9 @@ async function loadBatch(batchId) {
   app.batchId = batchId;
   app.segments = [];
   app.reviews = {};
+  app.index = -1;
+  app.activeCluster = null;
+  resetPlayer();
   refreshMeta();
   try {
     const response = await fetch(`/api/batches/${encodeURIComponent(batchId)}`);
@@ -158,8 +180,8 @@ async function loadBatch(batchId) {
     refreshMeta();
 
     renderList();
-    const firstAccepted = app.segments.findIndex((seg) => seg.accepted);
-    if (app.segments.length) select(Math.max(0, firstAccepted), false);
+    const first = visibleSegments()[0];
+    if (first) select(app.segments.indexOf(first), false);
     else {
       $("segList").innerHTML = '<p class="empty">这个批次没有保留的片段。</p>';
       resetPlayer();
@@ -225,13 +247,7 @@ async function loadClusters(batchId, targetDir = null) {
   }
 }
 
-/**
- * 把输出片段对到簇上。
- *
- * 报告里的成员是**说话轮次**序号（一集 254 个），而界面试听的是**最终输出
- * 片段**（一集 28 段）。一个输出段可能由多个轮次拼成，也可能只覆盖某个轮次的
- * 一部分，所以只能按时间段重叠匹配，并且取重叠最多的那个轮次所属的簇。
- */
+// 轮次序号与输出片段序号不同，按最大时间重叠匹配所属簇。
 function mapSegmentsToClusters(segments, clusters, turns) {
   const mapping = {};
   if (!clusters) return mapping;
@@ -417,6 +433,9 @@ function applyClusterFilter() {
     });
   }
   renderList();
+  const first = visibleSegments()[0];
+  if (first) select(app.segments.indexOf(first), false);
+  else { app.index = -1; resetPlayer(); }
 }
 
 /* ── 片段列表 ───────────────────────────────────────────── */
@@ -425,7 +444,7 @@ $("filters").addEventListener("click", (event) => {
   const chip = event.target.closest("[data-filter]");
   if (!chip) return;
   const wasClusterChip = chip.id === "clusterFilterChip";
-  // 再点一次同一类筛选，或点别的筛选条件，都退出"按簇看"的状态
+  // 切换筛选时清除簇选择。
   app.activeCluster = null;
   app.filter = wasClusterChip ? "all" : chip.dataset.filter;
   $("clusterFilterChip").hidden = true;
@@ -434,23 +453,47 @@ $("filters").addEventListener("click", (event) => {
   (wasClusterChip ? document.querySelector('[data-filter="all"]') : chip)
     .classList.add("is-on");
   renderList();
+  const first = visibleSegments()[0];
+  if (first) select(app.segments.indexOf(first), false);
+  else { app.index = -1; resetPlayer(); }
 });
 
 function visibleSegments() {
-  return app.segments.filter((seg) => {
+  const rows = app.segments.filter((seg) => {
     // Tier 视图：主输出 / 边缘捡漏 / 已撤下
     if (app.filter === "tierA") return seg.accepted;
     if (app.filter === "tierB") return !seg.accepted && seg.cluster_tier === "B";
     if (app.filter === "removed") return !seg.accepted && seg.cluster_tier !== "B";
-    if (!seg.accepted && seg.cluster_tier !== "B" && app.filter !== "cluster") return false;
+    if (!seg.accepted && seg.cluster_tier !== "B" && !["cluster", "active"].includes(app.filter)) return false;
     const done = Boolean(app.reviews[seg.ordinal]);
-    if (app.filter === "todo") return !done;
+    if (app.filter === "unreviewed" || app.filter === "active") return !done;
     if (app.filter === "done") return done;
     if (app.filter === "cluster" && app.activeCluster != null) {
       return app.segCluster[seg.ordinal] === app.activeCluster;
     }
     return true;
   });
+  if (app.filter === "active") return activeLearningOrder(rows);
+  if (["tierB","removed"].includes(app.filter) && rows.some(s => s.live_information != null))
+    return rows.sort((a,b) => (b.live_information ?? -1)-(a.live_information ?? -1));
+  return app.filter === "tierB" ? rows.sort((a, b) => tierRank(b) - tierRank(a)) : rows;
+}
+
+function activeLearningOrder(rows) {
+  // Greedy information + farthest-signature sampling for a diverse first 15.
+  const remaining = [...rows], selected = [];
+  const distance = (a, b) => {
+    const pairs = (a.identity_signature || []).map((v,i) => [v,b.identity_signature?.[i]])
+      .filter(pair => pair.every(v => typeof v === "number" && Number.isFinite(v)));
+    return pairs.length ? Math.sqrt(pairs.reduce((s,[x,y]) => s+(x-y)**2,0)/pairs.length) : 0;
+  };
+  while (remaining.length && selected.length < 15) {
+    const score = seg => (seg.live_information ?? (Number(seg.information_score) || 0)) +
+      (selected.length ? Math.min(...selected.map(other => distance(seg,other))) : 0);
+    remaining.sort((a,b) => score(b)-score(a) || a.ordinal-b.ordinal);
+    selected.push(remaining.shift());
+  }
+  return [...selected,...remaining.sort((a,b) => (Number(b.information_score)||0)-(Number(a.information_score)||0))];
 }
 
 function renderList() {
@@ -487,9 +530,9 @@ function renderList() {
     node.innerHTML =
       `<span class="seg-no">${String(seg.ordinal).padStart(3, "0")}</span>` +
       `<span class="seg-body">` +
-        `<span class="seg-text">${escapeHtml(seg.stt_text) || seg.filename}</span>` +
+        `<span class="seg-text">${escapeHtml(seg.stt_text) || escapeHtml(seg.filename)}</span>` +
         `<span class="seg-sub">${fmtTime(seg.start)}–${fmtTime(seg.end)}s · ${seg.duration.toFixed(2)}s${seg.accepted ? "" : " · 已撤下"}</span>` +
-      `</span>` + clusterTag + tag;
+      `</span>` + (!app.blind ? qualityBadge(seg) : "") + clusterTag + tag;
 
     node.addEventListener("click", () => {
       const position = app.segments.indexOf(seg);
@@ -510,6 +553,7 @@ function escapeHtml(text) {
 
 function select(position, autoplay) {
   if (position < 0 || position >= app.segments.length) return;
+  clearKeepPlayback();
   app.index = position;
   const seg = app.segments[position];
 
@@ -522,10 +566,12 @@ function select(position, autoplay) {
   $("nowFile").textContent = seg.filename;
   $("nowDuration").textContent = seg.duration.toFixed(2) + "s";
   $("srcRange").textContent = `源 ${fmtTime(seg.start)} – ${fmtTime(seg.end)}s`;
-  $("sttLine").textContent = seg.stt_text || "（无识别文本）";
+  $("sttLine").textContent = app.reviews[seg.ordinal]?.revised_text ?? seg.stt_text ?? "";
   $("scopeEmpty").hidden = true;
 
   const readout = [
+    `质量 ${qualityGrade(seg) || "—"} · SNR ${seg.acoustic_qc?.snr_db ?? "—"} dB`,
+    `融合分 ${seg.calibrated_fusion_score ?? "—"}`,
     `层级 ${seg.tier || "—"}`,
     `路线 ${seg.route || "—"}`,
     `相似度 ${seg.score == null ? "—" : Number(seg.score).toFixed(4)}`,
@@ -541,7 +587,11 @@ function select(position, autoplay) {
 }
 
 function resetPlayer() {
+  app.identityHeatmap = null;
+  clearKeepPlayback();
+  audio.pause();
   audio.removeAttribute("src");
+  ++app.decodeToken;
   $("nowIndex").textContent = "—";
   $("nowFile").textContent = "未选择片段";
   $("nowDuration").textContent = "0.00s";
@@ -555,6 +605,7 @@ function resetPlayer() {
 }
 
 async function loadAudio(seg, autoplay) {
+  app.identityHeatmap = null;
   audio.src = `/api/audio/${encodeURIComponent(app.batchId)}/${seg.ordinal}`;
   audio.load();
   $("curTime").textContent = "0.00";
@@ -566,6 +617,16 @@ async function loadAudio(seg, autoplay) {
 async function drawWaveFor(seg, autoplay) {
   const key = `${app.batchId}:${seg.ordinal}`;
   const token = ++app.decodeToken;
+  app.identityHeatmap = null;
+  {
+    fetch(`/api/identity_heatmap/${encodeURIComponent(app.batchId)}/${seg.ordinal}`)
+      .then(response => response.ok ? response.json() : null).then(data => {
+        if (token !== app.decodeToken) return;
+        app.identityHeatmap = data;
+        prefillTrimProposal();
+        drawWave(app.peaks || []);
+      }).catch(() => {});
+  }
   try {
     const response = await fetch(`/api/audio/${encodeURIComponent(app.batchId)}/${seg.ordinal}`);
     const buffer = await response.arrayBuffer();
@@ -574,6 +635,8 @@ async function drawWaveFor(seg, autoplay) {
     context.close();
     if (token !== app.decodeToken) return;
     app.peaks = computePeaks(decoded.getChannelData(0), 900);
+    app.waveSamples = decoded.getChannelData(0);
+    app.waveRate = decoded.sampleRate;
     app.peaksFor = key;
     drawWave(app.peaks);
   } catch (error) {
@@ -630,20 +693,19 @@ function drawWave(peaks) {
   }
   ctx.stroke();
 
+  drawIdentityHeat(ctx, width, height);
   if (!peaks.length) return;
 
   const barWidth = width / peaks.length;
-  // 频谱渐变：左青右紫，和界面主色一致
   const gradient = ctx.createLinearGradient(0, 0, width, 0);
   gradient.addColorStop(0, "#4de3ff");
   gradient.addColorStop(0.52, "#6d8dff");
   gradient.addColorStop(1, "#a06bff");
 
-  // 上下各一层光晕，让波形看起来在发光
   ctx.shadowColor = "rgba(77, 227, 255, 0.55)";
   ctx.shadowBlur = 9;
 
-  // roundRect 是较新的 Canvas API，旧内核上没有，退化用矩形
+  // 旧版 WebView 不支持 roundRect。
   const rounded = typeof ctx.roundRect === "function";
   ctx.beginPath();
   for (let i = 0; i < peaks.length; i += 1) {
@@ -663,29 +725,127 @@ function drawWave(peaks) {
 
   // 部分非目标的区间标记
   const segment = currentSegment();
-  const rev = segment ? app.reviews[segment.ordinal] : null;
-  if (rev && rev.label === "partial") {
-    const from = clamp((Number(rev.partial_start) || 0) / segment.duration, 0, 1);
-    const to = clamp((Number(rev.partial_end) || segment.duration) / segment.duration, 0, 1);
-    const left = from * width;
-    const span = Math.max(2, (to - from) * width);
-    const mark = ctx.createLinearGradient(left, 0, left + span, 0);
-    mark.addColorStop(0, "rgba(255, 107, 129, 0.30)");
-    mark.addColorStop(1, "rgba(255, 107, 129, 0.14)");
-    ctx.fillStyle = mark;
-    ctx.fillRect(left, 0, span, height);
-    ctx.strokeStyle = "rgba(255, 107, 129, 0.75)";
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(left, 0); ctx.lineTo(left, height);
-    ctx.moveTo(left + span, 0); ctx.lineTo(left + span, height);
-    ctx.stroke();
+  if (segment && !$('trimBox').hidden) {
+    let ranges = [];
+    try { ranges = readTrimIntervals(segment); } catch (_) { /* In-progress numeric input. */ }
+    for (const bounds of ranges) {
+      const from = clamp((Number(bounds[0]) || 0) / segment.duration, 0, 1);
+      const to = clamp((Number(bounds[1]) || segment.duration) / segment.duration, 0, 1);
+      const left = from * width;
+      const span = Math.max(2, (to - from) * width);
+      const mark = ctx.createLinearGradient(left, 0, left + span, 0);
+      mark.addColorStop(0, "rgba(255, 107, 129, 0.30)");
+      mark.addColorStop(1, "rgba(255, 107, 129, 0.14)");
+      ctx.fillStyle = mark;
+      ctx.fillRect(left, 0, span, height);
+      ctx.strokeStyle = "rgba(255, 107, 129, 0.75)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(left, 0); ctx.lineTo(left, height);
+      ctx.moveTo(left + span, 0); ctx.lineTo(left + span, height);
+      ctx.stroke();
+      ctx.fillStyle = '#ff6b81';
+      ctx.fillRect(left-4,height/2-14,8,28);
+      ctx.fillRect(left+span-4,height/2-14,8,28);
+    }
   }
 }
 
+function prefillTrimProposal() {
+  const seg = currentSegment(), heat = app.identityHeatmap;
+  if (!seg || !heat || app.blind || app.trimDirty || $('trimBox').hidden || app.reviews[seg.ordinal]?.label) return;
+  const ranges = [];
+  for (const frame of heat.frames || []) {
+    if (!(Number.isFinite(frame.evidence) && frame.evidence < -.5)) continue;
+    const a = clamp(frame.offset,0,seg.duration), b = clamp(frame.end,0,seg.duration);
+    if (b <= a) continue;
+    if (ranges.length && a <= ranges.at(-1)[1]+.021) ranges.at(-1)[1] = Math.max(b,ranges.at(-1)[1]);
+    else ranges.push([a,b]);
+  }
+  const span = heat.classifier_trim_proposal?.span;
+  if (!ranges.length && span?.length === 2 && span.every(Number.isFinite)) {
+    const a = clamp(span[0]-seg.start,0,seg.duration), b = clamp(span[1]-seg.start,0,seg.duration);
+    if (a > 0) ranges.push([0,a]); if (b < seg.duration) ranges.push([b,seg.duration]);
+  }
+  const useful = ranges.filter(([a,b]) => b-a >= .1);
+  if (!useful.length || useful.reduce((s,[a,b]) => s+b-a,0) >= seg.duration-.1) return;
+  $('trimRanges').value = useful.map(([a,b]) => `${a.toFixed(3)}-${b.toFixed(3)}`).join('; ');
+  $('trimStart').value = useful[0][0].toFixed(3); $('trimEnd').value = useful[0][1].toFixed(3);
+  app.trimSuggested = true;
+}
+
+function snapTrimTime(value, seg) {
+  const boundaries = (app.identityHeatmap?.frames || []).filter((f,i,a) => i &&
+    Number.isFinite(f.evidence) && Number.isFinite(a[i-1].evidence) &&
+    Math.sign(f.evidence) !== Math.sign(a[i-1].evidence)).map(f => f.offset);
+  const nearest = boundaries.sort((a,b) => Math.abs(a-value)-Math.abs(b-value))[0];
+  if (nearest != null && Math.abs(nearest-value)<.025) value = nearest;
+  const samples = app.waveSamples, rate = app.waveRate;
+  if (samples && rate && app.peaksFor === `${app.batchId}:${seg.ordinal}`) {
+    const center = Math.round(value*rate), radius = Math.round(.003*rate);
+    let best = center, distance = Infinity;
+    for (let i=Math.max(1,center-radius); i<Math.min(samples.length,center+radius); i++) {
+      if (samples[i]*samples[i-1] <= 0 && Math.abs(i-center)<distance) { best=i; distance=Math.abs(i-center); }
+    }
+    value = best/rate;
+  }
+  return clamp(value,0,seg.duration);
+}
+const trimCanvas = $('waveCanvas');
+trimCanvas.style.touchAction = 'none';
+trimCanvas.addEventListener('pointerdown',event => {
+  const seg = currentSegment(); if (!seg || $('trimBox').hidden) return;
+  let ranges; try { ranges = readTrimIntervals(seg); } catch (_) { return; }
+  const rect = trimCanvas.getBoundingClientRect(), x = event.clientX-rect.left;
+  let handle = null, distance = 12;
+  ranges.forEach((range,i) => range.forEach((time,edge) => {
+    const d = Math.abs(time/seg.duration*rect.width-x);
+    if (d <= distance) { distance=d; handle={index:i,edge,ranges}; }
+  }));
+  if (!handle) return;
+  app.trimDrag = handle; app.trimDragged = true; app.trimDirty = true;
+  app.trimRangeIndex = handle.index;
+  trimCanvas.setPointerCapture(event.pointerId); event.preventDefault();
+});
+trimCanvas.addEventListener('pointermove',event => {
+  const drag = app.trimDrag, seg = currentSegment(); if (!drag || !seg) return;
+  const rect = trimCanvas.getBoundingClientRect();
+  const value = snapTrimTime((event.clientX-rect.left)/rect.width*seg.duration,seg);
+  const pair = drag.ranges[drag.index];
+  pair[drag.edge] = drag.edge ? clamp(value,pair[0]+.01,seg.duration) : clamp(value,0,pair[1]-.01);
+  $('trimRanges').value = drag.ranges.map(p => p.map(v => v.toFixed(3)).join('-')).join('; ');
+  $('trimStart').value = pair[0].toFixed(3); $('trimEnd').value = pair[1].toFixed(3);
+  drawWave(app.peaks || []);
+});
+for (const type of ['pointerup','pointercancel']) trimCanvas.addEventListener(type,event => {
+  app.trimDrag = null;
+  if (trimCanvas.hasPointerCapture(event.pointerId)) trimCanvas.releasePointerCapture(event.pointerId);
+});
 window.addEventListener("resize", () => drawWave(app.peaks || []));
 
+function drawIdentityHeat(ctx, width, height) {
+  const heat = app.identityHeatmap, seg = currentSegment();
+  const available = Boolean(!app.blind && heat?.frames?.length && seg?.duration);
+  $("identityHeatLegend").hidden = !available;
+  if (!available) return;
+  const channels = heat.channels || [];
+  for (const frame of heat.frames) {
+    const x = clamp(frame.offset/seg.duration,0,1)*width;
+    const w = Math.max(1,(clamp(frame.end/seg.duration,0,1)*width)-x);
+    const color = value => value == null || !Number.isFinite(value) ? "rgba(150,150,150,.18)" :
+      value > 0 ? `rgba(50,210,150,${.15+.5*Math.tanh(Math.abs(value))})` :
+      `rgba(255,80,105,${.2+.5*Math.tanh(Math.abs(value))})`;
+    ctx.fillStyle = frame.blocked ? "rgba(255,80,105,.30)" : color(frame.evidence);
+    ctx.fillRect(x,0,w,height);
+    channels.forEach((name,i) => {
+      ctx.fillStyle = color(frame.channels?.[name]);
+      ctx.fillRect(x,height-(channels.length-i)*5,w,4);
+    });
+  }
+}
+
 $("waveCanvas").addEventListener("click", (event) => {
+  if (app.trimDragged) { app.trimDragged = false; return; }
   if (!audio.duration) return;
   const rect = event.target.getBoundingClientRect();
   audio.currentTime = clamp((event.clientX - rect.left) / rect.width, 0, 1) * audio.duration;
@@ -719,18 +879,18 @@ $("playBtn").addEventListener("click", () => {
   else { audio.pause(); $("playLabel").textContent = "播放"; }
 });
 
-$("replayBtn").addEventListener("click", () => { audio.currentTime = 0; play(); });
+$("replayBtn").addEventListener("click", () => {
+  if (app.reviews[currentSegment()?.ordinal]?.label === "partial") $("keepPlayBtn").click();
+  else { clearKeepPlayback(); audio.currentTime = 0; play(); }
+});
 $("prevBtn").addEventListener("click", () => step(-1));
 $("nextBtn").addEventListener("click", () => step(1));
 
 function step(delta) {
-  const visible = new Set(visibleSegments().map((seg) => seg.ordinal));
-  for (let position = app.index + delta; position >= 0 && position < app.segments.length; position += delta) {
-    if (visible.has(app.segments[position].ordinal)) {
-      select(position, true);
-      return;
-    }
-  }
+  const visible = visibleSegments();
+  const position = visible.indexOf(currentSegment());
+  const next = position >= 0 ? visible[position + delta] : visible[delta > 0 ? 0 : visible.length - 1];
+  if (next) select(app.segments.indexOf(next), true);
 }
 
 /* ── 裁决 ───────────────────────────────────────────────── */
@@ -739,30 +899,47 @@ document.querySelectorAll(".pad").forEach((pad) => {
   pad.addEventListener("click", () => decide(pad.dataset.label));
 });
 
+function readTrimIntervals(seg) {
+  const text = $("trimRanges").value.trim();
+  const intervals = text ? text.split(/[;；]+/).map(part => {
+    const match = part.trim().match(/^(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)$/);
+    if (!match) throw new Error("请填写区间，例如 0.5-1.2; 2.8-3.4");
+    return [Number(match[1]), Number(match[2])];
+  }) : [[parseFloat($("trimStart").value), parseFloat($("trimEnd").value)]];
+  if (!intervals.every(([a, b]) => Number.isFinite(a) && Number.isFinite(b) && a >= 0 && b > a && b <= seg.duration + .02))
+    throw new Error("污染区间必须位于片段内");
+  return intervals;
+}
+
 function decide(label) {
   const seg = currentSegment();
   if (!seg) return;
 
+  if (label === "partial" && $("trimBox").hidden) {
+    $("trimBox").hidden = false;
+    prefillTrimProposal();
+    $("trimStart").focus();
+    return;
+  }
+  const visibleBefore = visibleSegments();
+  const next = visibleBefore[visibleBefore.indexOf(seg) + 1];
+  let intervals = null;
   if (label === "partial") {
-    const duration = seg.duration;
-    const from = parseFloat($("trimStart").value);
-    const to = parseFloat($("trimEnd").value);
-    if (!Number.isFinite(from) || !Number.isFinite(to) || from < 0 || to <= from || to > duration) {
-      $("trimBox").hidden = false;
-      toast("请先填好他人声音的起止秒数");
-      return;
-    }
+    try { intervals = readTrimIntervals(seg); }
+    catch (error) { toast(error.message, "err"); return; }
   }
 
   app.history.push(JSON.stringify(app.reviews));
   if (app.history.length > 60) app.history.shift();
 
   app.reviews[seg.ordinal] = {
+    revised_text: app.reviews[seg.ordinal]?.revised_text ?? null,
     ordinal: seg.ordinal,
     filename: seg.filename,
     label: label,
-    partial_start: label === "partial" ? parseFloat($("trimStart").value) : null,
-    partial_end: label === "partial" ? parseFloat($("trimEnd").value) : null,
+    partial_start: intervals ? intervals[0][0] : null,
+    partial_intervals: intervals,
+    partial_end: intervals ? intervals[0][1] : null,
     partial_text: label === "partial" ? (($("partialText") || {}).value || "").trim() || null : null,
   };
 
@@ -771,13 +948,16 @@ function decide(label) {
   refreshMeta();
   save(false);
 
-  if ($("autoNext").checked && app.index < app.segments.length - 1) {
-    setTimeout(() => step(1), 260);
+  if ($("autoNext").checked && label !== "partial" && next) {
+    select(app.segments.indexOf(next), true);
   }
 }
 
 function reflectReview(ordinal) {
+  app.trimRangeIndex = 0;
+  app.trimDirty = false; app.trimSuggested = false;
   const review = app.reviews[ordinal] || {};
+  $('sttLine').contentEditable = review.label === 'correct' ? 'true' : 'false';
   document.querySelectorAll(".pad").forEach((pad) => {
     pad.classList.toggle("is-set", pad.dataset.label === review.label);
   });
@@ -791,10 +971,13 @@ function reflectReview(ordinal) {
     $("trimBox").hidden = false;
     const partialInput = $("partialText");
     if (partialInput) partialInput.value = review.partial_text || "";
-    $("trimStart").value = (review.partial_start ?? 0).toFixed(2);
-    $("trimEnd").value = (review.partial_end ?? seg.duration).toFixed(2);
+    $("trimRanges").value = (review.partial_intervals || []).map(pair => pair.join("-")).join("; ");
+    $("trimStart").value = (review.partial_intervals?.[0]?.[0] ?? review.partial_start ?? 0).toFixed(2);
+    $("trimEnd").value = (review.partial_intervals?.[0]?.[1] ?? review.partial_end ?? seg.duration).toFixed(2);
   } else {
     $("trimBox").hidden = true;
+    $("partialText").value = "";
+    $("trimRanges").value = "";
     if (seg) {
       $("trimStart").value = "0.00";
       $("trimEnd").value = seg.duration.toFixed(2);
@@ -808,31 +991,60 @@ $("trimFromPlayhead").addEventListener("click", () => {
   const seg = currentSegment();
   if (!seg) return;
   $("trimStart").value = clamp(audio.currentTime, 0, seg.duration).toFixed(2);
+  syncTrimNumbers();
 });
 
-/* 试听保留段：播错误区间之外最长的一段（范围播放，到点自动停）。 */
+function syncTrimNumbers() {
+  app.trimDirty = true;
+  const parts = $("trimRanges").value.split(/[;；]+/).filter(v => v.trim());
+  parts[app.trimRangeIndex || 0] = `${$("trimStart").value}-${$("trimEnd").value}`;
+  $("trimRanges").value = parts.join("; ");
+  drawWave(app.peaks || []);
+}
+for (const id of ["trimStart", "trimEnd"]) $(id).addEventListener("input", syncTrimNumbers);
+$("trimRanges").addEventListener("input", () => {
+  app.trimDirty = true;
+  try {
+    const ranges = readTrimIntervals(currentSegment());
+    app.trimRangeIndex = 0;
+    $("trimStart").value = ranges[0][0].toFixed(2);
+    $("trimEnd").value = ranges[0][1].toFixed(2);
+    drawWave(app.peaks || []);
+  } catch (_) { /* Keep incomplete text editable. */ }
+});
+
+/* 试听保留段：按顺序播放全部干净区间。 */
 let keepPlayStop = null;
+function clearKeepPlayback() {
+  if (keepPlayStop) audio.removeEventListener("timeupdate", keepPlayStop);
+  keepPlayStop = null;
+}
 $("keepPlayBtn").addEventListener("click", () => {
   const seg = currentSegment();
   if (!seg) return;
-  const from = parseFloat($("trimStart").value);
-  const to = parseFloat($("trimEnd").value);
-  if (!Number.isFinite(from) || !Number.isFinite(to) || to <= from) {
-    toast("请先填好他人声音的起止秒数", "err");
-    return;
+  let intervals;
+  try { intervals = readTrimIntervals(seg).sort((a,b) => a[0]-b[0]); }
+  catch (error) { toast(error.message, "err"); return; }
+  const pieces = [];
+  let cursor = 0;
+  for (const [a,b] of intervals) {
+    if (a - cursor >= .2) pieces.push([cursor,a]);
+    cursor = Math.max(cursor,b);
   }
-  const pieces = [[0, from], [to, seg.duration]].filter(([a, b]) => b - a > 0.2);
-  if (!pieces.length) { toast("错人区间覆盖了整句，没有可保留的干净段", "err"); return; }
-  const [keepStart, keepEnd] = pieces.sort((a, b) => (b[1] - b[0]) - (a[1] - a[0]))[0];
-  if (keepPlayStop) { audio.removeEventListener("timeupdate", keepPlayStop); keepPlayStop = null; }
-  audio.currentTime = keepStart;
-  audio.play();
-  toast(`试听保留段 ${keepStart.toFixed(2)}s – ${keepEnd.toFixed(2)}s`, "ok");
+  if (seg.duration-cursor >= .2) pieces.push([cursor,seg.duration]);
+  if (!pieces.length) { toast("没有可保留的干净段", "err"); return; }
+  if (keepPlayStop) audio.removeEventListener("timeupdate", keepPlayStop);
+  let index = 0;
+  audio.currentTime = pieces[0][0];
+  play();
+  toast(`依次试听 ${pieces.length} 个干净区间`, "ok");
   keepPlayStop = () => {
-    if (audio.currentTime >= keepEnd - 0.02) {
-      audio.pause();
-      audio.removeEventListener("timeupdate", keepPlayStop);
-      keepPlayStop = null;
+    if (audio.currentTime >= pieces[index][1] - .02) {
+      index += 1;
+      if (index < pieces.length) { audio.currentTime = pieces[index][0]; play(); }
+      else {
+        audio.pause(); audio.removeEventListener("timeupdate", keepPlayStop); keepPlayStop = null;
+      }
     }
   };
   audio.addEventListener("timeupdate", keepPlayStop);
@@ -860,18 +1072,19 @@ function refreshMeta() {
     `<span><b>${Object.keys(app.reviews).length}</b> 已标</span>`;
   if (clusterSummary) $("batchMeta").appendChild(clusterSummary);
   const complete = app.segments.filter(seg => validMaterialReview(seg)).length;
-  $("includeMaterial").disabled = !app.segments.length || complete !== app.segments.length;
+  $("includeMaterial").disabled = complete === 0;
   if ($("includeMaterial").disabled) $("includeMaterial").checked = false;
-  $("materialState").textContent = app.segments.length && complete === app.segments.length
-    ? "已全部打标；勾选后保存到 annotations/批次名.zip，可直接用于模型强化"
-    : `原料待完成：${complete}/${app.segments.length} 段已打标`;
+  $("materialState").textContent = complete > 0
+    ? `可增量导出 ${complete}/${app.segments.length} 段已标注原料`
+    : "标注任意片段后即可导出训练原料";
 }
 
 function validMaterialReview(seg) {
   const review = app.reviews[seg.ordinal];
   if (!review || !Object.hasOwn(LABELS, review.label) || review.ordinal !== seg.ordinal || review.filename !== seg.filename) return false;
-  return review.label !== "partial" || (Number.isFinite(review.partial_start) && Number.isFinite(review.partial_end)
-    && review.partial_start >= 0 && review.partial_end > review.partial_start && review.partial_end <= seg.duration + .02);
+  return review.label !== "partial" || (review.partial_intervals || [[review.partial_start, review.partial_end]])
+    .every(([a, b]) => Number.isFinite(a) && Number.isFinite(b) && a >= 0 && b > a && b <= seg.duration + .02);
+
 }
 
 $("autoNext").addEventListener("change", () => {
@@ -920,7 +1133,7 @@ $("exportBtn").addEventListener("click", async () => {
   try {
     const response = await fetch(`/api/export_verified/${encodeURIComponent(batchId)}`, {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ include_material: includeMaterial, gpt_sovits_list: includeGptList }),
+      body: JSON.stringify({ speaker: $("exportSpeaker").value, language: $("exportLanguage").value, include_material: includeMaterial, gpt_sovits_list: includeGptList, min_quality_grade: $("minQuality").value || null, restore_high_frequencies: $('restoreHighFrequencies').checked }),
     });
     const data = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(data.detail || "HTTP " + response.status);
@@ -931,14 +1144,14 @@ $("exportBtn").addEventListener("click", async () => {
     link.click();
     link.remove();
     toast(data.includes_material
-      ? "已附带训练原料：标注与全部音频 ZIP 已保存到 annotations 目录，可直接用于模型强化"
+      ? "已附带训练原料：已标注子集与音频 ZIP 已保存到 annotations 目录，可直接用于模型强化"
       : `ZIP 已交给浏览器下载：${data.verified_count} 段合格音频`, "ok");
   } catch (error) {
     toast("导出失败：" + error.message, "err");
   }
 });
 
-/* 一键信任主输出：未标注的 Tier A 全部标为 correct，再切到 Tier B 捡漏。 */
+/* 批量采纳未标注的主输出。 */
 $("trustMainBtn").addEventListener("click", async () => {
   if (!app.batchId) return;
   const pending = app.segments.filter((seg) => seg.accepted && !app.reviews[seg.ordinal]);
@@ -956,6 +1169,133 @@ $("trustMainBtn").addEventListener("click", async () => {
 });
 
 /* ── 快捷键 ─────────────────────────────────────────────── */
+document.addEventListener("keydown", (event) => {
+  if (!$("p-review").classList.contains("is-on") || $("speakerPanel").open || event.repeat || event.isComposing
+      || event.target.closest("input, textarea, select, [contenteditable]:not([contenteditable='false'])")) return;
+  const key = event.key.toLowerCase();
+  if (event.ctrlKey || event.metaKey || event.altKey) {
+    if (key === "z" && !event.altKey && (event.ctrlKey || event.metaKey)) {
+      event.preventDefault(); $("undoBtn").click();
+    }
+    return;
+  }
+  const labels = {1:"correct", 2:"wrong", 3:"partial", 4:"singing", 5:"overlap", 6:"skip"};
+  const actions = {" ":"playBtn", r:"replayBtn", arrowup:"prevBtn", w:"prevBtn", arrowdown:"nextBtn", s:"nextBtn", arrowleft:"prevBtn", arrowright:"nextBtn", b:"blindBtn"};
+  if (labels[key]) { event.preventDefault(); decide(labels[key]); }
+  else if (actions[key]) { event.preventDefault(); $(actions[key]).click(); }
+});
+
+$("trustBorderlineBtn").addEventListener("click", async () => {
+  if (!app.batchId) return;
+  const pending = app.segments.filter(
+    (seg) => seg.high_confidence_borderline && !app.reviews[seg.ordinal]?.label,
+  );
+  if (!pending.length) {
+    toast("没有待采纳的高分边缘句");
+    return;
+  }
+  app.history.push(JSON.stringify(app.reviews));
+  if (app.history.length > 60) app.history.shift();
+  pending.forEach((seg) => {
+    app.reviews[seg.ordinal] = {
+      ordinal: seg.ordinal,
+      filename: seg.filename,
+      label: "correct",
+    };
+  });
+  renderList();
+  refreshMeta();
+  reflectReview(currentSegment()?.ordinal);
+  if (await save(false)) {
+    const duration = pending.reduce((sum, seg) => sum + seg.duration, 0);
+    toast(`已采纳 ${pending.length} 句，共 ${duration.toFixed(2)} 秒`, "ok");
+  }
+});
+
+$("closeSpeakersBtn").addEventListener("click", () => $("speakerPanel").close());
+$("discoverSpeakersBtn").addEventListener("click", async () => {
+  if (!app.batchId) return;
+  const batchId = app.batchId;
+  $("speakerPanel").showModal();
+  $("speakerStatus").textContent = "正在扫描角色簇…";
+  $("speakerList").replaceChildren();
+  try {
+    const response = await fetch(`/api/batches/${encodeURIComponent(batchId)}/speakers`);
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || "角色探索失败");
+    if (app.batchId !== batchId) return;
+    $("speakerStatus").textContent = `发现 ${data.speakers.length} 个角色簇 · 每簇导出最多 4 段参考 WAV`;
+    data.speakers.forEach(speaker => {
+      const card = document.createElement("article"); card.className = "speaker-card";
+      const title = document.createElement("strong");
+      title.textContent = `${speaker.episode} · 簇 #${speaker.cluster_id}`;
+      const info = document.createElement("p");
+      info.textContent = `${Number(speaker.total_speech_seconds).toFixed(1)}s · ${speaker.member_count} 段 · 纯度 ${Number(speaker.purity_score).toFixed(3)}`;
+      const preview = document.createElement("p"); preview.textContent = (speaker.sample_texts || []).join(" / ");
+      const spans = document.createElement("p");
+      spans.textContent = "推荐种子：" + (speaker.recommended_seeds || []).map(seed => `${fmtTime(seed.start ?? seed.span?.[0])}–${fmtTime(seed.end ?? seed.span?.[1])}s`).join(" · ");
+      const button = document.createElement("button"); button.className = "mini-btn";
+      button.textContent = "导出 Top-4 并设为目标参考音频";
+      button.addEventListener("click", async () => {
+        button.disabled = true;
+        try {
+          const result = await fetch(`/api/batches/${encodeURIComponent(batchId)}/export_seeds`, {
+            method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({cluster_ids:[speaker.key]})});
+          const exported = await result.json();
+          if (!result.ok) throw new Error(exported.detail || "种子导出失败");
+          if (!exported.paths.length) throw new Error("没有可导出的种子，原轨及对应切片可能已删除");
+          $("refsInput").value = exported.paths.join("\n");
+          $("speakerStatus").textContent = exported.paths.join("\n");
+          toast(`已导出 ${exported.paths.length} 段，已填入提取页参考音频`, "ok");
+        } catch (error) { toast(error.message, "err"); }
+        finally { button.disabled = false; }
+      });
+      card.append(title, info, preview, spans, button); $("speakerList").append(card);
+    });
+  } catch (error) { $("speakerStatus").textContent = error.message; }
+});
+
+let rollbackBusy = false;
+async function refreshRollbackAvailability() {
+  try {
+    const response = await fetch('/api/training/rollback');
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || '无法读取模型备份');
+    $('rollbackModelBtn').disabled = rollbackBusy || !data.available;
+    $('rollbackModelBtn').title = data.message || '';
+  } catch (error) {
+    $('rollbackModelBtn').disabled = true;
+    $('rollbackModelBtn').title = error.message;
+  }
+}
+$("rollbackModelBtn").addEventListener("click", async () => {
+  rollbackBusy = true;
+  $('rollbackModelBtn').disabled = true;
+  try {
+    const response = await fetch("/api/training/rollback", {method:"POST"});
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.detail || "回滚失败");
+    toast("已回滚至上一次模型备份，下次提取生效", "ok");
+  } catch (error) { toast(error.message, "err"); }
+  finally { rollbackBusy = false; await refreshRollbackAvailability(); }
+});
+refreshRollbackAvailability();
+
+$('liveRecalibrate').addEventListener('click',async () => {
+  if (!app.batchId) return;
+  try {
+    const response = await fetch(`/api/batches/${encodeURIComponent(app.batchId)}/live_recalibrate`,{method:'POST'});
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || '重排失败');
+    if (data.status !== 'recalibrated') return toast(data.message,'err');
+    const scores = new Map(data.scores.map(s => [s.ordinal,s]));
+    app.segments.forEach(s => { s.live_information = scores.get(s.ordinal)?.information;
+      s.live_probability = scores.get(s.ordinal)?.probability; });
+    document.querySelector('[data-filter="active"]').click();
+    toast(`已根据 ${data.labels} 条标注刷新待审顺序`,'ok');
+  } catch(error) { toast(error.message,'err'); }
+});
+
 let trainingJob = null;
 let trainingTimer = null;
 async function pollTraining() {
@@ -970,12 +1310,14 @@ async function pollTraining() {
     $("trainingStorage").textContent = `临时磁盘占用 ${(data.temporary_bytes / 1024 / 1024).toFixed(1)} MB · ${data.temporary_path}`;
     $("trainBtn").disabled = true;
     $("discardModelBtn").disabled = false;
+    if (data.state === 'running') $('rollbackModelBtn').disabled = true;
     if (data.report) {
       const report = data.report;
-      const state = report.status === "already_applied" ? "全部 ZIP 已处理，模型未改动" : "已强化并自动保存";
+      const state = {already_applied:"重复 ZIP，模型未改动", validation_unavailable:"独立留出集不足，未更新", rejected_holdout:"留出验证未通过，未更新", updated_in_place:"全局模型已更新"}[report.status] || report.status;
       $("trainingReport").textContent = `ZIP：新增 ${report.new_packages} 份，跳过重复 ${report.duplicate_packages} 份\n新 ZIP 来源：${report.source_count} 集／文件，${report.reference_sets} 组参考\n参与训练 ${report.training_clips} 段，留出验证 ${report.held_out_clips} 段\n状态：${state}\n现用模型：${report.model_path}\n\n` + JSON.stringify(report.metrics, null, 2);
     }
     if (data.state === "running") trainingTimer = setTimeout(pollTraining, 1500);
+    else await refreshRollbackAvailability();
   } catch (error) { if (trainingJob === jobId) $("trainingState").textContent = error.message; }
 }
 
@@ -1016,6 +1358,7 @@ $("discardModelBtn").addEventListener("click", async () => {
     $("trainingState").textContent = "本次训练临时文件已清理";
     $("trainingStorage").textContent = "已强化的现用模型和已导出的原料会保留。";
     $("trainingReport").textContent = "等待原料文件";
+    await refreshRollbackAvailability();
   } catch (error) { toast(error.message, "err"); }
 });
 
@@ -1026,25 +1369,6 @@ async function resumeTraining() {
     if (trainingJob) pollTraining();
   } catch (error) { /* Service might be stopping. */ }
 }
-
-document.addEventListener("keydown", (event) => {
-  const typing = ["INPUT", "TEXTAREA", "SELECT"].includes(event.target.tagName);
-  if (typing) return;
-  if (!$("p-review").classList.contains("is-on")) return;
-
-  const keys = { "1": "correct", "2": "wrong", "3": "partial", "4": "singing", "5": "overlap", "6": "skip" };
-  if (keys[event.key]) { event.preventDefault(); decide(keys[event.key]); return; }
-
-  if (event.key === " ") { event.preventDefault(); $("playBtn").click(); return; }
-  if (event.key === "ArrowLeft") { event.preventDefault(); step(-1); return; }
-  if (event.key === "ArrowRight") { event.preventDefault(); step(1); return; }
-  if (event.key.toLowerCase() === "r") { event.preventDefault(); $("replayBtn").click(); return; }
-  if (event.key.toLowerCase() === "b") { event.preventDefault(); $("blindBtn").click(); return; }
-  if (event.key.toLowerCase() === "z" && (event.ctrlKey || event.metaKey)) {
-    event.preventDefault();
-    $("undoBtn").click();
-  }
-});
 
 /* ── 提取任务 ───────────────────────────────────────────── */
 
@@ -1155,7 +1479,8 @@ $("runBtn").addEventListener("click", async () => {
           use_singing_detector: $("useSinging").checked,
           export_video_clips: $("useVideo").checked,
           cluster_bootstrap: $("useBootstrap").checked,
-          cluster_identity_mode: $("useBootstrap").checked ? "enforce" : "audit",
+          cluster_identity_mode: "enforce",
+          export_sample_rate: Number($('exportSampleRate').value),
         },
       }),
     });

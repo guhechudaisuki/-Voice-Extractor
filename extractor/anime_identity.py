@@ -1,4 +1,4 @@
-"""Frozen local anime-speaker witness used by the production merge stage.
+"""Compare local anime-speaker evidence before joining neighboring utterances.
 
 This is not a trained per-person classifier. It compares a candidate part to
 the user-supplied target references and optional anonymous exclusion groups
@@ -39,8 +39,8 @@ class AnimeDomainWitness:
     def __init__(self, models_root: str | Path,
                  target_stem: Sequence[Path], target_raw: Sequence[Path],
                  negative_stem: Sequence[Sequence[Path]] = (),
-                 negative_raw: Sequence[Sequence[Path]] = ()):
-        self.encoders = {
+                 negative_raw: Sequence[Sequence[Path]] = (), *, encoders=None):
+        self.encoders = dict(zip(("char", "va"), encoders)) if encoders is not None else {
             variant: AnimeSpeakerOnnx(models_root, variant)
             for variant in ("char", "va")
         }
@@ -52,6 +52,7 @@ class AnimeDomainWitness:
         if len(raw_groups) != len(stem_groups):
             raise ValueError("Anime witness negative raw/stem groups differ")
         self._vectors: dict[tuple[str, str, str], np.ndarray] = {}
+        self._target_floors: dict[tuple[str, str], float] = {}
         self._roles: list[str] = []
         groups = [("target", target_pairs)]
         for index, (stem_group, raw_group) in enumerate(zip(stem_groups, raw_groups), 1):
@@ -67,6 +68,14 @@ class AnimeDomainWitness:
                         for path in ([stem_path] if channel == "stem" else [raw_path])
                     ]
                     self._vectors[(variant, channel, role)] = np.stack(vectors)
+                references = self._vectors[(variant, channel, "target")]
+                floor = .32 if variant == "char" else .20
+                if len(references) >= 2:
+                    dots = references @ references.T
+                    off_diagonal = dots[~np.eye(len(references), dtype=bool)]
+                    floor = float(np.quantile(off_diagonal, .20)) - .04
+                bounds = (.28, .45) if variant == "char" else (.18, .35)
+                self._target_floors[(variant, channel)] = float(np.clip(floor, *bounds))
         self._roles = [role for role, _pairs in groups if role != "target"]
 
     @staticmethod
@@ -86,13 +95,18 @@ class AnimeDomainWitness:
                     vector = encoder.encode(waveform, sample_rate=16000)
                 except ValueError:
                     return AnimeDomainScore("unresolved", (), ())
-                target = float(np.median(self._vectors[(variant, channel, "target")] @ vector))
-                role_scores = {
-                    role: float((self._vectors[(variant, channel, role)] @ vector).max())
-                    for role in self._roles
-                }
+                dots = self._vectors[(variant, channel, "target")] @ vector
+                target = (max(float(np.median(dots)), float(np.sort(dots)[-2:].mean()) - .02)
+                          if len(dots) >= 2 else float(dots[0]))
+                role_scores = {}
+                for role in self._roles:
+                    r_dots = self._vectors[(variant, channel, role)] @ vector
+                    role_scores[role] = (float(np.sort(r_dots)[-2:].mean())
+                                         if len(r_dots) >= 3 else float(r_dots.max()))
                 if not role_scores:
-                    return AnimeDomainScore("unresolved", (), ())
+                    margins.append(target - self._target_floors[(variant, channel)])
+                    winners.append("baseline_floor")
+                    continue
                 role = max(role_scores, key=role_scores.get)
                 margins.append(target - role_scores[role])
                 winners.append(role)
@@ -101,7 +115,7 @@ class AnimeDomainWitness:
             margins[index] > 0.0 for index in (0, 2)
         )
         other_supported = (
-            winners[0] == winners[2]
+            bool(self._roles) and winners[0] == winners[2]
             and all(margins[index] < 0.0 for index in (0, 2))
             and any(winners[index] == winners[0] and margins[index] < 0.0
                     for index in (1, 3))

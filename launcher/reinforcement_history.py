@@ -30,6 +30,25 @@ def read_history(path: Path) -> dict:
     return _validated(getattr(state, '_metadata', {}).get('', {}).get(HISTORY_KEY))
 
 
+def stage_binary_checkpoint(source: Path, destination: Path):
+    """Convert a legacy global safetensors checkpoint without changing weights."""
+    import torch
+    from safetensors import safe_open
+    from safetensors.torch import load_file
+    from extractor.model_store import atomic_save_projection
+
+    state = OrderedDict(load_file(str(source), device='cpu'))
+    with safe_open(str(source), framework='pt', device='cpu') as checkpoint:
+        metadata = checkpoint.metadata() or {}
+    state._metadata = {'': {HISTORY_KEY: read_history(source),
+                           'voice_extract_safetensors_metadata': metadata}}
+    atomic_save_projection(destination, state)
+    checked = torch.load(destination, map_location='cpu', weights_only=True)
+    if (set(checked) != set(state) or any(not torch.equal(value, checked[key]) for key, value in state.items())
+            or read_history(destination) != read_history(source)):
+        raise ValueError('全局模型格式迁移校验失败，原模型未修改')
+
+
 def stage_checkpoint(current: Path, staged: Path, projection, history: dict):
     """Preserve unrelated tensors/metadata and verify both weights and history."""
     import torch
@@ -64,7 +83,13 @@ def stage_checkpoint(current: Path, staged: Path, projection, history: dict):
 
 
 def completion_message(report: dict) -> str:
+    auxiliary = report.get('channel_updates', {})
+    detail = '；全局负例记忆和参考条件分类器已执行独立更新' if auxiliary else ''
+    if report['status'] == 'validation_unavailable':
+        return '全局 WavLM 权重保留：来源不足，经验已进入全局回放池' + detail
+    if report['status'] == 'rejected_holdout':
+        return '全局 WavLM 权重保留：未通过留出集非退化验证' + detail
     if report['status'] == 'already_applied':
-        return f"已跳过 {report['duplicate_packages']} 份重复 ZIP，没有新增 ZIP，模型未改动"
-    return (f"强化完成：处理 {report['new_packages']} 份新 ZIP，跳过 {report['duplicate_packages']} 份重复 ZIP；"
-            '已自动保存回现用模型')
+        return f"已跳过 {report['duplicate_packages']} 份重复 ZIP；没有新增训练样本"
+    return (f"全局强化完成：处理 {report['new_packages']} 份新 ZIP，跳过 {report['duplicate_packages']} 份重复 ZIP；"
+            '全局通用 WavLM 已原子更新，.previous 可回滚' + detail)

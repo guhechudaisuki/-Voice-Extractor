@@ -15,8 +15,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable
 
-from launcher.portable_resources import (ensure_program_files, install_embedded_python,
-    portable_environment, program_ready)
+from launcher.portable_resources import (copy_if_missing, ensure_program_files,
+    ensure_source_dependencies, install_embedded_python, portable_environment, program_ready)
 
 
 APP_VERSION = "3.0"
@@ -28,6 +28,7 @@ GLOBAL_SETTINGS = (
     / "desktop_settings.json"
 )
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+WINDOWS_DRIVE = Path(os.environ.get("SystemRoot", Path.home().anchor)).anchor
 
 PYTHON_INSTALLER_VERSION = "3.9.13"
 PYTHON_INSTALLER_URL = (
@@ -103,6 +104,7 @@ class ComponentSpec:
     files: tuple[DirectFile, ...] = ()
     model_id: str = ""
     check_file: str = ""
+    resource_only: bool = False
 
 
 COMPONENTS = (
@@ -260,6 +262,34 @@ COMPONENTS = (
             ),
         ),
         check_file="classifier_v2.pt",
+    ),
+    ComponentSpec(
+        "anime_char_model",
+        "动画角色声纹模型",
+        "models/anime-speaker-char",
+        "direct",
+        80,
+        (DirectFile(
+            "anime_speaker_char_ecapa.onnx",
+            "https://github.com/guhechudaisuki/-Voice-Extractor/releases/download/model-assets/anime_speaker_char_ecapa.onnx",
+            "d4e0ce7d55501fbb1a71d18ae7d3146d6fbd2d5aee8369d3171a82418f44d3a8",
+        ),),
+        check_file="anime_speaker_char_ecapa.onnx",
+        resource_only=True,
+    ),
+    ComponentSpec(
+        "anime_va_model",
+        "动画声优声纹模型",
+        "models/anime-speaker-va",
+        "direct",
+        80,
+        (DirectFile(
+            "anime_speaker_va_ecapa.onnx",
+            "https://github.com/guhechudaisuki/-Voice-Extractor/releases/download/model-assets/anime_speaker_va_ecapa.onnx",
+            "9d2d285e55cb5eb4ba09fe703119cfec4ae715ba3ba4df89a97cfec606e3d986",
+        ),),
+        check_file="anime_speaker_va_ecapa.onnx",
+        resource_only=True,
     ),
     ComponentSpec(
         "whisper_cache",
@@ -616,15 +646,15 @@ def _python_candidates(preferred: Path | None = None) -> list[Path]:
     local_app_data = Path(
         os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")
     )
-    program_files = Path(os.environ.get("ProgramFiles", "C:/Program Files"))
+    program_files = Path(os.environ.get("ProgramFiles", Path(WINDOWS_DRIVE) / "Program Files"))
     program_files_x86 = Path(
-        os.environ.get("ProgramFiles(x86)", "C:/Program Files (x86)")
+        os.environ.get("ProgramFiles(x86)", Path(WINDOWS_DRIVE) / "Program Files (x86)")
     )
     common_patterns = (
         local_app_data / "Programs" / "Python" / "Python*" / "python.exe",
         program_files / "Python*" / "python.exe",
         program_files_x86 / "Python*" / "python.exe",
-        Path("C:/Python*") / "python.exe",
+        Path(WINDOWS_DRIVE) / "Python*" / "python.exe",
         Path.home() / ".conda" / "envs" / "*" / "python.exe",
     )
     for pattern in common_patterns:
@@ -684,7 +714,7 @@ def discover_any_python(preferred: Path | None = None) -> Path | None:
 
 
 def probe_python_runtime(python: Path) -> dict[str, object]:
-    """Run a real import/GPU probe inside one candidate Python runtime."""
+    """Check dependency imports and GPU access in a candidate Python runtime."""
 
     code = r'''
 import json
@@ -1010,7 +1040,7 @@ def _component_ready(spec: ComponentSpec, path: Path) -> bool:
 
 
 def _component_quick_ready(spec: ComponentSpec, path: Path) -> bool:
-    """Cheap cache guard; never hashes weights or imports model libraries."""
+    """Check cached file metadata without loading or hashing model weights."""
 
     if spec.kind == "whisper":
         snapshots = path / "models--openai--whisper-large-v3-turbo" / "snapshots"
@@ -1079,7 +1109,7 @@ def _legacy_component_paths(
     gpt_root: Path | None,
 ) -> list[Path]:
     candidates = [layout.resource / spec.relative_path]
-    if getattr(sys, "frozen", False):
+    if getattr(sys, "frozen", False) or spec.resource_only:
         return candidates
     candidates.append(layout.root / spec.relative_path)
     for name in COMPONENT_ENVIRONMENT_PATHS.get(spec.key, ()):
@@ -1138,7 +1168,7 @@ def scan_assets(
     stored = stored if isinstance(stored, dict) else {}
     for spec in COMPONENTS:
         candidates: list[Path] = []
-        if stored.get(spec.key) and not getattr(sys, "frozen", False):
+        if stored.get(spec.key) and not getattr(sys, "frozen", False) and not spec.resource_only:
             candidates.append(Path(str(stored[spec.key])))
         candidates.extend(_legacy_component_paths(spec, layout, gpt_root))
         found = next(
@@ -1238,7 +1268,7 @@ def install_python_runtime(
     install_root: Path,
     reporter: Reporter,
 ) -> Path:
-    """Install an official per-user Python without asking for python.exe."""
+    """Install the official Python distribution for the current user."""
 
     layout = InstallLayout(install_root.expanduser().resolve())
     layout.prepare()
@@ -1363,6 +1393,7 @@ def ensure_assets(
 ) -> dict[str, Path]:
     assets, missing = scan_assets(layout, gpt_root)
     if not missing:
+        _install_auto_negatives(layout, source_root, assets)
         reporter(0.92, "本地模型检查完成，全部可用")
         return assets
     total = len(missing)
@@ -1406,12 +1437,25 @@ def ensure_assets(
     assets, missing = scan_assets(layout, gpt_root)
     if missing:
         raise RuntimeError("仍缺少模型：" + "、".join(spec.label for spec in missing))
+    _install_auto_negatives(layout, source_root, assets)
     return assets
 
 
-def _bundled_dependency(source_root: Path, name: str) -> Path | None:
-    candidate = source_root / "dependencies" / name
-    return candidate if candidate.is_dir() else None
+def _install_auto_negatives(
+    layout: InstallLayout, source_root: Path, assets: dict[str, Path],
+) -> None:
+    model = assets.get("wavlm_model")
+    if model is None:
+        return
+    destination = model / "auto_negatives.npz"
+    if destination.exists() or destination.is_symlink():
+        return
+    relative = Path("models/wavlm-base-plus-sv/auto_negatives.npz")
+    for root in (layout.resource, source_root):
+        source = root / relative
+        if source.is_file() and source.stat().st_size:
+            copy_if_missing(source, destination)
+            return
 
 
 def ensure_local_tools(
@@ -1420,43 +1464,20 @@ def ensure_local_tools(
     gpt_root: Path | None,
     reporter: Reporter,
 ) -> tuple[Path, Path, Path, Path]:
-    bundled_tools = source_root / "tools"
-    installed_ffmpeg = layout.tools / "ffmpeg.exe"
-    installed_ffprobe = layout.tools / "ffprobe.exe"
-    if installed_ffmpeg.is_file() and installed_ffprobe.is_file():
-        ffmpeg, ffprobe = installed_ffmpeg, installed_ffprobe
-    elif gpt_root and (
-        (gpt_root / "runtime" / "ffmpeg.exe").is_file()
-        and (gpt_root / "runtime" / "ffprobe.exe").is_file()
-    ):
-        # Reuse the existing binaries read-only. Nothing is moved or modified.
-        ffmpeg = gpt_root / "runtime" / "ffmpeg.exe"
-        ffprobe = gpt_root / "runtime" / "ffprobe.exe"
-        reporter(0.04, "已复用本地 FFmpeg，不复制也不修改原文件")
-    else:
-        bundled_ffmpeg = bundled_tools / "ffmpeg.exe"
-        bundled_ffprobe = bundled_tools / "ffprobe.exe"
-        if not bundled_ffmpeg.is_file() or not bundled_ffprobe.is_file():
-            raise RuntimeError("安装包和本地环境中均未找到 FFmpeg/FFprobe")
-        reporter(0.03, "正在安装本工具专用 FFmpeg")
-        shutil.copy2(bundled_ffmpeg, installed_ffmpeg)
-        reporter(0.04, "正在安装本工具专用 FFprobe")
-        shutil.copy2(bundled_ffprobe, installed_ffprobe)
-        ffmpeg, ffprobe = installed_ffmpeg, installed_ffprobe
-
-    uvr_code = _bundled_dependency(source_root, "uvr5")
-    sv_code = _bundled_dependency(source_root, "eres2net")
-    if uvr_code is None and gpt_root:
-        candidate = gpt_root / "tools" / "uvr5"
-        if candidate.is_dir():
-            uvr_code = candidate
-    if sv_code is None and gpt_root:
-        candidate = gpt_root / "GPT_SoVITS" / "eres2net"
-        if candidate.is_dir():
-            sv_code = candidate
-    if uvr_code is None or sv_code is None:
-        raise RuntimeError("安装包缺少 UVR/ERes2Net 后端代码")
-    return ffmpeg, ffprobe, uvr_code, sv_code
+    available = inspect_local_tools(layout, source_root, gpt_root)
+    if available["missing"] and not getattr(sys, "frozen", False):
+        reporter(0.02, "正在补齐本工具的 FFmpeg 与声学后端")
+        ensure_source_dependencies(layout.root, reporter)
+        available = inspect_local_tools(layout, source_root, gpt_root)
+    if available["missing"]:
+        raise RuntimeError("缺少运行依赖：" + "、".join(available["missing"]))
+    rows = available["rows"]
+    for label, filename in (("FFmpeg", "ffmpeg.exe"), ("FFprobe", "ffprobe.exe")):
+        if rows[label] == source_root / "tools" / filename:
+            installed = layout.tools / filename
+            copy_if_missing(rows[label], installed)
+            rows[label] = installed
+    return rows["FFmpeg"], rows["FFprobe"], rows["UVR 后端代码"], rows["ERes2Net 后端代码"]
 
 
 def install_executable(layout: InstallLayout) -> Path:
@@ -1486,18 +1507,18 @@ def inspect_local_tools(
         bundled_tools / "ffprobe.exe",
     ]
     if gpt_root:
-        ffmpeg_candidates.insert(0, gpt_root / "runtime" / "ffmpeg.exe")
-        ffprobe_candidates.insert(0, gpt_root / "runtime" / "ffprobe.exe")
+        ffmpeg_candidates.insert(1, gpt_root / "runtime" / "ffmpeg.exe")
+        ffprobe_candidates.insert(1, gpt_root / "runtime" / "ffprobe.exe")
     ffmpeg = next((path for path in ffmpeg_candidates if path.is_file()), None)
     ffprobe = next((path for path in ffprobe_candidates if path.is_file()), None)
 
-    uvr_candidates = [source_root / "dependencies" / "uvr5"]
-    sv_candidates = [source_root / "dependencies" / "eres2net"]
+    uvr_candidates = [layout.resource / "dependencies" / "uvr5", source_root / "dependencies" / "uvr5"]
+    sv_candidates = [layout.resource / "dependencies" / "eres2net", source_root / "dependencies" / "eres2net"]
     if gpt_root:
         uvr_candidates.append(gpt_root / "tools" / "uvr5")
         sv_candidates.append(gpt_root / "GPT_SoVITS" / "eres2net")
-    uvr = next((path for path in uvr_candidates if path.is_dir()), None)
-    sv = next((path for path in sv_candidates if path.is_dir()), None)
+    uvr = next((path for path in uvr_candidates if (path / "vr.py").is_file()), None)
+    sv = next((path for path in sv_candidates if (path / "ERes2NetV2.py").is_file()), None)
     rows = {
         "FFmpeg": ffmpeg,
         "FFprobe": ffprobe,
@@ -1542,6 +1563,8 @@ def load_cached_context(
         if not value:
             return None
         path = Path(value).expanduser()
+        if spec.resource_only and path.resolve() != (layout.resource / spec.relative_path).resolve():
+            return None
         if getattr(sys, "frozen", False) and not path.resolve().is_relative_to(layout.resource):
             return None
         if not _component_quick_ready(spec, path):
@@ -1582,22 +1605,23 @@ def load_cached_context(
         ),
     )
 
-    def cached_directory(name: str, fallbacks: Iterable[Path]) -> Path | None:
+    def cached_directory(name: str, fallbacks: Iterable[Path], entry: str) -> Path | None:
         value = str(settings.get(name) or "").strip()
         candidates = ([Path(value).expanduser()] if value else []) + list(fallbacks)
-        return next((path for path in candidates if path.is_dir()), None)
+        return next((path for path in candidates if (path / entry).is_file()), None)
 
-    uvr_fallbacks = [source_root / "dependencies" / "uvr5"]
-    sv_fallbacks = [source_root / "dependencies" / "eres2net"]
+    uvr_fallbacks = [layout.resource / "dependencies" / "uvr5", source_root / "dependencies" / "uvr5"]
+    sv_fallbacks = [layout.resource / "dependencies" / "eres2net", source_root / "dependencies" / "eres2net"]
     if gpt_root:
         uvr_fallbacks.append(gpt_root / "tools" / "uvr5")
         sv_fallbacks.append(gpt_root / "GPT_SoVITS" / "eres2net")
-    uvr_code = cached_directory("uvr_code", uvr_fallbacks)
-    sv_code = cached_directory("sv_code", sv_fallbacks)
+    uvr_code = cached_directory("uvr_code", uvr_fallbacks, "vr.py")
+    sv_code = cached_directory("sv_code", sv_fallbacks, "ERes2NetV2.py")
     if ffmpeg is None or ffprobe is None or uvr_code is None or sv_code is None:
         return None
 
     layout.prepare()
+    _install_auto_negatives(layout, source_root, assets)
     if schema is None or settings.get("complete") is not True:
         try:
             save_settings(
@@ -1630,7 +1654,7 @@ def finalize_inspected_context(
     inspection: dict[str, object],
     reporter: Reporter,
 ) -> BootstrapContext:
-    """Persist an already successful full scan without running it a second time."""
+    """Cache the results of a completed installation scan."""
 
     if not inspection.get("ready"):
         raise RuntimeError("当前完整扫描尚未满足全部依赖")
@@ -1646,6 +1670,7 @@ def finalize_inspected_context(
     install_executable(layout)
     python = Path(str(python_value))
     assets = {str(key): Path(str(path)) for key, path in assets_value.items()}
+    _install_auto_negatives(layout, source_root, assets)
     gpt_value = inspection.get("gpt_root")
     gpt_root = Path(str(gpt_value)) if gpt_value else infer_gpt_root(python)
     ffmpeg, ffprobe, uvr_code, sv_code = ensure_local_tools(
@@ -1688,7 +1713,7 @@ def inspect_nvidia_environment() -> dict[str, object]:
     nvidia_smi = shutil.which("nvidia-smi.exe") or shutil.which("nvidia-smi")
     if not nvidia_smi:
         conventional = (
-            Path(os.environ.get("ProgramFiles", "C:/Program Files"))
+            Path(os.environ.get("ProgramFiles", Path(WINDOWS_DRIVE) / "Program Files"))
             / "NVIDIA Corporation"
             / "NVSMI"
             / "nvidia-smi.exe"

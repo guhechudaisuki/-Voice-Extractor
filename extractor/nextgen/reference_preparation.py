@@ -1,9 +1,4 @@
-"""Build an immutable, multi-reference bank from prepared single-speaker clips.
-
-Only clean VAD-confirmed intervals contribute reference tokens. This stage
-does not identify a person from a filename or character name. Distinct user
-roles stay distinct; target and optional exclusion groups are never averaged.
-"""
+"""Build immutable target and exclusion reference groups from clean speech intervals."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -80,8 +75,7 @@ def prepare_reference_bank(materials: tuple[ReferenceMaterial, ...],
                     previous_end = max(previous_end, mask.end)
                 elif mask.start >= speech.end:
                     next_start = min(next_start, mask.start)
-            # A reference token may attend to its entire local transformer
-            # context. Never let a neighboring VAD island enter that context.
+            # Transformer context must exclude neighboring speech islands.
             context = SampleSpan(max(0, previous_end, speech.start - context_samples),
                                  min(source.total_samples, next_start, speech.end + context_samples))
             if context.length < getattr(getattr(encoder, "geometry", None),
@@ -102,8 +96,7 @@ def prepare_reference_bank(materials: tuple[ReferenceMaterial, ...],
             typical = float(levels_tensor[valid].median())
             if typical < 1e-5:
                 continue
-            # Quiet VAD-internal frames do not become identity evidence merely
-            # because the whole reference file passed VAD.
+            # Remove quiet frames even inside a valid VAD interval.
             valid &= levels_tensor >= max(1e-5, typical * .15)
             if int(valid.sum()) < minimum_valid_frames:
                 continue

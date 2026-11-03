@@ -1,4 +1,1 @@
-"""Independent next-generation engine; not imported by desktop production.
-
-Implementation and acoustic validation are separate release requirements.
-"""
+"""Prepared-audio speaker extraction and verification components."""

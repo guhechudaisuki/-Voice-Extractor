@@ -19,6 +19,19 @@ STRONG_END_RE = re.compile(r"[。！？!?]+[\"'”’）】》]*$")
 FRAGMENT_RE = re.compile(r".*?[。！？!?]+|.+$", re.S)
 
 
+class _TimedPart(tuple):
+    """Four-value tuple with provenance for timestamps synthesized by us.
+
+    Preserve the tuple interface used by existing callers while retaining the
+    distinction between Whisper timestamps and text-length interpolation.
+    """
+
+    def __new__(cls, text, start, end, language, *, timing_estimated=False):
+        part = super().__new__(cls, (text, start, end, language))
+        part.timing_estimated = bool(timing_estimated)
+        return part
+
+
 def is_complete_text(text: str) -> bool:
     return bool(text.strip() and STRONG_END_RE.search(text.strip()))
 
@@ -123,11 +136,7 @@ class WhisperSegmenter:
             torch_dtype=dtype,
             chunk_length_s=30,
         )
-        # The pipeline accepts a path or an in-memory waveform.  Bounded paths
-        # keep long files from becoming one opaque ASR call, while preserving
-        # the existing local-FFmpeg loading behavior.
-        import tempfile
-        from .audio import extract_audio_range
+        waveform = load_mono(audio_path, 16000)
 
         results: list[dict[str, Any]] = []
         try:
@@ -136,20 +145,17 @@ class WhisperSegmenter:
                 end = min(duration, start + window_seconds)
                 if end <= start:
                     continue
-                with tempfile.TemporaryDirectory(prefix="whisper_chunk_") as temp_dir:
-                    chunk_path = Path(temp_dir) / "chunk.wav"
-                    progress(
-                        index / max(1, count),
-                        f"Whisper 分块 {index + 1}/{count}：开始（{start:.1f}-{end:.1f} 秒）",
-                    )
-                    extract_audio_range(audio_path, chunk_path, start, end)
-                    result = pipe(
-                        str(chunk_path),
-                        return_timestamps="word",
-                        return_language=True,
-                        batch_size=1,
-                        generate_kwargs={"task": "transcribe"},
-                    )
+                progress(
+                    index / max(1, count),
+                    f"Whisper 分块 {index + 1}/{count}：开始（{start:.1f}-{end:.1f} 秒）",
+                )
+                result = pipe(
+                    {"raw": waveform[round(start * 16000):round(end * 16000)].numpy(), "sampling_rate": 16000},
+                    return_timestamps="word",
+                    return_language=True,
+                    batch_size=1,
+                    generate_kwargs={"task": "transcribe"},
+                )
                 result["_offset"] = start
                 results.append(result)
                 progress((index + 1) / max(1, count), f"Whisper 分块 {index + 1}/{count}：完成")
@@ -338,9 +344,12 @@ class WhisperSegmenter:
                 local_end = None if local_end is None else float(local_end)
             except (TypeError, ValueError):
                 local_start = local_end = None
-            if local_start is None:
+            if local_start is None or not math.isfinite(local_start):
                 untimed.append(text)
                 continue
+            if local_end is not None and not math.isfinite(local_end):
+                local_end = None
+            timing_estimated = local_end is None or local_end <= local_start
             start = window_start + max(0.0, local_start)
             if local_end is None:
                 # Whisper occasionally omits the final timestamp.  Estimate a
@@ -353,9 +362,11 @@ class WhisperSegmenter:
             start = max(span.start, min(span.end, start))
             end = max(span.start, min(span.end, end))
             if end <= start:
+                timing_estimated = True
                 end = min(span.end, start + max(0.05, min(0.5, window_end - window_start)))
             if end > start:
-                timed.append((text, start, end, language))
+                timed.append(_TimedPart(text, start, end, language,
+                                        timing_estimated=timing_estimated))
 
         # Some pipeline versions return only ``text`` (or return a mixture of
         # timed and untimed chunks).  Never lose non-empty text just because a
@@ -366,8 +377,10 @@ class WhisperSegmenter:
             if not _clean_text(fallback_text) and untimed:
                 fallback_text = "".join(untimed)
             if _clean_text(fallback_text):
-                timed.append((fallback_text, span.start if window_start <= span.start else window_start,
-                              span.end if window_end >= span.end else window_end, language))
+                timed.append(_TimedPart(
+                    fallback_text, span.start if window_start <= span.start else window_start,
+                    span.end if window_end >= span.end else window_end, language,
+                    timing_estimated=True))
         elif untimed:
             # Preserve untimed words which were not represented by a timed
             # chunk, appending them to the current window rather than dropping
@@ -377,7 +390,8 @@ class WhisperSegmenter:
                 fallback_start = max(span.start, window_start)
                 fallback_end = min(span.end, window_end)
                 if fallback_end > fallback_start:
-                    timed.append((fallback_text, fallback_start, fallback_end, language))
+                    timed.append(_TimedPart(fallback_text, fallback_start, fallback_end,
+                                            language, timing_estimated=True))
         return timed
 
     @staticmethod
@@ -394,32 +408,45 @@ class WhisperSegmenter:
         # safe to collapse, while identical text in a neighbouring span is a
         # legitimate separate turn and must remain separate.
         merged: list[tuple[str, float, float, str]] = []
+        estimated_parts = {tuple(item) for item in parts
+                           if getattr(item, "timing_estimated", False)}
         for language in sorted({item[3] for item in parts}):
             deduped = _deduplicate_timed_parts(
                 [(text, start, end) for text, start, end, item_language in parts if item_language == language],
                 tolerance=0.35,
             )
-            merged.extend((*item, language) for item in deduped)
+            merged.extend(_TimedPart(*item, language,
+                                     timing_estimated=(*item, language) in estimated_parts)
+                          for item in deduped)
         merged.sort(key=lambda item: (item[1], item[2]))
         timed_parts: list[tuple[str, float, float, str]] = []
-        for text, start, end, language in merged:
-            for fragment, fragment_start, fragment_end in _split_timed_chunk(text, start, end):
+        for part in merged:
+            text, start, end, language = part
+            fragments = _split_timed_chunk(text, start, end)
+            # Punctuation inside one timestamped chunk is not a timed boundary.
+            # Keep the existing sentence assembly, but never offer its invented
+            # proportional timestamps to the audio/text synchronized splitter.
+            estimated = part.timing_estimated or len(fragments) > 1
+            for fragment, fragment_start, fragment_end in fragments:
                 fragment_start = max(span.start, min(span.end, fragment_start))
                 fragment_end = max(span.start, min(span.end, fragment_end))
                 if fragment_end > fragment_start and _clean_text(fragment):
-                    timed_parts.append((fragment, fragment_start, fragment_end, language))
+                    timed_parts.append(_TimedPart(fragment, fragment_start, fragment_end,
+                                                  language, timing_estimated=estimated))
 
         candidates: list[CandidateSentence] = []
         buffer: list[str] = []
         buffer_languages: list[str] = []
+        buffer_parts: list[dict] = []
         sentence_start: float | None = None
         previous_end: float | None = None
 
         def flush(*, tail: bool) -> None:
-            nonlocal buffer, buffer_languages, sentence_start, previous_end
+            nonlocal buffer, buffer_languages, buffer_parts, sentence_start, previous_end
             if not buffer or sentence_start is None or previous_end is None:
                 buffer = []
                 buffer_languages = []
+                buffer_parts = []
                 sentence_start = None
                 return
             text = _clean_text("".join(buffer))
@@ -432,14 +459,23 @@ class WhisperSegmenter:
                     language=infer_language(text, language),
                 )
                 candidate.diagnostics["transcription_span_index"] = span_index
+                candidate.diagnostics["timing_estimated"] = any(
+                    part["timing_estimated"] for part in buffer_parts)
+                candidate.diagnostics["transcription_fragments"] = buffer_parts
+                candidate.diagnostics['word_timestamps'] = [
+                    {'text':part[0],'start':part[1],'end':part[2],'timing_estimated':False}
+                    for part in merged if not part.timing_estimated
+                    and part[1] < candidate.end and part[2] > candidate.start]
                 if tail:
                     candidate.diagnostics["transcription_tail"] = True
                 candidates.append(candidate)
             buffer = []
             buffer_languages = []
+            buffer_parts = []
             sentence_start = None
 
-        for text, start, end, language in timed_parts:
+        for part in timed_parts:
+            text, start, end, language = part
             if previous_end is not None and start - previous_end > max_gap:
                 # A gap is a sentence/turn boundary even when Whisper omitted
                 # punctuation.  Flush rather than discarding the preceding
@@ -450,6 +486,10 @@ class WhisperSegmenter:
                 sentence_start = start
             buffer.append(text)
             buffer_languages.append(language)
+            buffer_parts.append({
+                "text": _clean_text(text), "start": start, "end": end,
+                "timing_estimated": part.timing_estimated,
+            })
             previous_end = end
             if is_complete_text(_clean_text("".join(buffer))):
                 flush(tail=False)
@@ -477,10 +517,9 @@ class WhisperSegmenter:
         caller's span boundary, rather than punctuation, defines the end of
         the target speaker turn.
 
-        Stage 15: after the first auto-language pass, the dominant language
-        (vote of the three longest spans' windows) locks short spans
-        (< 4.0 s) whose detected language disagrees — short Japanese lines
-        otherwise hallucinate into English/Chinese gibberish.
+        The longest spans supply the language prior for short replies. Empty
+        windows get one retry with silence around the original waveform;
+        timestamps remain confined to the caller's speaker boundaries.
         """
         progress = progress or (lambda _value, _message: None)
         audio_path = Path(audio_path)
@@ -511,13 +550,13 @@ class WhisperSegmenter:
             chunk_length_s=30,
         )
 
-        import tempfile
-        from .audio import extract_audio_range
+        waveform = load_mono(audio_path, 16000)
 
         parts_by_window: dict[int, dict[tuple, list]] = {
             index: {} for index in range(len(normalised_spans))
         }
         window_language: dict[tuple, str] = {}
+        padding_retries: set[int] = set()
         locked_language: str | None = None
         windows_per_span = {
             span_index: sum(1 for item in plan if item[0] == span_index)
@@ -532,16 +571,13 @@ class WhisperSegmenter:
                     f"Whisper 目标段 {span_index + 1}/{len(normalised_spans)}，"
                     f"窗口 {window_index + 1}/{span_window_count}：开始（{start:.2f}-{end:.2f} 秒）",
                 )
-                with tempfile.TemporaryDirectory(prefix="whisper_span_") as temp_dir:
-                    chunk_path = Path(temp_dir) / "span.wav"
-                    extract_audio_range(audio_path, chunk_path, start, end)
-                    result = pipe(
-                        str(chunk_path),
-                        return_timestamps="word",
-                        return_language=True,
-                        batch_size=1,
-                        generate_kwargs={"task": "transcribe"},
-                    )
+                result = pipe(
+                    {"raw": waveform[round(start * 16000):round(end * 16000)].numpy(), "sampling_rate": 16000},
+                    return_timestamps="word",
+                    return_language=True,
+                    batch_size=1,
+                    generate_kwargs={"task": "transcribe"},
+                )
                 if not isinstance(result, dict):
                     result = {}
                 parts_by_window[span_index][(window_index, start, end)] = (
@@ -555,7 +591,7 @@ class WhisperSegmenter:
                     f"窗口 {window_index + 1}/{span_window_count}：完成",
                 )
 
-            # Stage 15：主导语言投票（3 个最长目标段）+ 短片段锁定重转写。
+            # Short utterances do not carry enough evidence for reliable language detection.
             longest_spans = sorted(
                 range(len(normalised_spans)),
                 key=lambda i: normalised_spans[i].duration, reverse=True)[:3]
@@ -580,25 +616,60 @@ class WhisperSegmenter:
                 progress(0.0, f"Whisper：语言锁定 {locked_language}，重转写 {len(redo)} 个短窗口")
             for redo_index, (span_index, window_index, start, end) in enumerate(redo):
                 span = normalised_spans[span_index]
-                with tempfile.TemporaryDirectory(prefix="whisper_span_") as temp_dir:
-                    chunk_path = Path(temp_dir) / "span.wav"
-                    extract_audio_range(audio_path, chunk_path, start, end)
-                    result = pipe(
-                        str(chunk_path),
-                        return_timestamps="word",
-                        return_language=True,
-                        batch_size=1,
-                        generate_kwargs={
-                            "task": "transcribe", "language": locked_language},
-                    )
+                result = pipe(
+                    {"raw": waveform[round(start * 16000):round(end * 16000)].numpy(), "sampling_rate": 16000},
+                    return_timestamps="word",
+                    return_language=True,
+                    batch_size=1,
+                    generate_kwargs={
+                        "task": "transcribe", "language": locked_language},
+                )
                 if not isinstance(result, dict):
                     result = {}
-                parts_by_window[span_index][(window_index, start, end)] = (
-                    self._timed_parts_for_result(result, start, end, span)
-                )
+                retried_parts = self._timed_parts_for_result(result, start, end, span)
+                if retried_parts:
+                    parts_by_window[span_index][(window_index, start, end)] = retried_parts
                 progress(
                     (redo_index + 1) / max(1, len(redo)),
                     f"Whisper：语言锁定重转写 {redo_index + 1}/{len(redo)}",
+                )
+
+            empty_windows = [
+                item for item in plan
+                if not parts_by_window[item[0]][(item[1], item[2], item[3])]
+            ]
+            for retry_index, (span_index, window_index, start, end) in enumerate(empty_windows):
+                span = normalised_spans[span_index]
+                clip_waveform = waveform[round(start * 16000):round(end * 16000)]
+                if clip_waveform.numel() == 0 or not bool(torch.isfinite(clip_waveform).all()):
+                    continue
+                if float(clip_waveform.square().mean()) <= 1e-8:
+                    continue
+                padding = 0.30
+                samples = int(padding * 16000)
+                padded = torch.nn.functional.pad(clip_waveform, (samples, samples))
+                generate_kwargs = {
+                    "task": "transcribe", "no_speech_threshold": 0.1,
+                    "logprob_threshold": -2.0,
+                }
+                if locked_language is not None:
+                    generate_kwargs["language"] = locked_language
+                result = pipe(
+                    {"raw": padded.cpu().numpy(), "sampling_rate": 16000},
+                    return_timestamps="word", return_language=True, batch_size=1,
+                    generate_kwargs=generate_kwargs,
+                )
+                padding_retries.add(span_index)
+                if isinstance(result, dict):
+                    parts_by_window[span_index][(window_index, start, end)] = (
+                        self._timed_parts_for_result(
+                            result, start - padding, end + padding,
+                            TimeSpan(start, end),
+                        )
+                    )
+                progress(
+                    (retry_index + 1) / max(1, len(empty_windows)),
+                    f"Whisper：短句静音垫重试 {retry_index + 1}/{len(empty_windows)}",
                 )
         finally:
             del pipe
@@ -611,26 +682,13 @@ class WhisperSegmenter:
             timed_parts: list[tuple[str, float, float, str]] = []
             for window_key in sorted(parts_by_window.get(span_index, {})):
                 timed_parts.extend(parts_by_window[span_index][window_key])
-            candidates.extend(
-                self._candidates_from_span_parts(
-                    timed_parts, span, max_gap=max_gap, span_index=span_index
-                )
+            span_candidates = self._candidates_from_span_parts(
+                timed_parts, span, max_gap=max_gap, span_index=span_index
             )
-        candidates.sort(key=lambda candidate: (candidate.start, candidate.end))
-        progress(1.0, f"Whisper：目标段识别完成，得到 {len(candidates)} 条文本")
-        return candidates
-
-
-        candidates: list[CandidateSentence] = []
-        for span_index, span in enumerate(normalised_spans):
-            timed_parts: list[tuple[str, float, float, str]] = []
-            for window_key in sorted(parts_by_window.get(span_index, {})):
-                timed_parts.extend(parts_by_window[span_index][window_key])
-            candidates.extend(
-                self._candidates_from_span_parts(
-                    timed_parts, span, max_gap=max_gap, span_index=span_index
-                )
-            )
+            if span_index in padding_retries:
+                for candidate in span_candidates:
+                    candidate.diagnostics["transcription_silence_padding_retry"] = True
+            candidates.extend(span_candidates)
         candidates.sort(key=lambda candidate: (candidate.start, candidate.end))
         progress(1.0, f"Whisper：目标段识别完成，得到 {len(candidates)} 条文本")
         return candidates
@@ -670,14 +728,12 @@ class FunASRTools:
         )
         output: dict[Path, list[TimeSpan]] = {}
         try:
-            import tempfile
-            from .audio import extract_audio_range
-
             for file_index, (audio_path, duration, chunk_count) in enumerate(
                 zip(audio_paths, durations, chunk_counts),
                 start=1,
             ):
                 spans: list[TimeSpan] = []
+                waveform = load_mono(audio_path, 16000).numpy()
                 for chunk_index in range(chunk_count):
                     start_offset = chunk_index * window_seconds
                     end_offset = min(duration, start_offset + window_seconds)
@@ -686,10 +742,8 @@ class FunASRTools:
                         f"块 {chunk_index + 1}/{chunk_count}"
                     )
                     progress(completed / max(1, total_chunks), f"{label}：开始")
-                    with tempfile.TemporaryDirectory(prefix="vad_chunk_") as temp_dir:
-                        chunk_path = Path(temp_dir) / "chunk.wav"
-                        extract_audio_range(audio_path, chunk_path, start_offset, end_offset)
-                        result = model.generate(input=str(chunk_path), batch_size_s=60)
+                    chunk = waveform[round(start_offset * 16000):round(end_offset * 16000)]
+                    result = model.generate(input=chunk, batch_size_s=60, fs=16000)
                     values = result[0].get("value", []) if result else []
                     spans.extend(
                         TimeSpan(
@@ -728,11 +782,23 @@ class FunASRTools:
             check_latest=False,
         )
         output: dict[Path, str] = {}
+        self.word_timestamps = {}
         try:
             for index, path in enumerate(paths, start=1):
                 progress((index - 1) / len(paths), f"中文 STT {index}/{len(paths)}：开始")
                 result = model.generate(input=str(path), batch_size_s=60, hotword="")
                 output[path] = _clean_text(result[0].get("text", "")) if result else ""
+                payload = result[0] if result else {}
+                stamps = payload.get('timestamp') or []
+                tokens = payload.get('tokens') or payload.get('token') or []
+                if isinstance(tokens,str): tokens=tokens.split()
+                if not tokens:
+                    tokens = re.findall(r'[\u3400-\u9fff]|[A-Za-z0-9]+',output[path])
+                if len(tokens)==len(stamps):
+                    self.word_timestamps[path] = [dict(text=str(token),start=float(pair[0])/1000.,
+                        end=float(pair[1])/1000.,timing_estimated=False)
+                        for token,pair in zip(tokens,stamps) if isinstance(pair,(list,tuple)) and len(pair)==2
+                        and all(isinstance(v,(float,int)) and math.isfinite(v) for v in pair) and pair[1]>pair[0]>=0]
                 progress(index / len(paths), f"中文 STT {index}/{len(paths)}：完成")
             return output
         finally:

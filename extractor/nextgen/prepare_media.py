@@ -1,9 +1,4 @@
-"""Bounded real-media preparation for the independent engine.
-
-This reuses the installed singing, UVR, VAD and overlap components without
-changing the desktop result. It stops before identity inference: a scene is a
-set of possibilities, not a claim that any clip belongs to the target.
-"""
+"""Prepare bounded scenes with singing, separation, VAD and overlap detection."""
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
@@ -63,8 +58,7 @@ def _alignment_anchors(raw: tuple[SampleSpan, ...], stem: tuple[SampleSpan, ...]
         if not unique or anchor.start >= unique[-1].end:
             unique.append(anchor)
     if len(unique) > 12:
-        # Testing only the first few seconds would silently miss a late UVR
-        # timing drift in a longer prepared scene.
+        # Spread anchors across the scene to detect late alignment drift.
         indexes = {round(i * (len(unique) - 1) / 11) for i in range(12)}
         unique = [unique[index] for index in sorted(indexes)]
     return tuple(unique)
@@ -109,12 +103,7 @@ def prepare_bounded_media(source: str | Path, destination: str | Path, *,
                           device: str = "cuda", max_seconds: float = 90.0,
                           silence: SilenceRange | None = None,
                           progress: Progress | None = None) -> MediaPreparation:
-    """Prepare a short scene for code/debug checks, without running identity.
-
-    The destination must be new. A full episode is intentionally rejected by
-    default so development cannot accidentally repeat a multi-hour run.
-    Production may later call this per bounded chunk, with explicit overlap.
-    """
+    """Prepare a bounded scene in a new directory without identity inference."""
     source = Path(source).resolve(strict=True)
     destination = Path(destination).resolve()
     if destination.exists():

@@ -1,9 +1,4 @@
-"""Final source-span audit, separate export length policy and STT-last delivery.
-
-This module never changes audio boundaries to satisfy STT or minimum duration.
-STT errors retain acoustically accepted audio in a separate review area, not in
-the ready-to-train ZIP. One ZIP contains all successful clips in the batch.
-"""
+"""Audit fixed source spans, transcribe accepted clips and package successful exports."""
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass

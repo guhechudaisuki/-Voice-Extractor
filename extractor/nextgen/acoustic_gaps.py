@@ -1,10 +1,4 @@
-"""Conservative independent gap confirmation for change-head proposals.
-
-Both raw and separated VAD must observe the pause, and separated waveform
-energy must actually fall relative to speech on both sides. These checks only
-certify an acoustic space between utterances; the new child still needs its
-own identity, endpoint, purity and contamination assessment.
-"""
+"""Confirm pauses with both VAD views and local waveform energy."""
 from __future__ import annotations
 
 import math
@@ -61,6 +55,25 @@ def find_confirmed_gaps(parent: Candidate, raw_voice: tuple[SampleSpan, ...],
                 continue
             candidates.append(AcousticGap(common, True, True, True,
                                           "raw_and_stem_vad_with_stem_waveform_pause"))
-    # Intersecting two VAD streams may produce the same gap through duplicate
-    # side intervals; preserve one deterministic proposal per source interval.
+    # Strong BGM can mask raw VAD gaps; require deeper silence in the vocal stem.
+    for stem_gap in stem_gaps:
+        if any(gap.span.intersection(stem_gap) is not None for gap in candidates):
+            continue
+        if (stem_gap.length < minimum_gap_samples
+                or stem_gap.start <= parent.output.start or stem_gap.end >= parent.output.end):
+            continue
+        if (stem_gap.start - flank_samples < parent.context.start
+                or stem_gap.end + flank_samples > parent.context.end):
+            continue
+        before = SampleSpan(stem_gap.start - flank_samples, stem_gap.start)
+        after = SampleSpan(stem_gap.end, stem_gap.end + flank_samples)
+        _, stem_left = audio.read_pair(before)
+        _, stem_pause = audio.read_pair(stem_gap)
+        _, stem_right = audio.read_pair(after)
+        speech_level = min(_rms(stem_left), _rms(stem_right))
+        if (speech_level > 1e-4
+                and _rms(stem_pause) <= min(0.10, maximum_gap_to_speech_rms * 0.6) * speech_level):
+            candidates.append(AcousticGap(stem_gap, True, True, True,
+                                          "stem_vad_with_deep_waveform_silence"))
+    # Both VAD views may yield the same source interval.
     return tuple({gap.span: gap for gap in sorted(candidates, key=lambda row: row.span)}.values())

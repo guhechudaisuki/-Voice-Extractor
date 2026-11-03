@@ -14,13 +14,24 @@ def _configured_path(name: str) -> Path | None:
     return Path(value).expanduser().resolve()
 
 
+def _gpt_root(workspace: Path) -> Path:
+    """Find the nearest installation alongside the tool or its parent folders."""
+    workspace = workspace.resolve()
+    installation = "GPT-SoVITS-v2pro-20250604"
+    for directory in (workspace, *workspace.parents):
+        for path in (directory / installation, directory / "GPT-sovits" / installation):
+            if path.is_dir():
+                return path
+    return workspace / installation
+
+
 def _asset_root() -> Path:
-    """Find the shared tool assets when this candidate lives under versions/."""
+    """Locate shared assets for a tool installed below the project root."""
 
     for candidate in (TOOL_ROOT, *TOOL_ROOT.parents):
         if (
             ((candidate / "model").exists() or (candidate / "models").exists())
-            and (candidate.parent / "GPT-SoVITS-v2pro-20250604").exists()
+            and _gpt_root(candidate).is_dir()
         ):
             return candidate
     return TOOL_ROOT
@@ -32,7 +43,7 @@ MODEL_ROOT = _configured_path("VOICE_EXTRACT_MODEL_ROOT") or ASSET_ROOT / "model
 WORKSPACE_ROOT = ASSET_ROOT.parent
 GPT_ROOT = (
     _configured_path("VOICE_EXTRACT_GPT_ROOT")
-    or WORKSPACE_ROOT / "GPT-SoVITS-v2pro-20250604"
+    or _gpt_root(TOOL_ROOT)
 )
 GPT_RUNTIME = GPT_ROOT / "runtime"
 FFMPEG = _configured_path("VOICE_EXTRACT_FFMPEG") or GPT_RUNTIME / "ffmpeg.exe"

@@ -193,6 +193,9 @@ class SpeakerSplitResult:
     boundaries: tuple[SpeakerBoundary, ...]
 
 
+from .embedding_reuse import cached_batch, configure_cache
+
+
 class SpeakerVerifier:
     def __init__(self, device: str = "cuda") -> None:
         self.device = torch.device("cuda" if device == "cuda" and torch.cuda.is_available() else "cpu")
@@ -206,6 +209,7 @@ class SpeakerVerifier:
         model = ERes2NetV2(baseWidth=24, scale=4, expansion=4)
         model.load_state_dict(state)
         self.model = model.eval().to(self.device)
+        configure_cache(self, SV_MODEL)
 
     def close(self) -> None:
         if hasattr(self, "model"):
@@ -214,6 +218,7 @@ class SpeakerVerifier:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+    @cached_batch
     def _embeddings_from_waveforms(
         self,
         waveforms: Sequence[torch.Tensor],
@@ -407,6 +412,7 @@ class CAMPlusVerifier:
         state = torch.load(CAMPLUS_MODEL, map_location="cpu", weights_only=False)
         model.load_state_dict(state)
         self.model = model.eval().to(self.device)
+        configure_cache(self, CAMPLUS_MODEL)
 
     def close(self) -> None:
         if hasattr(self, "model"):
@@ -415,6 +421,7 @@ class CAMPlusVerifier:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+    @cached_batch
     def _embeddings_from_waveforms(
         self,
         waveforms: Sequence[torch.Tensor],
@@ -567,8 +574,9 @@ class CAMPlusVerifier:
 class WavLMSpeakerVerifier:
     """WavLM x-vector verifier used only for dual-model disagreements."""
 
-    def __init__(self, device: str = "cuda") -> None:
+    def __init__(self, device: str = "cuda", *, role_key=None) -> None:
         from transformers import AutoFeatureExtractor, WavLMForXVector
+        from .model_store import active_speaker_path
 
         self.device = torch.device(
             "cuda" if device == "cuda" and torch.cuda.is_available() else "cpu"
@@ -577,8 +585,10 @@ class WavLMSpeakerVerifier:
             str(WAVLM_SV_MODEL), local_files_only=True
         )
         self.model = WavLMForXVector.from_pretrained(
-            str(WAVLM_SV_MODEL), local_files_only=True
+            str(WAVLM_SV_MODEL), local_files_only=True,
+            use_safetensors=active_speaker_path(WAVLM_SV_MODEL).suffix == '.safetensors'
         ).eval().to(self.device)
+        configure_cache(self, active_speaker_path(WAVLM_SV_MODEL))
 
     def close(self) -> None:
         if hasattr(self, "model"):
@@ -587,6 +597,7 @@ class WavLMSpeakerVerifier:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+    @cached_batch
     def _embeddings_from_waveforms(
         self,
         waveforms: Sequence[torch.Tensor],
@@ -706,21 +717,26 @@ class WavLMSpeakerVerifier:
 
 
 class WeSpeakerVerifier:
-    """Deterministic CPU ONNX verifier used for residual speaker ambiguity."""
+    """ONNX verifier with CUDA acceleration and CPU fallback."""
 
     SAMPLE_RATE = 16000
     WINDOW_SECONDS = 3.0
     HOP_SECONDS = 1.5
 
-    def __init__(self) -> None:
+    def __init__(self, device: str = "cuda") -> None:
         import onnxruntime
-
-        # CPU execution is fast for the small ambiguity batch and avoids
-        # provider-dependent CUDA kernel variation between identical runs.
-        self.session = onnxruntime.InferenceSession(
-            str(WESPEAKER_MODEL),
-            providers=["CPUExecutionProvider"],
-        )
+        providers = ["CPUExecutionProvider"]
+        if str(device).startswith("cuda") and "CUDAExecutionProvider" in onnxruntime.get_available_providers():
+            providers.insert(0, "CUDAExecutionProvider")
+        try:
+            self.session = onnxruntime.InferenceSession(str(WESPEAKER_MODEL), providers=providers)
+        except Exception:
+            if len(providers) == 1:
+                raise
+            self.session = onnxruntime.InferenceSession(
+                str(WESPEAKER_MODEL), providers=["CPUExecutionProvider"])
+        self.device = self.session.get_providers()[0]
+        configure_cache(self, WESPEAKER_MODEL)
         self.input_name = self.session.get_inputs()[0].name
         self.output_name = self.session.get_outputs()[0].name
 
@@ -756,7 +772,19 @@ class WeSpeakerVerifier:
         )
         return features - features.mean(dim=0, keepdim=True)
 
-    def _window_embeddings(
+    def _window_embeddings(self, waveforms, batch_size=64, progress=None):
+        windows, ranges = [], []
+        for waveform in waveforms:
+            start = len(windows)
+            windows.extend(self._windows(waveform))
+            ranges.append((start, len(windows)))
+        return self._encode_windows(windows, batch_size=batch_size, progress=progress), ranges
+
+    @cached_batch
+    def _encode_windows(self, waveforms, batch_size=64, progress=None):
+        return self._window_embeddings_uncached(waveforms, batch_size=batch_size, progress=progress)[0]
+
+    def _window_embeddings_uncached(
         self,
         waveforms: Sequence[torch.Tensor],
         batch_size: int = 64,
@@ -861,7 +889,7 @@ class WeSpeakerVerifier:
 class DualSpeakerVerifier:
     """Classify target-speaker turns using ERes2Net and CAM++ consensus."""
 
-    SHORT_MIN_DURATION = 0.55
+    SHORT_MIN_DURATION = 0.35
     FULL_MIN_DURATION = 2.20
     BALANCED_MIN_DURATION = 3.00
 
@@ -974,7 +1002,7 @@ class DualSpeakerVerifier:
         # global threshold drop because the reference medians, spreads and
         # local window evidence remain mandatory.
         recall = (
-            duration >= cls.SHORT_MIN_DURATION
+            duration >= max(.55, cls.SHORT_MIN_DURATION)
             and primary.score >= max(0.54, threshold - 0.16)
             and secondary.score >= max(0.46, threshold - 0.24)
             and paired_reference_median >= max(0.43, threshold - 0.27)
@@ -1004,10 +1032,14 @@ class DualSpeakerVerifier:
         self,
         device: str = "cuda",
         status: Callable[[str], None] | None = None,
+        *, role_key=None, cache_enabled=True,
     ) -> None:
         self.device = device
+        self.role_key = role_key
+        self.cache_enabled = cache_enabled
         self.status = status or (lambda _message: None)
-        self.primary = SpeakerVerifier(device)
+        self.primary = self._cache_model(SpeakerVerifier(device))
+        self.anime_encoders = None
         self.secondary: CAMPlusVerifier | None = None
         self.secondary_profile: CAMPlusProfile | None = None
         self.tertiary: WavLMSpeakerVerifier | None = None
@@ -1020,7 +1052,33 @@ class DualSpeakerVerifier:
         # profile, then reuse the same model to avoid loading it twice.
         self.boundary_secondary: CAMPlusVerifier | None = None
 
+    def _cache_model(self, encoder):
+        cache = getattr(encoder, 'feature_cache', None)
+        if cache is not None:
+            cache.enabled = getattr(self, 'cache_enabled', True)
+        return encoder
+
+    def anime_pair(self):
+        if self.anime_encoders is None:
+            from .config import ASSET_ROOT
+            from .nextgen.anime_embedding import AnimeSpeakerOnnx, _MODEL_FILES
+            if not all((ASSET_ROOT / "models" / p).is_file() for p in _MODEL_FILES.values()):
+                return None
+            encoders = []
+            try:
+                for variant in ("char", "va"):
+                    encoders.append(self._cache_model(AnimeSpeakerOnnx(ASSET_ROOT / "models", variant, device=self.device)))
+            except Exception:
+                for encoder in encoders:
+                    encoder.close()
+                raise
+            self.anime_encoders = tuple(encoders)
+        return self.anime_encoders
+
     def close(self) -> None:
+        for encoder in self.anime_encoders or ():
+            encoder.close()
+        self.anime_encoders = None
         self.primary.close()
         closed: set[int] = set()
         for verifier in (self.secondary, self.boundary_secondary):
@@ -1344,7 +1402,7 @@ class DualSpeakerVerifier:
     def _ensure_secondary(self, profile: SpeakerMatchProfile) -> CAMPlusProfile:
         if self.secondary is None:
             self.status("边界候选出现：正在加载 CAM++ 二次声纹模型")
-            self.secondary = self.boundary_secondary or CAMPlusVerifier(self.device)
+            self.secondary = self.boundary_secondary or self._cache_model(CAMPlusVerifier(self.device))
             self.boundary_secondary = self.secondary
             # Reuse the primary model's retained source indexes. Filtering the
             # two models independently can pair different clips and makes an
@@ -1360,7 +1418,7 @@ class DualSpeakerVerifier:
     def _ensure_tertiary(self, profile: SpeakerMatchProfile) -> WavLMProfile:
         if self.tertiary is None:
             self.status("检测到双模型歧义：正在加载 WavLM 第三声纹模型")
-            self.tertiary = WavLMSpeakerVerifier(self.device)
+            self.tertiary = self._cache_model(WavLMSpeakerVerifier(self.device, role_key=getattr(self, 'role_key', None)))
             self.tertiary_profile = self.tertiary.build_profile(
                 profile.reference_paths,
                 reference_indexes=profile.primary.reference_indexes,
@@ -1381,7 +1439,7 @@ class DualSpeakerVerifier:
     ) -> tuple[WeSpeakerVerifier, WeSpeakerProfile]:
         if self.quaternary is None:
             self.status("正在加载 WeSpeaker 第四声纹裁决模型")
-            self.quaternary = WeSpeakerVerifier()
+            self.quaternary = self._cache_model(WeSpeakerVerifier(self.device))
             self.quaternary_profile = self.quaternary.build_profile(
                 profile.reference_paths,
                 reference_indexes=profile.primary.reference_indexes,
@@ -2673,7 +2731,7 @@ class DualSpeakerVerifier:
     def _boundary_secondary_factory(self) -> CAMPlusVerifier:
         if self.boundary_secondary is None:
             self.status("检测到疑似换人：正在加载 CAM++ 边界模型")
-            self.boundary_secondary = self.secondary or CAMPlusVerifier(self.device)
+            self.boundary_secondary = self.secondary or self._cache_model(CAMPlusVerifier(self.device))
             self.status("CAM++ 边界模型已就绪")
         return self.boundary_secondary
 
@@ -3403,20 +3461,21 @@ class LocalSpeakerTurnSplitter:
             cuts = [
                 boundary.time
                 for boundary in boundaries
-                if span.start + minimum_turn_seconds <= boundary.time <= span.end - minimum_turn_seconds
+                if (span.start + minimum_turn_seconds - 1e-6 <= boundary.time
+                    <= span.end - minimum_turn_seconds + 1e-6)
             ]
             cursor = span.start
             span_turns: list[TimeSpan] = []
             for cut in cuts:
-                if cut - cursor >= minimum_turn_seconds:
+                if cut - cursor + 1e-6 >= minimum_turn_seconds:
                     span_turns.append(TimeSpan(cursor, cut))
                 cursor = cut
-            if span.end - cursor >= minimum_turn_seconds:
+            if span.end - cursor + 1e-6 >= minimum_turn_seconds:
                 span_turns.append(TimeSpan(cursor, span.end))
             elif span_turns:
                 previous = span_turns[-1]
                 span_turns[-1] = TimeSpan(previous.start, span.end)
-            elif span.duration >= minimum_turn_seconds:
+            elif span.duration + 1e-6 >= minimum_turn_seconds:
                 span_turns.append(span)
             turns.extend(span_turns)
         return SpeakerSplitResult(tuple(turns), tuple(boundaries))

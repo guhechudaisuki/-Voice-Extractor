@@ -1,15 +1,7 @@
-"""Voice Extractor WebUI 后端。
+"""WebUI services for extraction, review, export, and model reinforcement.
 
-输出目录结构（由 extractor/pipeline.py 的 _write_outputs 决定）：
-
-    output/<batch_id>/<目标目录>/audio/0001_xxx.wav
-    output/<batch_id>/<目标目录>/text/0001_xxx.txt
-    output/<batch_id>/<目标目录>/stage_audit.json
-    output/<batch_id>/batch_manifest.json      ← sentences[] 是权威索引
-
-因此批次 ≠ 单个目标目录：一个批次可以包含多个目标目录。片段由
-batch_manifest.json 的 sentences[] 定义，音频路径由每条记录的 audio_file
-字段给出（相对批次根，反斜杠分隔）。
+Batch manifests define sentence ordinals and batch-relative audio paths.
+A batch may contain several target directories.
 """
 
 from __future__ import annotations
@@ -26,9 +18,9 @@ import uuid
 import psutil
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
-from fastapi import FastAPI, HTTPException, File, UploadFile
+from fastapi import FastAPI, HTTPException, File, UploadFile, Request
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
@@ -40,7 +32,10 @@ if str(BASE_DIR) not in sys.path:
     # Embedded Python omits cwd/script paths on standalone BAT launches.
     sys.path.insert(0, str(BASE_DIR))
 from launcher.training_workspace import Workspace
-from launcher.training_material import clean_reviews
+from launcher.training_material import (
+    clean_reviews, discover_batch_speakers, export_batch_seeds,
+    high_confidence_borderline,
+)
 from launcher.training_upload import MaterialUploadLimit
 from launcher.review_store import read_review, write_review, review_path, existing_review_path
 from launcher.reinforcement_history import completion_message
@@ -53,14 +48,14 @@ STATIC_DIR = Path(__file__).resolve().parent / "webui_static"
 LAUNCH_BAT = BASE_DIR / "启动当前版本.bat"
 DESKTOP_PY = Path(__file__).resolve().parent / "voice_extractor_desktop.py"
 
-# 与 extractor PipelineOptions 默认值保持一致；UI 只是回显，不作为真值来源。
+# Keep display defaults aligned with PipelineOptions.
 DEFAULT_THRESHOLD = 0.68
 DEFAULT_SILENCE_MIN = 0.20
 DEFAULT_SILENCE_MAX = 0.85
 
 
 def _app_version() -> str:
-    """从 desktop_bootstrap.py 里读版本号，避免两处各写一份。"""
+    """Read the shared version without importing desktop UI dependencies."""
     source = Path(__file__).resolve().parent / "desktop_bootstrap.py"
     if source.is_file():
         match = re.search(
@@ -144,7 +139,10 @@ class ItemReview(BaseModel):
     label: str
     partial_start: Optional[float] = None
     partial_end: Optional[float] = None
+    partial_intervals: Optional[List[List[float]]] = None
+    partial_texts: Optional[List[dict]] = None
     partial_text: Optional[str] = None
+    revised_text: Optional[str] = None
     notes: Optional[str] = ""
 
 
@@ -157,6 +155,30 @@ class BatchReviewPayload(BaseModel):
 class VerifiedExportPayload(BaseModel):
     include_material: bool = False
     gpt_sovits_list: bool = False
+    min_quality_grade: Optional[str] = None
+    speaker: str = "target"
+    language: str = "JA"
+    restore_high_frequencies: bool = False
+
+
+@app.get('/api/training/rollback')
+def global_rollback_status():
+    from launcher.corpus_worker import rollback_status
+    status = rollback_status()
+    return {**status, 'available': (status['available']
+            and not TRAINING_PROCESSES and RUN.process is None and not _rescore_lock.locked())}
+
+
+@app.post("/api/training/rollback")
+def rollback_training():
+    from launcher.corpus_worker import rollback_global_models
+    with _training_lock:
+        if TRAINING_PROCESSES or RUN.process is not None or _rescore_lock.locked():
+            raise HTTPException(409, "请等待当前提取、强化或重评任务结束")
+        try:
+            return rollback_global_models()
+        except (ValueError, OSError) as exc:
+            raise HTTPException(400, str(exc)) from exc
 
 
 def _batch_dir(batch_id: str) -> Path:
@@ -214,6 +236,8 @@ def _attach_cluster_review_audio(data: dict, batch_dir: Path) -> None:
 def _read_manifest(batch_dir: Path) -> dict:
     manifest_file = batch_dir / "batch_manifest.json"
     if not manifest_file.is_file():
+        manifest_file = batch_dir / 'manifest.json'
+    if not manifest_file.is_file():
         return {}
     try:
         data = json.loads(manifest_file.read_text(encoding="utf-8"))
@@ -222,6 +246,8 @@ def _read_manifest(batch_dir: Path) -> dict:
     if not isinstance(data, dict):
         return {}
     _attach_cluster_review_audio(data, batch_dir)
+    from launcher.role_rescore import apply_rescore
+    data = apply_rescore(batch_dir, data)
     return data
 
 
@@ -331,7 +357,7 @@ def get_batch_details(batch_id: str):
         if not isinstance(row, dict):
             continue
         relative = _clip_relative(row)
-        # 音频必须真实存在，否则前端会显示一个点了没声音的空行。
+        # Omit entries that cannot be played.
         if not relative or not (batch_dir / relative).is_file():
             continue
         diagnostics = row.get("diagnostics")
@@ -350,12 +376,23 @@ def get_batch_details(batch_id: str):
             "accepted": bool(row.get("accepted")),
             "cluster_removed": bool(diagnostics.get("cluster_removed")),
             "cluster_tier": diagnostics.get("cluster_tier") or "",
+            "cluster_reason": diagnostics.get("cluster_reason"),
+            "tier_b_rank_score": diagnostics.get("tier_b_rank_score"),
+            "calibrated_fusion_score": diagnostics.get("calibrated_fusion_score"),
+            "information_score": (diagnostics.get("identity_heatmap") or {}).get("information_score"),
+            "identity_heatmap_available": bool((diagnostics.get("identity_heatmap") or {}).get("frames")),
+            "identity_signature": [(diagnostics.get('fusion_evidence') or {}).get(name) for name in
+                ('primary', 'secondary', 'tertiary', 'anime_char_score', 'anime_va_score')],
+            "cluster_ids": diagnostics.get('cluster_ids', []),
+            "high_confidence_borderline": high_confidence_borderline(row),
+            "acoustic_qc": diagnostics.get("acoustic_qc") or {},
             "reject_reason": str(row.get("reject_reason") or ""),
             "score": row.get("speaker_score"),
             "tier": diagnostics.get("speaker_tier") or "",
             "route": _route_of(diagnostics),
             "exclusion_margin": diagnostics.get("exclusion_margin"),
             "review": existing.get(str(ordinal)) or {},
+            "role_rescore": diagnostics.get('role_rescore'),
         })
 
     return {
@@ -367,18 +404,119 @@ def get_batch_details(batch_id: str):
     }
 
 
+@app.get('/api/batches/{batch_id}/speakers')
+def get_batch_speakers(batch_id: str):
+    directory = _batch_dir(batch_id)
+    try:
+        speakers = discover_batch_speakers(directory)
+        return {'batch_id': batch_id, 'speakers': speakers}
+    except (OSError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post('/api/batches/{batch_id}/live_recalibrate')
+def live_recalibrate(batch_id: str):
+    from launcher.live_recalibration import recalibrate
+    with _review_lock:
+        segments = get_batch_details(batch_id)['segments']
+    return recalibrate(segments)
+
+
+_rescore_jobs = {}
+_rescore_lock = threading.Lock()
+
+
+@app.get('/api/batches/{batch_id}/rescore')
+def rescore_status(batch_id: str):
+    _batch_dir(batch_id)
+    return _rescore_jobs.get(batch_id, {'status': 'idle'})
+
+
+@app.post('/api/batches/{batch_id}/rescore')
+def rescore_model(batch_id: str):
+    from launcher.role_rescore import rescore_batch
+    directory = _batch_dir(batch_id)
+    if TRAINING_PROCESSES or RUN.process is not None:
+        raise HTTPException(409, '请等待正在进行的提取或强化任务结束')
+    if not _rescore_lock.acquire(blocking=False):
+        raise HTTPException(409, '已有重评任务正在运行')
+    _rescore_jobs[batch_id] = {'status': 'running', 'message': '读取缓存与最新强化模型'}
+    def work():
+        try:
+            result = rescore_batch(directory, progress=lambda msg: _rescore_jobs[batch_id].update(message=msg))
+            _rescore_jobs[batch_id] = result
+        except Exception as exc:
+            _rescore_jobs[batch_id] = {'status': 'failed', 'message': str(exc)}
+        finally:
+            _rescore_lock.release()
+    threading.Thread(target=work, daemon=True).start()
+    return {'status': 'running'}
+
+
+@app.get('/api/fs/browse')
+def browse_local_files(request: Request, path: str = '', kind: str = 'media', offset: int = 0):
+    from launcher.local_files import require_loopback, browse
+    require_loopback(request)
+    try:
+        return browse(path, kind=kind, offset=offset)
+    except (OSError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+class DatasetMergePayload(BaseModel):
+    batch_ids: List[str]
+    speaker: str = 'target'
+    language: str = 'JA'
+    target_lufs: float = -23.
+    true_peak: float = -1.
+    min_quality_grade: Optional[str] = None
+    restore_high_frequencies: bool = False
+
+
+@app.post('/api/datasets/merge')
+def merge_reviewed_batches(payload: DatasetMergePayload):
+    from launcher.dataset_merger import merge_datasets
+    ids = list(dict.fromkeys(payload.batch_ids))
+    if not 1 <= len(ids) <= 100:
+        raise HTTPException(400, '请选择 1–100 个批次')
+    with _review_lock:
+        batches = [(p, _read_manifest(p), _read_review(p).get('reviews', {})) for p in map(_batch_dir, ids)]
+    token = uuid.uuid4().hex
+    destination = TRAINING_WORKSPACE.root / f'{token}.zip'
+    try:
+        stats = merge_datasets(batches, destination, speaker=payload.speaker, language=payload.language,
+            target_lufs=payload.target_lufs, true_peak=payload.true_peak,
+            min_quality_grade=payload.min_quality_grade, restore_high_frequencies=payload.restore_high_frequencies)
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    with _artifact_lock:
+        DOWNLOADS[token] = (destination, 'reviewed_corpus.zip')
+    return {**stats, 'download_url': f'/api/download/{token}', 'zip_name': 'reviewed_corpus.zip'}
+
+
+class SeedExportPayload(BaseModel):
+    cluster_ids: Optional[List[Union[str, int]]] = None
+
+
+@app.post('/api/batches/{batch_id}/export_seeds')
+def export_batch_speaker_seeds(batch_id: str, payload: Optional[SeedExportPayload] = None):
+    directory = _batch_dir(batch_id)
+    with _artifact_lock:
+        if _closing.is_set():
+            raise HTTPException(409, '程序正在关闭')
+        try:
+            return export_batch_seeds(directory, payload.cluster_ids if payload else None)
+        except (OSError, ValueError, RuntimeError) as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+
 @app.get("/api/batches/{batch_id}/stage_turns")
 def get_stage_turns(batch_id: str):
-    """返回 stage_audit.json 里的说话轮次与最终输出段。
-
-    簇判决报告里的成员是**说话轮次序号**（254 个），而界面上试听的是**最终
-    输出片段**（28 段）。两者不是一回事，前端要靠时间段重叠把它们对上。
-    这个接口把两套时间段都给出来，好在浏览器里做重叠匹配。
-    """
+    """Return speaker-turn intervals for matching output clips by overlap."""
     batch_dir = _batch_dir(batch_id)
     audit_file = next(iter(sorted(batch_dir.rglob("stage_audit.json"))), None)
     if audit_file is None:
-        return {"available": False, "reason": "这一集没有 stage_audit.json"}
+        return {"available": False, "reason": "这一批次没有说话轮次记录"}
     try:
         audit = json.loads(audit_file.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -434,7 +572,7 @@ def _cluster_reports(batch_dir: Path):
             reports.append((path, data, str(path.parent.relative_to(batch_dir)).replace("\\", "/")))
     if reports:
         return reports
-    # Historical development reports are bound by full batch ID, never filename suffix.
+    # Legacy reports must match the full batch ID.
     for path in sorted(ROOT_DOCS.glob("cluster*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
@@ -529,6 +667,25 @@ def save_cluster_override(batch_id: str, payload: ClusterOverridePayload):
     return {"status": "ok", "message": "目标簇标注已保存"}
 
 
+@app.get("/api/identity_heatmap/{batch_id}/{ordinal}")
+def get_identity_heatmap(batch_id: str, ordinal: int):
+    sentences = _read_manifest(_batch_dir(batch_id)).get('sentences')
+    if not isinstance(sentences, list) or not 1 <= ordinal <= len(sentences):
+        raise HTTPException(404, '片段不存在')
+    row = sentences[ordinal-1]
+    heat = (row.get('diagnostics') or {}).get('identity_heatmap') or {}
+    start, end = float(row.get('start', 0)), float(row.get('end', 0))
+    origin = float(heat.get('source_start', start))
+    frames = []
+    for frame in heat.get('frames', ()):
+        a, b = origin+frame['offset'], origin+frame['end']
+        if min(b,end) > max(a,start):
+            frames.append({**frame, 'offset':max(a,start)-start, 'end':min(b,end)-start})
+    return {**heat, 'source_start':start, 'source_end':end, 'frames':frames,
+            'classifier_trim_proposal':(row.get('diagnostics') or {}).get('classifier_trim_proposal'),
+            'available':bool(frames)}
+
+
 @app.get("/api/audio/{batch_id}/{ordinal}")
 def stream_audio(batch_id: str, ordinal: int):
     """按序号取音频：序号是稳定索引，比在 URL 里传文件名可靠。"""
@@ -585,8 +742,14 @@ def _build_verified_export(batch_id: str, payload: Optional[VerifiedExportPayloa
     zip_path = review_path(batch_dir).with_suffix('.zip') if include_material else TRAINING_WORKSPACE.root / f"{uuid.uuid4().hex}.zip"
     try:
         zip_path.parent.mkdir(parents=True, exist_ok=True)
+        stats = {}
         verified_count = export_review_zip(batch_dir, manifest, reviews, zip_path, include_material,
-                                           gpt_sovits_list=gpt_sovits_list and not include_material)
+                                           speaker=payload.speaker if payload else "target",
+                                           language=payload.language if payload else "JA",
+                                           gpt_sovits_list=gpt_sovits_list and not include_material,
+                                           min_quality_grade=payload.min_quality_grade if payload else None,
+                                           restore_high_frequencies=payload.restore_high_frequencies if payload else False,
+                                           stats=stats)
     except (OSError, ValueError) as exc:
         raise HTTPException(400, str(exc)) from exc
 
@@ -606,6 +769,9 @@ def _build_verified_export(batch_id: str, payload: Optional[VerifiedExportPayloa
     return {
         "status": "ok",
         "verified_count": verified_count,
+        **stats,
+        "message": (f"已导出 {stats['valid_count']} 条有效训练音频，总净时长 {stats['total_duration_seconds']:.2f} 秒。"
+                    f"清单（ZIP 内）：{stats['slicer_opt_path']}；{stats['metadata_path']}"),
         "zip_path": str(zip_path),
         "zip_name": zip_name,
         "download_url": f"/api/download/{token}",
@@ -660,6 +826,8 @@ def _training_worker(job_id: str, process: subprocess.Popen, destination: Path):
 
 @app.post("/api/training/start")
 def start_training(files: List[UploadFile] = File(...)):
+    if _rescore_lock.locked():
+        raise HTTPException(409, '请等待当前角色重评结束')
     if not 1 <= len(files) <= 30:
         raise HTTPException(400, "请选择 1 至 30 个含标注和音频的 ZIP 文件")
     if sum(uploaded.size or 0 for uploaded in files) > 8 * 1024**3:
@@ -847,6 +1015,8 @@ def _pump(process: subprocess.Popen) -> None:
 
 @app.post("/api/extract")
 def start_extract(payload: ExtractPayload):
+    if _rescore_lock.locked():
+        raise HTTPException(409, '请等待当前角色重评结束')
     with RUN.lock:
         if _closing.is_set():
             raise HTTPException(409, "程序正在关闭")

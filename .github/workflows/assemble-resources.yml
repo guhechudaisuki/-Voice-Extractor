@@ -4,10 +4,10 @@ on:
   workflow_dispatch:
     inputs:
       prefix:
-        description: Unique prefix of the staging part assets
+        description: Unique prefix of the resource part assets
         required: true
       count:
-        description: Number of staging parts
+        description: Number of resource parts
         required: true
       sha256:
         description: Expected SHA-256 of the complete resource ZIP
@@ -33,15 +33,15 @@ jobs:
           ARTIFACT_NAME: ${{ inputs.artifact_name }}
         run: |
           python - <<'PY'
-          import hashlib, json, os, re, subprocess
+          import hashlib, os, re, subprocess, zipfile
           from concurrent.futures import ThreadPoolExecutor
-          from pathlib import Path
+          from pathlib import Path, PurePosixPath
 
           prefix = os.environ['PREFIX']
           count = int(os.environ['COUNT'])
           expected = os.environ['EXPECTED_SHA256']
-          if not re.fullmatch(r'resource-stage-[a-f0-9]{12}-', prefix) or not 1 <= count <= 200:
-              raise ValueError('Invalid staging part selection')
+          if not re.fullmatch(r'resource-part-[a-f0-9]{12}-', prefix) or not 1 <= count <= 200:
+              raise ValueError('Invalid resource part selection')
           if not re.fullmatch(r'[a-f0-9]{64}', expected):
               raise ValueError('Invalid checksum')
           repository = os.environ['GITHUB_REPOSITORY']
@@ -59,11 +59,57 @@ jobs:
           digest = hashlib.sha256()
           with destination.open('wb') as output:
               for path in parts:
-                  block = path.read_bytes()
-                  output.write(block)
-                  digest.update(block)
+                  with path.open('rb') as source:
+                      for block in iter(lambda: source.read(1024 * 1024), b''):
+                          output.write(block)
+                          digest.update(block)
           if digest.hexdigest() != expected:
               raise ValueError('Resource ZIP checksum mismatch')
+          if artifact.endswith('.zip'):
+              root_files = {'desktop_worker.py', 'extract_cli.py', 'app.py', 'README.md',
+                            'LICENSE', 'requirements-extra.txt'}
+              code_roots = {'extractor', 'launcher', 'vendor', 'dependencies'}
+              assets = {'tools/ffmpeg.exe', 'tools/ffprobe.exe',
+                        'models/anime_t3/classifier_v2.pt',
+                        'models/wavlm-base-plus-sv/auto_negatives.npz',
+                        'models/anime-speaker-char/anime_speaker_char_ecapa.onnx',
+                        'models/anime-speaker-va/anime_speaker_va_ecapa.onnx',
+                        'model/speaker/wavlm-base-plus-sv/auto_negatives.npz'}
+              excluded = {'tests', 'test', 'evaluation', 'docs', 'examples', '__pycache__'}
+              suffixes = {'.py', '.json', '.yaml', '.yml', '.txt', '.csv', '.html', '.css',
+                          '.js', '.svg', '.png', '.ico', '.typed', '.dll', '.pyd', '.so'}
+              required = root_files | {'extractor/pipeline.py', 'launcher/release_manifest.py',
+                          'launcher/model_reinforcement.py', 'dependencies/uvr5/vr.py',
+                          'dependencies/eres2net/ERes2NetV2.py', 'dependencies/LICENSE.GPT-SoVITS',
+                          'tools/ffmpeg.exe', 'tools/ffprobe.exe',
+                          'models/anime_t3/classifier_v2.pt',
+                          'models/wavlm-base-plus-sv/auto_negatives.npz',
+                          'models/anime-speaker-char/anime_speaker_char_ecapa.onnx',
+                          'models/anime-speaker-va/anime_speaker_va_ecapa.onnx'}
+              seen = set()
+              with zipfile.ZipFile(destination) as package:
+                  members = package.infolist()
+                  if sum(item.file_size for item in members) > 2 * 1024**3:
+                      raise ValueError('Resource ZIP exceeds the installation size limit')
+                  for item in members:
+                      name = item.filename
+                      path = PurePosixPath(name)
+                      if (not path.parts or path.is_absolute() or '\\' in name or ':' in name
+                              or '\0' in name or any(part in {'', '.', '..'} for part in name.split('/'))
+                              or any(part.startswith('.') or part.lower() in excluded for part in path.parts)
+                              or (item.external_attr >> 16) & 0o170000 == 0o120000
+                              or name.casefold() in seen):
+                          raise ValueError(f'Invalid resource path: {name}')
+                      seen.add(name.casefold())
+                      license_file = path.name.upper().startswith(('LICENSE', 'COPYING', 'NOTICE'))
+                      metadata = any(part.endswith('.dist-info') for part in path.parts)
+                      code_file = (path.parts[0] in code_roots
+                                   and (path.suffix.lower() in suffixes or license_file or metadata)
+                                   and not path.name.lower().startswith(('test_', 'conftest.', 'readme')))
+                      if name not in root_files | assets and not code_file:
+                          raise ValueError(f'Unexpected resource file: {name}')
+                  if not {name.casefold() for name in required}.issubset(seen):
+                      raise ValueError('Resource ZIP is missing required runtime files or licenses')
           subprocess.run(['gh', 'release', 'upload', 'v3.0', str(destination), '--repo', repository,
                           '--clobber'], check=True)
           print(f'Published {destination}: {destination.stat().st_size} bytes, SHA256 {expected}')

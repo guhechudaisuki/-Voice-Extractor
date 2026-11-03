@@ -1,11 +1,4 @@
-"""Inference-only adapter for locally installed anime speaker ONNX models.
-
-The encoder is reference-conditioned at use time: the same frozen model encodes
-user references and candidate speech. Nothing here trains or identifies a
-character by name. The filterbank intentionally matches the preprocessing of
-the existing anime_speaker_embedding checkpoints; an ordinary torchaudio mel
-filterbank would change the model input distribution.
-"""
+"""Local anime speaker encoders with checkpoint-compatible acoustic features."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -20,22 +13,23 @@ _MODEL_FILES = {
 }
 
 
-def speechbrain_compatible_fbank(waveform: torch.Tensor) -> torch.Tensor:
-    """Return the frozen anime model's 16 kHz, 80-bin features [frames, bins].
+class InsufficientSpeech(ValueError):
+    """Audio contains too little speech to produce an identity embedding."""
 
-    The model was trained with SpeechBrain's default 25/10 ms Hamming STFT,
-    triangular HTK-mel power filters, per-utterance 80 dB floor, and the
-    checkpoint's unusual x32768 waveform scale. Resampling must happen before
-    this function; accepting a rate here would risk a silent mismatch.
-    """
+
+def speechbrain_compatible_fbank(waveform: torch.Tensor) -> torch.Tensor:
+    """Return 80-bin features using the checkpoint's 16 kHz SpeechBrain frontend."""
     samples = torch.as_tensor(waveform, dtype=torch.float32, device="cpu")
-    if samples.ndim != 1 or samples.numel() < 3200 or not torch.isfinite(samples).all():
-        raise ValueError("Expected at least 0.2 s of finite mono audio at 16 kHz")
+    if samples.ndim != 1 or not torch.isfinite(samples).all():
+        raise ValueError("Expected finite mono audio at 16 kHz")
+    if samples.numel() < 3200:
+        raise InsufficientSpeech("Expected at least 0.2 s of audio")
     if float(samples.square().mean().sqrt()) < 1e-5:
-        raise ValueError("Silent audio cannot provide speaker identity evidence")
+        raise InsufficientSpeech("Silent audio cannot provide speaker identity evidence")
     peak = samples.abs().amax()
     if peak > 1.0:
         samples = samples / peak
+    # The checkpoint frontend expects int16-scale amplitudes.
     samples = samples * 32768.0
 
     spectrum = torch.stft(
@@ -61,7 +55,7 @@ def speechbrain_compatible_fbank(waveform: torch.Tensor) -> torch.Tensor:
 class AnimeSpeakerOnnx:
     """Frozen char/va embeddings; no network access and no checkpoint writes."""
 
-    def __init__(self, models_root: str | Path, variant: str):
+    def __init__(self, models_root: str | Path, variant: str, *, device="cpu"):
         if variant not in _MODEL_FILES:
             raise ValueError(f"Unknown anime speaker variant: {variant}")
         path = Path(models_root) / _MODEL_FILES[variant]
@@ -72,9 +66,10 @@ class AnimeSpeakerOnnx:
 
         options = ort.SessionOptions()
         options.intra_op_num_threads = 2
-        self.session = ort.InferenceSession(
-            str(path), sess_options=options, providers=["CPUExecutionProvider"],
-        )
+        providers = ["CPUExecutionProvider"]
+        if str(device).startswith("cuda") and "CUDAExecutionProvider" in ort.get_available_providers():
+            providers.insert(0, "CUDAExecutionProvider")
+        self.session = ort.InferenceSession(str(path), sess_options=options, providers=providers)
         inputs, outputs = self.session.get_inputs(), self.session.get_outputs()
         if (len(inputs) != 1 or inputs[0].name != "features"
                 or inputs[0].shape[-1] != 80 or len(outputs) != 1
@@ -82,10 +77,24 @@ class AnimeSpeakerOnnx:
             raise ValueError("Unexpected anime speaker ONNX input/output contract")
         self.variant = variant
         self.path = path
+        self.device = self.session.get_providers()[0]
+        from ..embedding_reuse import configure_cache
+        configure_cache(self, path, implementation=__file__)
 
     def encode(self, waveform: torch.Tensor, *, sample_rate: int) -> np.ndarray:
         if sample_rate != 16000:
             raise ValueError("Anime speaker encoder requires resampled 16 kHz audio")
+        from ..embedding_reuse import waveform_key
+        cache = getattr(self, "feature_cache", None)
+        if cache is None:
+            return self._encode(waveform)
+        key = waveform_key(self.feature_version, waveform)
+        def compute():
+            vector = self._encode(waveform)
+            return vector, vector
+        return cache.get_or_compute(key, compute)[0]
+
+    def _encode(self, waveform):
         features = speechbrain_compatible_fbank(waveform)
         result = self.session.run(None, {"features": features.numpy()[None]})[0]
         vector = np.asarray(result, dtype=np.float32).reshape(-1)
@@ -95,3 +104,6 @@ class AnimeSpeakerOnnx:
         if norm <= 1e-8:
             raise ValueError("Anime speaker ONNX returned a zero embedding")
         return vector / norm
+
+    def close(self) -> None:
+        self.session = None

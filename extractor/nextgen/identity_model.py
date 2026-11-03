@@ -1,11 +1,4 @@
-"""Trainable reference-conditioned temporal identity/contamination head.
-
-References remain separate tokens, never a mean speaker centroid. Matching is
-order invariant; known exclusion groups remain inspectable while the independent
-other-voice head can detect an unregistered person. This architecture has NO
-usable default weights. Construction is for training/tests; inference must load
-a fingerprinted checkpoint and its matching calibration.
-"""
+"""Reference-conditioned temporal identity and contamination head requiring calibrated weights."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -109,9 +102,7 @@ class TemporalIdentityModel(nn.Module):
         previous = torch.cat((hidden[:1], hidden[:-1]), dim=0)
         logits = self.frame_head(torch.cat((hidden, (hidden - previous).abs()), dim=-1))
         if self.architecture_version == 2:
-            # The v1 learned projection/head erased stronger frozen-speaker
-            # evidence on held-out scenes. Keep that evidence as a local skip;
-            # the bounded temporal correction may refine, not overwrite it.
+            # Bound temporal corrections around the frozen local speaker evidence.
             direct_target = (F.normalize(raw, dim=-1)
                              @ F.normalize(target.raw, dim=-1).T)
             direct_target = direct_target.masked_fill(~target.valid[None, :], -torch.inf)

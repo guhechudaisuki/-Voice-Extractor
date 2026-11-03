@@ -6,7 +6,7 @@ import shutil
 from .model_store import file_sha256
 
 
-def save_training_context(output: Path, source: Path, references: list[Path]):
+def save_training_context(output: Path, source: Path, references: list[Path], *, identity_references=None):
     directory = output / '_training'
     directory.mkdir(parents=True, exist_ok=True)
     records = []
@@ -17,6 +17,12 @@ def save_training_context(output: Path, source: Path, references: list[Path]):
         records.append({'audio': name, 'sha256': checksum})
     data = {'schema': 1, 'source_name': source.name, 'source_sha256': file_sha256(source),
             'references': records}
+    # Training references can be prepared vocal clips. Keep the original role
+    # identity stable across preparation versions and temporary file locations.
+    if identity_references is not None:
+        data['role_reference_sha256'] = sorted(set(file_sha256(Path(p)) for p in identity_references))
+        data['original_reference_paths'] = [str(Path(p).resolve()) for p in identity_references]
+        data['reference_names'] = [Path(p).name for p in identity_references]
     (directory / 'context.json').write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
 
 

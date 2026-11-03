@@ -1,52 +1,77 @@
-# Python
+# Keep source directories; other root directories contain local data.
+/*/
+!/.github/
+!/extractor/
+!/launcher/
+!/scripts/
+!/vendor/
+!/model/
+!/models/
+
+# Local tests, evaluation scripts, and development notes
+/tests/
+/evaluation/
+/docs/
+/[计]划方案/
+/[我]心危素材/
+/output/
+/cache/
+/temp/
+/logs/
+/training/
+/scripts/check_global_workbench.py
+/scripts/check_peripheral_*.py
+/scripts/check_peripheral_*.cjs
+*.md
+!/README.md
+!**/LICENSE.md
+!**/LICENSE.MD
+/*.json
+/*.ps1
+/.*
+!/.gitignore
+!/.gitattributes
+!/.github/
+
+# Python environments and caches
 __pycache__/
 *.py[cod]
 *.pyd
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
 *.egg-info/
-
-# Local environments and logs
 .venv/
 venv/
 env/
-*.log
-output/app.log
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage*
+htmlcov/
 
-# Runtime, model weights and caches (never commit these)
-models/
-model/
-/cache/
-work/
-output/
-annotations/
-training/data/
-training/cache/
-training/checkpoints/
-runtime/
-logs/
-tools/
-python_packages/
-/resource/
-voice_extractor_installation.json
-/VoiceExtractor.exe
-omnvoice/
-GPT-SoVITS*/
-**/hf_cache/
-**/modelscope_cache/
-*.pth
-*.pt
-!models/anime_t3/classifier_v2.pt
-*.ckpt
-*.bin
-*.onnx
-*.safetensors
+# Build output and local configuration
+build/
+dist/
+bin/
+obj/
+*.exe
+*.dll
 *.spec
 !VoiceExtractor.spec
+*.log
+*.tmp
+*.bak
+*.previous
+*.rebond
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.user
+*.suo
 
-# Audio/video inputs and generated media
-/京吹原片音频/
+# Input media and generated archives
 *.wav
 *.mp3
 *.flac
@@ -57,59 +82,29 @@ GPT-SoVITS*/
 *.mkv
 *.avi
 *.zip
+*.7z
+*.tar
+*.gz
 
-# Build output
-build/
-dist/*
-!dist/VoiceExtractor.exe
-versions/
-/提取_目标优化前_734bd07/
-launcher/bin/
-launcher/obj/
-/vendor/bin/
-
-# OS/editor files
-.DS_Store
-Thumbs.db
-.idea/
-.vscode/
-*.user
-*.suo
-提取_错误段排除后_1236632/
-提取_错误段排除后_v2_00/
-提取_重训第一版试听_20260928_2ed2ea/
-
-# Local agent/tool state
-.serena/
-voice_extractor_settings.json
-# Local development instructions, prompts, and handoff notes
-/docs/
-
-# === v3.0: 只保留可运行程序，不提交素材/证据/日志/构建产物 ===
-docs/*.json
-docs/cluster_bootstrap_*/
-docs/*replay*.json
-docs/*duration*.json
-docs/*stage1_4*.json
-docs/*stage5_11*.json
-docs/*stage13_16*.json
-docs/*plan_completion*.json
-docs/*kokoro*.json
-docs/*high_recall*.json
-dist/
-test_logs/
+# Downloaded weights and model caches
+*.pth
+*.pt
+*.ckpt
+*.bin
+*.onnx
+*.safetensors
 *.npz
-*.previous
-*.rebond
-evaluation/episode*_user_review_*.json
-evaluation/*_request.json
-evaluation/known_*.json
-evaluation/*_cases.json
-evaluation/repair_preview_*.json
-evaluation/short_span_*.json
-evaluation/join_cases.json
-
-我心危素材/
-计划方案/
-training/
-run_cluster_p0p2.ps1
+hf_cache/
+modelscope_cache/
+/models/*
+!/models/anime_t3/
+/models/anime_t3/*
+!models/anime_t3/classifier_v2.pt
+!/models/wavlm-base-plus-sv/
+/models/wavlm-base-plus-sv/*
+!models/wavlm-base-plus-sv/auto_negatives.npz
+/model/*
+!/model/speaker/
+/model/speaker/*
+!/model/speaker/wavlm-base-plus-sv/
+/model/speaker/wavlm-base-plus-sv/*

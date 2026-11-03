@@ -44,7 +44,45 @@ def pooled_features(encoder, processor, device, wave: torch.Tensor) -> torch.Ten
 @torch.no_grad()
 def score_window(models: tuple, wave: torch.Tensor) -> float:
     encoder, processor, classifier, _threshold, device = models
+    if wave.numel() < 8000:
+        wave = torch.nn.functional.pad(wave, (0, 8000 - wave.numel()))
     return float(classifier(pooled_features(encoder, processor, device, wave)).item())
+
+
+class ReferenceConditionedClassifier(torch.nn.Module):
+    """A universal metric: the same query changes identity with its reference.
+
+    No speaker ID or reference hash is baked into the checkpoint. Calibration
+    thresholds operate on the shared projected query/reference cosine scale.
+    """
+    def __init__(self, projection, reference_vectors):
+        super().__init__()
+        self.projection = projection
+        self.register_buffer('references', torch.nn.functional.normalize(reference_vectors, dim=-1))
+
+    def forward(self, pooled):
+        width = pooled.shape[-1] // 3
+        stats = torch.cat((pooled[..., :width], pooled[..., -width:]), dim=-1)
+        query = torch.nn.functional.normalize(self.projection(stats), dim=-1)
+        scores = self.references @ query
+        return (scores.topk(min(2, len(scores))).values.mean() - .8) * 20.
+
+
+@torch.no_grad()
+def reference_conditioned_classifier(encoder, processor, device, paths):
+    from .audio import load_mono
+    vectors = []
+    for path in paths:
+        wave = load_mono(path, 16000)
+        if wave.numel() < 8000:
+            wave = torch.nn.functional.pad(wave, (0, 8000 - wave.numel()))
+        for offset in window_starts(len(wave), window=min(28800, len(wave)), hop=14400):
+            pooled = pooled_features(encoder, processor, device, wave[offset:offset+28800])
+            width = pooled.numel() // 3
+            vectors.append(encoder.feature_extractor(torch.cat((pooled[:width], pooled[-width:]))))
+    if not vectors:
+        raise ValueError('参考音频没有可用的声纹特征')
+    return ReferenceConditionedClassifier(encoder.feature_extractor, torch.stack(vectors)).to(device).eval()
 
 
 def negative_window_evidence(windows: list[dict]) -> float | None:

@@ -1,4 +1,4 @@
-"""Optional subtitle timing hints. Text is provenance, never a transcript."""
+"""Subtitle timing, dialogue boundaries, and conservative text recovery."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import re
 import sys
 from bisect import bisect_left
 from dataclasses import asdict, dataclass, field, replace
+from html import unescape
 from pathlib import Path
 from statistics import median
 from typing import Sequence
@@ -76,23 +77,21 @@ def read_subtitles(path: Path) -> list[SubtitleCue]:
             kind = "lyrics"
         elif re.search(r"\\(?:pos|move)\(", event.text) or re.search(r"(?:sign|title|staff|注释|招牌)", event.style, re.I):
             kind = "screen_text"
-        key = (event.start, event.end, kind)
+        actor = str(getattr(event, "name", "") or "").strip()
+        key = (event.start, event.end, kind, plain, actor)
         if key in seen:
             continue
         seen.add(key)
-        actor = str(getattr(event, "name", "") or "").strip()
         cues.append(SubtitleCue(index, event.start / 1000, event.end / 1000, plain, kind, actor))
     folded: list[SubtitleCue] = []
     for cue in sorted(cues, key=lambda cue: (cue.start, cue.end)):
-        # 双语同轴行折叠（Stage 15）：JPSC 类字幕同一句有 Dial-JP/Dial-CH
-        # 两条几乎同轴的事件，绝不当作多人重叠，也不允许把日文行挤掉。
+        # Fold translations, while preserving simultaneous dialogue by different speakers.
         if (folded and cue.kind == "speech" and folded[-1].kind == "speech"
                 and abs(cue.start - folded[-1].start) <= 0.15
-                and abs(cue.end - folded[-1].end) <= 0.15):
+                and abs(cue.end - folded[-1].end) <= 0.15
+                and _parallel_caption(folded[-1], cue)):
             previous = folded[-1]
             if _has_kana(cue.text) and not _has_kana(previous.text):
-                folded[-1] = replace(previous, text=cue.text)
-            elif _has_kana(cue.text) and _has_kana(previous.text) and len(cue.text) > len(previous.text):
                 folded[-1] = replace(previous, text=cue.text)
             continue
         folded.append(cue)
@@ -103,6 +102,51 @@ def read_subtitles(path: Path) -> list[SubtitleCue]:
 
 def _has_kana(text: str) -> bool:
     return bool(re.search(r"[\u3040-\u30ff]", str(text or "")))
+
+
+def _parallel_caption(left: SubtitleCue, right: SubtitleCue) -> bool:
+    if left.actor and right.actor and left.actor != right.actor:
+        return False
+    if re.sub(r"\s+", "", left.text) == re.sub(r"\s+", "", right.text):
+        return True
+    if _has_kana(left.text) == _has_kana(right.text):
+        return False
+    translation = right.text if _has_kana(left.text) else left.text
+    return bool(re.search(r"[\u4e00-\u9fff]", translation))
+
+
+def clean_dialogue_text(text: str) -> str:
+    """Remove presentation markup and decline cues containing multiple speakers."""
+    text = unescape(re.sub(r"<[^>]+>|\{[^}]*\}", "", str(text or "")))
+    text = text.replace(r"\N", "\n").replace(r"\n", "\n").replace(r"\h", " ")
+    if re.search(r"[♪♫♬]", text):
+        return ""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if sum(bool(re.match(r"^[-–—]\s*\S", line)) for line in lines) > 1:
+        return ""
+    speakers = re.findall(r"^(?:[-–—]\s*)?([^:：\n]{1,24})[:：]", text, re.M)
+    if len(set(speakers)) > 1:
+        return ""
+    labels = [
+        match.group(1) for line in lines
+        if (match := re.match(r"^[（(【\[]([^）)】\]]{1,24})[）)】\]]\s*\S", line))
+    ]
+    if len(set(labels)) > 1:
+        return ""
+    if any(_has_kana(line) for line in lines) and any(
+        not _has_kana(line) and re.search(r"[\u4e00-\u9fff]", line) for line in lines
+    ):
+        lines = [line for line in lines if _has_kana(line)]
+    cleaned = []
+    for line in lines:
+        line = re.sub(r"^[-–—]\s*", "", line)
+        line = re.sub(r"^[^:：]{1,24}[:：]\s*", "", line)
+        line = re.sub(r"^[（(【\[][^）)】\]]{1,24}[）)】\]]\s*", "", line)
+        if line.strip():
+            cleaned.append(line.strip())
+    separator = "" if any(_has_kana(line) for line in cleaned) else " "
+    result = re.sub(r"\s+", " ", separator.join(cleaned)).strip()
+    return result if re.search(r"[^\W\d_]", result) else ""
 
 
 def discover_subtitle_for_target(target: Path) -> Path | None:
@@ -167,34 +211,30 @@ class SubtitleGuide:
         })
 
     def overlapping_speech_spans(self, minimum: float = 0.25) -> list[TimeSpan]:
-        """两条 speech 字幕在同一时间重叠 → 多人同时说话的禁区。
-
-        动画里的前后景同时喊话（如背景喊「楽譜 返して」+ 前景对话）在字幕上
-        表现为时间重叠的双 Cue；这些区间不得当作单人干净语音切分或拼接。
-        返回合并后的重叠区间（已应用对齐偏移）。
-        """
+        """Return simultaneous dialogue intervals, including nested cues."""
         speech = sorted(
             (cue for cue in self.cues if cue.kind == "speech"),
             key=lambda cue: (cue.start, cue.end))
         spans: list[TimeSpan] = []
-        for left, right in zip(speech, speech[1:]):
-            # 双语/特效同轴行保护：起止几乎一致的两条字幕不是多人重叠。
-            if (abs(right.start - left.start) <= 0.18
-                    and abs(right.end - left.end) <= 0.18):
-                continue
-            overlap = min(left.end, right.end) - max(left.start, right.start)
-            if overlap < minimum:
-                continue
-            if self.aligned:
-                left_span = self.cue_span(left)
-                right_span = self.cue_span(right)
-                if left_span is None or right_span is None:
+        active: list[SubtitleCue] = []
+        intersections = []
+        for right in speech:
+            active = [left for left in active if left.end > right.start]
+            for left in active:
+                if (abs(right.start - left.start) <= 0.18
+                        and abs(right.end - left.end) <= 0.18
+                        and _parallel_caption(left, right)):
                     continue
-                start = max(left_span.start, right_span.start)
-                end = min(left_span.end, right_span.end)
-            else:
-                start = max(left.start, right.start)
-                end = min(left.end, right.end)
+                left_span = self.cue_span(left) if self.aligned else TimeSpan(left.start, left.end)
+                right_span = self.cue_span(right) if self.aligned else TimeSpan(right.start, right.end)
+                if left_span is not None and right_span is not None:
+                    start = max(left_span.start, right_span.start)
+                    end = min(left_span.end, right_span.end)
+                    if end - start >= minimum:
+                        intersections.append(TimeSpan(start, end))
+            active.append(right)
+        for interval in sorted(intersections, key=lambda part: (part.start, part.end)):
+            start, end = interval.start, interval.end
             if end - start < minimum:
                 continue
             if spans and start <= spans[-1].end:
@@ -260,6 +300,59 @@ class SubtitleGuide:
             return None
         return TimeSpan(max(0.0, cue.start + local), max(0.0, cue.end + local))
 
+    def cue_indices_for_span(self, span: TimeSpan) -> frozenset[int]:
+        """Identify dialogue ownership without treating missing alignment as permission to join."""
+        indices = set()
+        for cue in self.cues:
+            if cue.kind != "speech":
+                continue
+            aligned = self.cue_span(cue)
+            if aligned is None:
+                aligned = TimeSpan(max(0.0, cue.start + self.offset), max(0.0, cue.end + self.offset))
+            if _intersection(span, aligned) > 0.01:
+                indices.add(cue.index)
+        return frozenset(indices)
+
+    def crosses_cue_boundary(self, left: TimeSpan, right: TimeSpan) -> bool:
+        left_indices = self.cue_indices_for_span(left)
+        right_indices = self.cue_indices_for_span(right)
+        if left_indices != right_indices or len(left_indices | right_indices) > 1:
+            return True
+        combined = self.cue_indices_for_span(TimeSpan(min(left.start, right.start), max(left.end, right.end)))
+        return combined != left_indices
+
+    def text_fallback(self, span: TimeSpan) -> dict | None:
+        """Return one aligned dialogue cue suitable for an already verified speaker span."""
+        if span.duration <= 0:
+            return None
+        matches = []
+        for cue in self.cues:
+            aligned = self.cue_span(cue)
+            if aligned is None or aligned.duration <= 0:
+                continue
+            overlap = _intersection(span, aligned)
+            coverage = overlap / max(span.duration, aligned.duration)
+            if coverage < 0.70 or abs(span.duration - aligned.duration) > 0.4 + 1e-6:
+                continue
+            text = clean_dialogue_text(cue.text)
+            if text:
+                matches.append({
+                    "text": text, "cue_index": cue.index, "coverage": coverage,
+                    "aligned_start": aligned.start, "aligned_end": aligned.end,
+                })
+        if len(matches) != 1:
+            return None
+        match = matches[0]
+        for cue in self.cues:
+            if cue.kind != "speech" or cue.index == match["cue_index"]:
+                continue
+            aligned = self.cue_span(cue)
+            if aligned is None:
+                aligned = TimeSpan(cue.start + self.offset, cue.end + self.offset)
+            if _intersection(span, aligned) > 0.01:
+                return None
+        return match
+
     def retry_windows(self, speech: Sequence[TimeSpan], duration: float) -> list[TimeSpan]:
         windows = []
         for cue in self.cues:
@@ -315,4 +408,7 @@ class SubtitleGuide:
             if aligned is not None and _intersection(span, aligned) > 0.10:
                 matches.append({**asdict(cue), "aligned_start": aligned.start, "aligned_end": aligned.end})
         candidate.diagnostics["subtitle_reference"] = matches
-        candidate.diagnostics["subtitle_text_used_for_stt"] = False
+        used = bool(candidate.diagnostics.get("subtitle_text_fallback"))
+        candidate.diagnostics["subtitle_text_used_for_stt"] = used
+        if used:
+            self.report["text_used_for_stt"] = True

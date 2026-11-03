@@ -161,8 +161,7 @@ def run_job(
     rows = []
     for target_path, result in zip(target_paths, batch.results):
         for sentence in result.accepted:
-            # Gradio Dataframe outputs are positional rows. Returning dicts
-            # raises a Pydantic tuple validation error in Gradio 4.44.x.
+            # Gradio Dataframe expects positional rows, not mappings.
             rows.append(
                 [
                     target_path.name,

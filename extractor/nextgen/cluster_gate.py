@@ -1,37 +1,32 @@
 """Map exact candidate intervals to canonical turns without allowing later rescue bypasses."""
 from __future__ import annotations
 from dataclasses import replace
+import math
+
+from .identity_cluster import cohort_z_probability
+from .identity_trajectory import IdentityTrajectory
+from .candidate_topology import CandidateTopology
+from ..candidate_lattice import CandidateLattice
+from ..recall import certificate_matches, subtract_intervals, MIN_TARGET_SECONDS
 
 
 HARD_VETOES = ("structural_hard_reject", "excluded_role_rejected",
                "final_same_speaker_internal_discard", "final_identity_boundary_discard",
                "multi_model_anchor_decisive_boundary", "boundary_suppressed_recovery")
 
-# 高危救援路径标记：这些片段绕过了正常声纹下限，进入主输出（Tier A）前必须
-# 通过更严的多通道复核；第 1~3 集已知错人段几乎全部带有这些标记且低分。
 RESCUE_KEYS = ("locator_recovery", "target_locator_recovery", "tertiary_locator_recovery",
                "classifier_target_rescue", "wavlm_local_rescue", "wavlm_rescue",
                "subtitle_sentence_restored", "experimental_island_rescued_child")
 
-# 带救援标记的候选进入 Tier A 的窗口最低分硬下限。
 RESCUE_WINDOW_FLOOR = 0.62
 RESCUE_SECONDARY_SLACK = 0.04
-# 无救援标记但内部存在低分窗口的候选同样不得进 Tier A（实证阈值）。
 WEAK_WINDOW_FLOOR = 0.56
-# 救援标记候选被簇层晋升（Tier B → Tier A）时的更高窗口下限。
 PROMOTION_RESCUE_WINDOW_FLOOR = 0.75
-# 晋升候选要求其重叠轮次的滑窗通过率不低于该值（低通过率说明父轮次是
-# 混合长句，裁切子段机制才是正确的救赎路径，而不是整句晋升）。
 PROMOTION_TURN_PASS_RATIO = 0.5
 
-# 上游因"疑似混合说话人"保守撤下的候选：不整句晋升，但允许与已验证干净
-# 区间求交集裁出干净子段（≥ min_output_seconds）。
 MIXED_CROP_REASONS = ("最终局部身份冲突", "疑似混合说话人")
-# 局部声学分类器否决但与簇级成员证据冲突的候选：两个证据源打架，交给
-# Tier B 人工仲裁（绝不进主输出）。
 CLASSIFIER_CONFLICT_REASON = "局部声学分类器"
 
-# 候选句级窗口核验的参数。
 CANDIDATE_WINDOW_OVERLAP = 0.45
 CANDIDATE_WINDOW_PASS_RATIO = 0.80
 CANDIDATE_SPAN_TOLERANCE = 0.06
@@ -43,27 +38,102 @@ def _secondary_hint(candidate):
                 "secondary_speaker_score", "secondary_cluster_score",
                 "camplus_score"):
         value = candidate.diagnostics.get(key)
-        if isinstance(value, (int, float)):
+        if isinstance(value, (int, float)) and math.isfinite(value):
             return float(value)
     return None
 
 
+def _interval_rows(local, start, end):
+    """Collect windows that overlap the candidate's identity-bearing interval."""
+    rows = [row for group in (local or {}).values() if isinstance(group, list)
+            for row in group if isinstance(row, dict) and row.get("span")
+            and min(row["span"][1], end) - max(row["span"][0], start)
+            >= min(CANDIDATE_WINDOW_OVERLAP, end - start)]
+    return sorted(rows, key=lambda row: (row["span"][0], row["span"][1]))
+
+
+def _calibrate_candidate(candidate, turns, result, local):
+    """Calibrate available evidence before ranking; absent channels carry no weight."""
+    def finite(value):
+        return isinstance(value, (int, float)) and math.isfinite(value)
+    def lookup(mapping, index):
+        return mapping.get(str(index), mapping.get(index))
+    def average(values):
+        values = [(v, w) for v, w in values if finite(v) and w > 0]
+        return sum(v*w for v,w in values) / sum(w for _,w in values) if values else None
+    overlaps = [(t, min(t.end, candidate.end) - max(t.start, candidate.start)) for t in turns]
+    overlaps = [(t, w) for t, w in overlaps if w > 0]
+    rows = [(r, min(r["span"][1], candidate.end) - max(r["span"][0], candidate.start))
+            for r in _interval_rows(local, candidate.start, candidate.end)]
+    reference = result.diagnostics.get("turn_reference_scores") or {}
+    def reference_score(channel):
+        local_score = average([(r.get(channel), w) for r, w in rows])
+        if local_score is not None:
+            return local_score
+        return average([((lookup(reference, t.index) or {}).get(channel), w) for t,w in overlaps])
+    primary = getattr(candidate, "speaker_score", None)
+    if not finite(primary) or primary <= 0 or candidate.diagnostics.get("cluster_cropped"):
+        primary = reference_score("primary")
+    secondary = _secondary_hint(candidate)
+    if secondary is None or candidate.diagnostics.get("cluster_cropped"):
+        secondary = reference_score("secondary")
+    tertiary = candidate.diagnostics.get("wavlm_score")
+    tertiary_source = "candidate"
+    if not finite(tertiary) or tertiary <= 0:
+        tertiary = average([(r.get("tertiary"), w) for r, w in rows])
+        tertiary_source = "local_windows"
+        if tertiary is None:
+            mapping = result.diagnostics.get("tertiary_scores") or {}
+            tertiary = average([(lookup(mapping, t.index), w) for t,w in overlaps])
+            tertiary_source = "overlapping_turns" if tertiary is not None else "unavailable"
+    anime_char = reference_score("anime_char_score")
+    anime_va = reference_score("anime_va_score")
+    floors = result.diagnostics.get("profile_floors") or {}
+    def sigmoid(value, floor, scale):
+        return 1 / (1 + math.exp(-max(-30., min(30., (value-floor)/scale))))
+    components = []
+    for value, floor, scale, weight in (
+        (primary, floors.get("primary", .58), .06, .30),
+        (secondary, floors.get("secondary", .51), .06, .25),
+        (tertiary, result.diagnostics.get("tertiary_floor", .75), .04, .20),
+        (anime_char, floors.get("anime_char", .45), .07, .20),
+        (anime_va, floors.get("anime_va", .45), .07, .20)):
+        if finite(value):
+            components.append((sigmoid(value, floor, scale), weight))
+    cohort = result.diagnostics.get("turn_cohort_z") or {}
+    for name, weight in (("cohort_z_primary", .15), ("cohort_z_secondary", .10)):
+        z = average([((lookup(cohort, t.index) or {}).get(name), w) for t,w in overlaps])
+        if z is not None:
+            components.append((cohort_z_probability(z), weight))
+    fusion = sum(v*w for v,w in components) / sum(w for _,w in components) if components else 0.
+    calibrated_llrs = [(r.get('manifold_log_odds'), w) for r,w in rows
+        if sum(item.get('method') == 'as_norm_gaussian_llr' for item in
+               (r.get('identity_evidence', {}).get('calibration') or {}).values()) >= 2]
+    episode_llr = average(calibrated_llrs)
+    if episode_llr is not None:
+        fusion = sigmoid(episode_llr, 0., 1.)
+    candidate.diagnostics["calibrated_fusion_score"] = round(fusion, 6)
+    candidate.diagnostics["fusion_evidence"] = {"primary": primary, "secondary": secondary,
+        "tertiary": tertiary, "tertiary_source": tertiary_source,
+        "anime_char_score": anime_char, "anime_va_score": anime_va,
+        "method": "episode_as_norm_llr" if episode_llr is not None else "reference_sigmoid_and_topk_cohort_z",
+        "episode_llr": episode_llr}
+    for name in ("cm_p", "cm_s"):
+        margins = [r[name] for r,_ in rows if finite(r.get(name))]
+        if margins:
+            candidate.diagnostics["cohort_" + name] = min(margins)
+    candidate.diagnostics["tier_b_rank_score"] = round(_tier_b_rank(candidate), 6)
+
+
 def _cluster_windows_strong(local, primary_floor, secondary_floor,
-                            a: float, b: float) -> bool:
-    """1.8s 簇滑窗权威豁免（Stage 13）：候选区间在 ClusterAnalyzer 自身的
-    1.8s 滑窗下全窗通过、双通道强匹配、且对非目标簇无竞争劣势时，豁免上游
-    0.6s 超短窗的瞬时抖动（男声/轻声独白在 0.6s 窗内极易被一个爆破音打落）。
-    """
+                            a: float, b: float, *, allow_anime=True) -> bool:
+    """Require complete local coverage with strong identity and cohort margins."""
     if not local:
         return False
-    rows = [
-        row
-        for group in local.values() if isinstance(group, list)
-        for row in group
-        if isinstance(row, dict) and row.get("span")
-        and min(row["span"][1], b) - max(row["span"][0], a) >= CANDIDATE_WINDOW_OVERLAP
-    ]
+    rows = _interval_rows(local, a, b)
     if not rows or not all(bool(row.get("accepted")) for row in rows):
+        return False
+    if not allow_anime and _covered_ratio(a, b, [row["span"] for row in rows]) < .85:
         return False
     p_floor = (primary_floor or 0.56) + 0.02
     s_floor = (secondary_floor or 0.50) + 0.02
@@ -71,62 +141,116 @@ def _cluster_windows_strong(local, primary_floor, secondary_floor,
     min_s = min(float(row.get("secondary", 0.0)) for row in rows)
     mean_p = sum(float(row.get("primary", 0.0)) for row in rows) / len(rows)
     mean_s = sum(float(row.get("secondary", 0.0)) for row in rows) / len(rows)
-    # 任一窗口的竞争余量为负 → 不豁免（防救援错人）。
     if any(isinstance(row.get("cm_s"), (int, float)) and row["cm_s"] < 0.01
            for row in rows):
         return False
     if any(isinstance(row.get("cm_p"), (int, float)) and row["cm_p"] < 0.08
            for row in rows):
         return False
+    if allow_anime and all(row.get("anime_register_shift") and not row.get("hard_veto") for row in rows):
+        return (min_p >= (primary_floor or .56) + .04
+                and min_s >= max(.20, (secondary_floor or .50) - .25))
     return (min_p >= p_floor and min_s >= s_floor
             and mean_p >= p_floor + 0.03 and mean_s >= s_floor + 0.03)
 
 
 def _local_classifier_multi_veto(candidate, start: float | None = None,
-                                 end: float | None = None) -> bool:
-    """局部分类器双强负窗否决：候选区间内出现 >= 2 个跌破 reject_threshold
-    （约 -4.24）的 0.5s 强负分窗口 → 证据表明区间内混有他人语音。
-
-    降入 Tier B（不整句否决）。实测 Ep1–3 全量扫描：该规则对真目标 0 误伤
-    （单窗换气负分不触发），唯独精准命中 Ep3 [550.64,555.74] 的 4 个强负窗
-    （最低 -12.40）。不要求两个负窗连续紧挨。
-    """
+                                 end: float | None = None, *, strong_windows=False) -> bool:
+    """Reject sustained negative classifier evidence inside the requested interval."""
     audit = candidate.diagnostics.get("local_classifier_audit")
     if not isinstance(audit, dict):
         return False
+    a = candidate.start if start is None else start
+    b = candidate.end if end is None else end
+    parent_a, parent_b = candidate.diagnostics.get("cluster_parent_span", (candidate.start, candidate.end))
+    allow_near = (parent_b - parent_a <= 3.0 or not strong_windows
+                  or b - a >= .75 * (parent_b - parent_a))
+    return _classifier_audit_veto(audit, a, b, allow_near=allow_near)
+
+
+def _classifier_audit_veto(audit, a, b, *, allow_near=True):
     windows = audit.get("windows") or []
     threshold = audit.get("reject_threshold")
     if not isinstance(threshold, (int, float)):
         threshold = -4.24
-    a = candidate.start if start is None else start
-    b = candidate.end if end is None else end
-    neg_count = sum(
-        1 for w in windows
+    relevant = [w for w in windows
         if isinstance(w, dict) and w.get("voiced")
         and isinstance(w.get("score"), (int, float))
-        and min(float(w.get("end", 0)), b) - max(float(w.get("start", 0)), a) >= 0.25
-        and float(w["score"]) <= threshold)
-    return neg_count >= 2
+        and min(float(w.get("end", 0)), b) - max(float(w.get("start", 0)), a) >= 0.25]
+    neg_count = sum(float(w["score"]) <= threshold for w in relevant)
+    near_count = sum(float(w["score"]) <= threshold + 1. for w in relevant)
+    return neg_count >= 2 or (allow_near and bool(audit.get("rejected")) and near_count >= 3
+                             and near_count >= .75 * len(relevant))
 
 
 def _window_min(candidate):
     """候选的窗口最低分；<=0 视为无窗口证据（不参与弱窗判定）。"""
     value = float(getattr(candidate, "window_min_score", 0.0) or 0.0)
-    return value if value > 0.0 else None
+    return value if math.isfinite(value) and value > 0.0 else None
+
+
+def _meets_export_length(start, end, minimum, result):
+    if end - start >= minimum - 1e-9:
+        return True
+    if certificate_matches(start, end, result.diagnostics.get("certified_short_spans", ())):
+        return True
+    if minimum > 1.2 or end - start < 1.10 - 1e-9:
+        return False
+    return certificate_matches(start, end, [span
+        for spans in result.diagnostics.get("clean_core_certificates", {}).values() for span in spans])
+
+
+def _synthesis_regions(spans, occupied, minimum, result, trajectory):
+    """Subtract existing exports, then assess each remaining interval on its own."""
+    for start, end in spans:
+        pieces = [(start, end)]
+        for a, b in sorted(occupied, key=lambda span: (float(span[0]), float(span[1]))):
+            pieces = [(x, y) for left, right in pieces
+                      for x, y in ((left, min(right, a)), (max(left, b), right))
+                      if y > x]
+        for a, b in pieces:
+            if _meets_export_length(a, b, minimum, result) and trajectory.assess(a, b)["accepted"]:
+                yield a, b
+
+
+def _join_short_remainders(candidates, spans, minimum, trajectory):
+    """Keep a certified sentence's short residual audio attached to its export."""
+    for candidate in candidates:
+        for start, end in spans:
+            if not (start <= candidate.start < candidate.end <= end):
+                continue
+            left = candidate.start - start
+            right = end - candidate.end
+            a = start if 0. < left < minimum else candidate.start
+            b = end if 0. < right < minimum else candidate.end
+            if (a, b) == (candidate.start, candidate.end):
+                continue
+            if any(other is not candidate and min(b, other.end) > max(a, other.start)
+                   for other in candidates):
+                continue
+            evidence = trajectory.assess(a, b)
+            if evidence["accepted"]:
+                candidate.start, candidate.end = a, b
+                candidate.diagnostics["identity_trajectory"] = evidence
+                candidate.diagnostics["cluster_short_remainder_joined"] = True
+                candidate.diagnostics["acoustic_identity_audit"] = {
+                    "span": [a, b], "passed": True, "method": "interval_evidence"}
 
 
 def _rescue_tier(candidate, secondary_floor, *, local=None, primary_floor=None,
-                 start=None, end=None):
-    """高危救援候选严审：低副通道分或低窗口分 → 只能进 Tier B。
-
-    1.8s 簇滑窗全过且双通道强匹配时（_cluster_windows_strong）豁免 0.6s
-    短窗抖动，直接放行 Tier A（Stage 13 权威豁免）。
-    """
-    if _local_classifier_multi_veto(candidate):
+                 start=None, end=None, trajectory=None):
+    """Use interval evidence when available, otherwise retain the upstream review policy."""
+    if trajectory is not None:
+        evidence = trajectory.assess(candidate.start if start is None else start,
+                                     candidate.end if end is None else end)
+        if evidence["observed_fraction"] > 0:
+            return "A" if evidence["accepted"] else "B"
+    strong_windows = _cluster_windows_strong(local, primary_floor, secondary_floor,
+        candidate.start if start is None else start, candidate.end if end is None else end)
+    if (_local_classifier_multi_veto(candidate, start, end, strong_windows=strong_windows)
+            or candidate.diagnostics.get("cluster_source_identity_conflict")):
         return "B"
-    if _cluster_windows_strong(local, primary_floor, secondary_floor,
-                               candidate.start if start is None else start,
-                               candidate.end if end is None else end):
+    if strong_windows:
         return "A"
     window_min = _window_min(candidate)
     if not any(candidate.diagnostics.get(key) for key in RESCUE_KEYS):
@@ -140,52 +264,40 @@ def _rescue_tier(candidate, secondary_floor, *, local=None, primary_floor=None,
     return "B" if (weak_secondary or weak_window) else "A"
 
 
-def candidate_membership(candidate, turns, result, *, local=None, min_seconds=1.2):
-    """候选句级核验：候选只为自己区间的声纹证据负责，不再被父轮次连坐。
-
-    返回 ``(allowed, cluster_ids, reason, tier)``；tier 为 "A"（主输出）、
-    "B"（边缘待捡漏）或 None（彻底拒绝）。
-    """
+def candidate_membership(candidate, turns, result, *, local=None, min_seconds=1.2, trajectory=None):
+    """Return local acceptance, cluster IDs, reason and output tier."""
     overlaps = [t for t in turns if min(t.end, candidate.end) > max(t.start, candidate.start)]
     ids = sorted({result.cluster_of[t.index] for t in overlaps})
-    if result.target_cluster_id is None or not overlaps:
+    if not overlaps or (result.target_cluster_id is None
+                        and not result.diagnostics.get("reference_mining")):
         return False, ids, "no_target_or_coverage", None
     floors = result.diagnostics.get("profile_floors") or {}
     secondary_floor = floors.get("secondary")
 
-    accepted_spans = result.diagnostics.get("accepted_spans")
+    accepted_spans = result.diagnostics.get("trajectory_spans", result.diagnostics.get("accepted_spans"))
     if accepted_spans is not None:
         allowed = any(a <= candidate.start + CANDIDATE_SPAN_TOLERANCE
                       and b >= candidate.end - CANDIDATE_SPAN_TOLERANCE
                       for a, b in accepted_spans)
         reason = "target_cluster" if allowed else ""
         if not allowed:
-            # 交集占候选时长 ≥85%（且 ≥ min_seconds）也算覆盖：边界微偏或
-            # 头尾被裁掉少量杂音的候选句不应整句连坐。
             duration = max(candidate.duration, 1e-6)
             coverage = max(
                 (min(candidate.end, b) - max(candidate.start, a)
                  for a, b in accepted_spans),
                 default=0.0,
             )
-            if coverage >= min_seconds and coverage >= CANDIDATE_COVERAGE_RATIO * duration:
+            if trajectory is None and coverage >= min_seconds and coverage >= CANDIDATE_COVERAGE_RATIO * duration:
                 allowed, reason = True, "target_cluster_partial_coverage"
-        if not allowed and local:
-            # 候选句专属窗口：只看与候选区间重叠 ≥0.45s 的滑窗。
-            rows = [
-                row
-                for group in local.values()
-                if _group_overlaps_candidate(group, candidate)
-                for row in group
-                if isinstance(row, dict) and row.get("span") and (
-                    min(row["span"][1], candidate.end)
-                    - max(row["span"][0], candidate.start) >= CANDIDATE_WINDOW_OVERLAP)
-            ]
+        if not allowed and local and trajectory is None:
+            rows = _interval_rows(local, candidate.start, candidate.end)
             if rows:
                 accepted = [bool(row.get("accepted")) for row in rows]
                 ratio = sum(accepted) / len(accepted)
-                if all(accepted) or (ratio >= CANDIDATE_WINDOW_PASS_RATIO
-                                     and accepted[0] and accepted[-1]):
+                covered = _covered_ratio(candidate.start, candidate.end,
+                    [r["span"] for r in rows if r.get("accepted")])
+                if covered >= CANDIDATE_COVERAGE_RATIO and (all(accepted) or (
+                        ratio >= CANDIDATE_WINDOW_PASS_RATIO and accepted[0] and accepted[-1])):
                     allowed, reason = True, "target_cluster_windows"
         if not allowed:
             border = len(result.borderline_membership) > 0 and any(
@@ -206,19 +318,10 @@ def candidate_membership(candidate, turns, result, *, local=None, min_seconds=1.
             return False, ids, "uncovered_interval", None
 
     tier = _rescue_tier(candidate, secondary_floor, local=local,
-                        primary_floor=floors.get("primary"))
+                        primary_floor=floors.get("primary"), trajectory=trajectory)
     if tier == "B":
         return False, ids, "rescue_strict_review", "B"
     return True, ids, "target_cluster", "A"
-
-
-def _group_overlaps_candidate(group, candidate):
-    """local 里每个键的窗口组只要有一条与候选重叠就参与核验。"""
-    return isinstance(group, list) and any(
-        isinstance(row, dict) and row.get("span")
-        and min(row["span"][1], candidate.end) > max(row["span"][0], candidate.start)
-        for row in group
-    )
 
 
 def _turn_pass_ratio(candidate, turns, local):
@@ -230,10 +333,29 @@ def _turn_pass_ratio(candidate, turns, local):
         rows = local.get(str(turn.index)) if local else None
         if not rows:
             continue
-        accepted = [bool(row.get("accepted")) for row in rows if isinstance(row, dict)]
+        accepted = [bool(row.get("accepted")) for row in rows if isinstance(row, dict)
+                    and row.get('micro_state') != 'uncertain']
         if accepted:
             ratios.append(sum(accepted) / len(accepted))
     return min(ratios) if ratios else None
+
+
+def _positive_fine_review(candidate, evidence):
+    """Keep a well-observed classifier/coarse disagreement available for review.
+
+    Fine classifier support alone never establishes target identity. It must
+    not disappear merely because the coarse cluster has no target membership.
+    Sparse positive frames, contamination and forbidden spans remain excluded.
+    """
+    return bool(
+        candidate.duration >= MIN_TARGET_SECONDS - 1e-9
+        and not evidence.get('accepted')
+        and evidence.get('blocked_fraction', 0.) == 0.
+        and not evidence.get('fine_conflict')
+        and not evidence.get('occlusion', {}).get('localized_contamination')
+        and evidence.get('fine_covered_fraction', 0.) >= .75
+        and evidence.get('positive_fraction', 0.) >= .75
+        and evidence.get('fine_mean', 0.) > 2. * evidence.get('fine_error', 0.))
 
 
 def apply_cluster_gate(accepted, rejected, turns, result, *, mode, min_seconds=1.2,
@@ -242,46 +364,64 @@ def apply_cluster_gate(accepted, rejected, turns, result, *, mode, min_seconds=1
         return {"removed": 0, "promoted": 0, "cropped": 0, "borderline": 0}
     removed, promoted, cropped, borderline = [], [], [], []
     originally_accepted = list(accepted)
+    source_pool = [*originally_accepted, *rejected]
+    hard_source_spans = [(c.start, c.end) for c in source_pool
+                         if any(c.diagnostics.get(k) for k in HARD_VETOES)]
     floors = result.diagnostics.get("profile_floors") or {}
     secondary_floor = floors.get("secondary")
     primary_floor = floors.get("primary")
+    trajectory = IdentityTrajectory(local, floors, source_pool, blocked_spans)
     accepted_spans = result.diagnostics.get("accepted_spans") or []
-    # Stage 13：相邻干净子区间合并（间隔 <=0.35s 且间隙不碰阻塞区间）。
-    # 上游把长轮次切成碎片时，连续同簇窗口各自 <1.2s 无法借尸还魂；
-    # 合并后即可成为完整 Tier A 产出。
-    merged_accepted_spans: list[list[float]] = []
-    merged_constituents: list[list[tuple[float, float]]] = []
+    mergeable_spans = [*accepted_spans, *result.diagnostics.get("certified_short_spans", [])]
     target_ids = set(result.target_cluster_ids) or (
         {result.target_cluster_id} if result.target_cluster_id is not None else set())
-    non_target_turns = [
-        t for t in turns
-        if result.cluster_of[t.index] not in target_ids and result.cluster_of[t.index] != -1
-    ]
-    for span_a, span_b in sorted(accepted_spans):
-        if (merged_accepted_spans and span_a - merged_accepted_spans[-1][1] <= 0.55
-                and not any(min(span_a, mark[1]) - max(merged_accepted_spans[-1][1], mark[0]) > 0.02
-                            for mark in blocked_spans)
-                and not any(min(span_a, nt.end) - max(merged_accepted_spans[-1][1], nt.start) > 0.02
-                            for nt in non_target_turns)):
-            merged_accepted_spans[-1][1] = max(merged_accepted_spans[-1][1], span_b)
-            merged_constituents[-1].append((span_a, span_b))
-            continue
-        merged_accepted_spans.append([span_a, span_b])
-        merged_constituents.append([(span_a, span_b)])
+    non_target_turns = [(t.start, t.end) for t in turns
+                        if result.cluster_of[t.index] not in target_ids
+                        and result.cluster_of[t.index] != -1 and not result.membership[t.index]]
+    # A mixed parent is not a veto on independently supported children.
+    supported = [tuple(row['span']) for rows in (local or {}).values() for row in rows
+                 if row.get('accepted') and not row.get('hard_veto')
+                 and not row.get('identity_evidence', {}).get('exclusion_evidence', {}).get('conflict')]
+    positive_union = []
+    for a, b in sorted(set(supported)):
+        if positive_union and a <= positive_union[-1][1]:
+            positive_union[-1][1] = max(positive_union[-1][1], b)
+        else:
+            positive_union.append([a, b])
+    supported = [part for a, b in positive_union
+                 for part in trajectory.decode(a, b, MIN_TARGET_SECONDS)]
+    non_target_turns = subtract_intervals(non_target_turns, supported)
+    mergeable_spans.extend(supported)
+    certified = result.diagnostics.setdefault('certified_short_spans', [])
+    certified = result.diagnostics['certified_short_spans'] = list(certified)
+    certified.extend([a, b] for a, b in supported if b - a < min_seconds)
+    topology = CandidateTopology(source_pool, local, min_seconds)
+    merged, _ = topology.merge(mergeable_spans, [*blocked_spans, *non_target_turns])
+    short_spans = list(result.diagnostics.get('certified_short_spans', ()))
+    short_spans += [(a,b) for a,b in merged if b-a < min_seconds
+                   and _meets_export_length(a,b,min_seconds,result)]
+    lattice = CandidateLattice(trajectory, merged)
+    merged_accepted_spans = lattice.decode(min_seconds, short_spans) if local else merged
+    result.diagnostics["trajectory_spans"] = [list(span) for span in merged_accepted_spans]
+    result.diagnostics["trajectory_decoding"] = {
+        "input_spans": len(mergeable_spans), "output_spans": len(merged_accepted_spans),
+        "method": "candidate_lattice_identity_dp"}
 
     def make_crop(parent, start, end, reason, *, strict_parent=False):
-        """从已验证干净区间裁出子句；子段继承父段的救援/弱窗审查。
-
-        """
+        """Create a child using the identity evidence inside its own boundaries."""
         child = replace(parent, start=start, end=end, accepted=True,
                         reject_reason="", diagnostics=dict(parent.diagnostics))
-        if _local_classifier_multi_veto(child, start, end):
-            # 裁切子段区间内仍有 >=2 个局部分类器强负窗：主干里混着他人
-            # 语音，降入 Tier B 待试听（0 误伤实测见函数注释）。
+        child.diagnostics["cluster_parent_span"] = [parent.start, parent.end]
+        evidence = trajectory.assess(start, end)
+        strong_windows = evidence["accepted"]
+        child.diagnostics["identity_trajectory"] = evidence
+        child.diagnostics["cluster_source_identity_conflict"] = bool(
+            evidence["observed_fraction"] > 0 and not strong_windows)
+        if child.diagnostics["cluster_source_identity_conflict"]:
             child.accepted = False
-            child.reject_reason = "簇级身份未通过：local_classifier_multi_veto"
+            child.reject_reason = "簇级身份未通过：interval_identity_conflict"
             child.diagnostics["cluster_tier"] = "B"
-            child.diagnostics["cluster_reason"] = "local_classifier_multi_veto"
+            child.diagnostics["cluster_reason"] = "interval_identity_conflict"
             borderline.append(child)
             return None
         child.diagnostics.update(cluster_cropped=True, cluster_identity=True,
@@ -293,18 +433,12 @@ def apply_cluster_gate(accepted, rejected, turns, result, *, mode, min_seconds=1
             "span": [start, end], "passed": True, "method": "cluster_temporal_consensus"}
         window_min = _window_min(parent)
         rescue_marked = any(parent.diagnostics.get(k) for k in RESCUE_KEYS)
-        strong_windows = _cluster_windows_strong(
-            local, floors.get("primary"), secondary_floor, start, end)
-        rescue_b = _rescue_tier(parent, secondary_floor, local=local,
+        rescue_b = _rescue_tier(child, secondary_floor, local=local,
                                 primary_floor=floors.get("primary"),
-                                start=start, end=end) == "B"
+                                start=start, end=end, trajectory=trajectory) == "B"
         strict_b = strict_parent and (window_min is None
                 or (rescue_marked and window_min < PROMOTION_RESCUE_WINDOW_FLOOR))
         if not strong_windows and (rescue_b or strict_b):
-            # 父段证据不足（救援标记 + 弱副通道/弱窗，或整体弱窗；混合嫌疑
-            # 父段还要求窗口证据齐全、救援标记者窗口分更高）：子段只进
-            # Tier B 待人工/多模型仲裁，不进主输出。1.8s 簇滑窗全过且双通道
-            # 强匹配时豁免（Stage 13 权威豁免）。
             child.accepted = False
             child.reject_reason = "簇级身份未通过：rescue_strict_review"
             child.diagnostics["cluster_tier"] = "B"
@@ -315,11 +449,29 @@ def apply_cluster_gate(accepted, rejected, turns, result, *, mode, min_seconds=1
         return child
 
     for candidate in [*originally_accepted, *rejected]:
+        evidence = trajectory.assess(candidate.start, candidate.end)
+        candidate.diagnostics["identity_trajectory"] = evidence
+        candidate.diagnostics["cluster_source_identity_conflict"] = bool(
+            evidence["observed_fraction"] > 0 and not evidence["accepted"])
         allowed, ids, reason, tier = candidate_membership(
-            candidate, turns, result, local=local, min_seconds=min_seconds)
+            candidate, turns, result, local=local, min_seconds=min_seconds, trajectory=trajectory)
         hard = (any(candidate.diagnostics.get(k) for k in HARD_VETOES) or
                 any(min(candidate.end, b) > max(candidate.start, a) for a, b in blocked_spans))
         allowed = allowed and not hard
+        if (mode == 'enforce' and not hard and not allowed
+                and not any(min(candidate.end, b) > max(candidate.start, a)
+                            for a, b in hard_source_spans)
+                and _positive_fine_review(candidate, evidence)):
+            tier, reason = 'B', 'fine_identity_disagreement'
+            candidate.diagnostics['review_only'] = True
+            candidate.diagnostics['cluster_identity'] = False
+            candidate.diagnostics.pop('acoustic_identity_audit', None)
+            candidate.diagnostics['review_evidence_source'] = {
+                'method': 'candidate_classifier_and_trajectory',
+                'classifier_model_sha256': (candidate.diagnostics.get(
+                    'local_classifier_audit') or {}).get('model_sha256'),
+                'confirmed_target': False,
+            }
         candidate.diagnostics.update(cluster_ids=ids, cluster_would_accept=allowed,
                                      cluster_mode=mode, cluster_reason=reason,
                                      cluster_target_id=result.target_cluster_id)
@@ -327,11 +479,8 @@ def apply_cluster_gate(accepted, rejected, turns, result, *, mode, min_seconds=1
             continue
         if any(candidate is item for item in originally_accepted):
             if allowed and tier == "A":
-                # 门控前已接受、簇层也放行的整句候选：若其所在轮次的滑窗通过率
-                # 很低（混合长句），整句证据不足，降入 Tier B（干净子段另由
-                # 裁切机制保留）。
                 ratio = _turn_pass_ratio(candidate, turns, local)
-                if ratio is not None and ratio < PROMOTION_TURN_PASS_RATIO:
+                if evidence["observed_fraction"] == 0 and ratio is not None and ratio < PROMOTION_TURN_PASS_RATIO:
                     candidate.accepted = False
                     candidate.reject_reason = "簇级身份未通过：low_window_pass_ratio"
                     candidate.diagnostics["cluster_removed"] = True
@@ -341,10 +490,6 @@ def apply_cluster_gate(accepted, rejected, turns, result, *, mode, min_seconds=1
                 else:
                     candidate.diagnostics["cluster_tier"] = "A"
             else:
-                # 门控前已被上游流水线接受的候选被簇层拦下：默认进 Tier B
-                # 捡漏池（上游已验证、簇层无法确认 → 交给人工试听）；仅当簇层
-                # 有明确反向证据（重叠轮次全部属于非目标簇）或硬否决时才彻底
-                # 撤下。
                 keep_tier = ("B" if (tier == "B"
                                      or _is_borderline(candidate, turns, result)
                                      or _has_family_overlap(candidate, turns, result))
@@ -359,22 +504,18 @@ def apply_cluster_gate(accepted, rejected, turns, result, *, mode, min_seconds=1
                 if not hard:
                     for a, b in merged_accepted_spans:
                         start, end = max(candidate.start, a), min(candidate.end, b)
-                        if end - start >= min_seconds:
+                        if _meets_export_length(start, end, min_seconds, result):
                             make_crop(candidate, start, end, reason)
         elif tier == "B" and not hard:
-            # 边缘召回池（Tier B）：保留在 rejected 里，由导出层写入 _borderline/
-            # 供前端 1 分钟捡漏；绝不混入主输出。
             candidate.diagnostics["cluster_tier"] = "B"
             borderline.append(candidate)
         elif (not hard and candidate.reject_reason in (
                 "声纹匹配不足", *MIXED_CROP_REASONS, "说话回合过短")):
-            # Tier B → Tier A 晋升：要求救援标记候选窗口分更高，且父轮次
-            # 滑窗通过率达标（低通过率的混合长句走裁切路径而非整句晋升）。
             ratio = _turn_pass_ratio(candidate, turns, local)
             rescue_marked = any(candidate.diagnostics.get(k) for k in RESCUE_KEYS)
             window_min = _window_min(candidate)
             promotable = (
-                allowed and candidate.duration >= min_seconds
+                allowed and _meets_export_length(candidate.start, candidate.end, min_seconds, result)
                 and candidate.reject_reason == "声纹匹配不足"
                 and (not rescue_marked or window_min is None
                      or window_min >= PROMOTION_RESCUE_WINDOW_FLOOR)
@@ -390,37 +531,30 @@ def apply_cluster_gate(accepted, rejected, turns, result, *, mode, min_seconds=1
                 promoted.append(candidate)
                 whole_promoted = True
             if not whole_promoted:
-                # 未能整句晋升（常见于首/尾 1 个换气窗口未过的 4~12 秒高分
-                # 长句）：与已验证干净区间求交集裁出干净主干升 Tier A。
-                # 双重门槛：父轮次滑窗通过率 >= PROMOTION_TURN_PASS_RATIO
-                # （低通过率混合长句的"干净区间"边界不可信，实测 Ep2
-                # [228.44,230.54] 借此混入），加上 make_crop 的救援/弱窗/
-                # 双强负窗审查——混音主干会被降入 Tier B 而不是混进主输出。
-                croppable = ratio is None or ratio >= PROMOTION_TURN_PASS_RATIO
+                croppable = bool(merged_accepted_spans)
                 cropped_any = False
                 if croppable:
                     for a, b in merged_accepted_spans:
                         start, end = max(candidate.start, a), min(candidate.end, b)
-                        if end - start >= min_seconds:
+                        if _meets_export_length(start, end, min_seconds, result):
                             child = make_crop(candidate, start, end, "promoted_subspan",
                                               strict_parent=False)
                             if child is not None:
                                 cropped_any = True
-                if not cropped_any and (promotable
-                                        or _has_family_overlap(candidate, turns, result)):
+                # A promoted subspan must not hide the parent's unreviewed
+                # remainder. Fully covered duplicates are removed by Tier B NMS.
+                if ((not cropped_any and promotable)
+                        or _has_family_overlap(candidate, turns, result)):
                     candidate.diagnostics["cluster_tier"] = "B"
                     borderline.append(candidate)
         elif (not hard
               and any(key in candidate.reject_reason for key in MIXED_CROP_REASONS)):
-            # 混合嫌疑候选：不整句晋升，只裁出与已验证干净区间的交集子段。
-            # 父段已被上游怀疑过，裁切审查从严格（窗口证据必须齐全）。
             for a, b in accepted_spans:
                 start, end = max(candidate.start, a), min(candidate.end, b)
-                if end - start >= min_seconds:
+                if _meets_export_length(start, end, min_seconds, result):
                     make_crop(candidate, start, end, "mixed_trimmed", strict_parent=True)
         elif (not hard and CLASSIFIER_CONFLICT_REASON in candidate.reject_reason
               and _has_strong_family_overlap(candidate, turns, result)):
-            # 局部声学分类器说非目标、簇级证据说是成员：冲突交人工仲裁。
             candidate.diagnostics["cluster_tier"] = "B"
             candidate.diagnostics["cluster_reason"] = "classifier_conflict"
             borderline.append(candidate)
@@ -439,73 +573,18 @@ def apply_cluster_gate(accepted, rejected, turns, result, *, mode, min_seconds=1
                 unique_crops.append(child)
         cropped = unique_crops
         accepted[:] = _deduplicate_tier_a([*kept, *cropped])
+        _join_short_remainders(accepted, merged_accepted_spans, min_seconds, trajectory)
         rejected[:] = [c for c in rejected if id(c) not in promoted_ids] + removed
-        _refine_tier_b(borderline, accepted)
-        # Stage 13 孤儿实体化：合并后的已认证干净区间若未有任何 Tier A 候选
-        # 覆盖（上游碎片化/说话回合过短导致），直接合成 Tier A 候选交给
-        # STT——ClusterAnalyzer 的 1.8s 窗口认证本身就是产出凭据。
         from ..types import CandidateSentence
         tier_a_spans = [(c.start, c.end) for c in accepted]
         synthesized = 0
-        for merged_index, (span_start, span_end) in enumerate(merged_accepted_spans):
-            if span_end - span_start < min_seconds:
-                continue
-            if any(min(span_end, mark_b) - max(span_start, mark_a) > 0.02
-                   for mark_a, mark_b in blocked_spans):
-                continue
-            constituents = merged_constituents[merged_index] if merged_index < len(merged_constituents) else []
-            # 合成凭据检查：accepted 窗口运行段本身已过 floors/margins/cohort，
-            # 此处只复核分数地板与竞争余量（跨边缘的 rejected 邻窗不计入，
-            # 否则 0.9s hop 下任何 1.8s span 都会因相邻窗被误杀）。
-            # Stage 13：合成区间必须继承重叠候选的局部分类器审计——已知
-            # 负例多数带强负窗（0 误伤实测见函数注释）。
-            class _SpanShim:
-                start, end = span_start, span_end
-                diagnostics = {"local_classifier_audit": None}
-            for pool_candidate in [*rejected, *originally_accepted]:
-                if (min(pool_candidate.end, span_end) - max(pool_candidate.start, span_start)
-                        < 0.45 * min(pool_candidate.duration or 1e-6, span_end - span_start)):
-                    continue
-                audit = pool_candidate.diagnostics.get("local_classifier_audit")
-                if isinstance(audit, dict) and audit.get("windows"):
-                    _SpanShim.diagnostics["local_classifier_audit"] = audit
-                    break
-            if _local_classifier_multi_veto(_SpanShim, span_start, span_end):
-                continue
-            constituent_ok = True
-            for s_a, s_b in constituents:
-                rows = [
-                    row for group in (local or {}).values() if isinstance(group, list)
-                    for row in group
-                    if isinstance(row, dict) and row.get("accepted")
-                    and row.get("span")
-                    and min(row["span"][1], s_b) - max(row["span"][0], s_a) >= 0.45
-                ]
-                if not rows:
-                    constituent_ok = False
-                    break
-                if min(float(row["primary"]) for row in rows) < (primary_floor or 0.56):
-                    constituent_ok = False
-                    break
-                if min(float(row["secondary"]) for row in rows) < (secondary_floor or 0.50):
-                    constituent_ok = False
-                    break
-                if any(isinstance(row.get("cm_s"), (int, float)) and row["cm_s"] < 0.01
-                       for row in rows):
-                    constituent_ok = False
-                    break
-                if any(isinstance(row.get("cm_p"), (int, float)) and row["cm_p"] < 0.08
-                       for row in rows):
-                    constituent_ok = False
-                    break
-            if not constituent_ok:
-                continue
-            if _covered_ratio(span_start, span_end, tier_a_spans) >= 0.3:
-                continue
+        for span_start, span_end in _synthesis_regions(
+                merged_accepted_spans, tier_a_spans, min_seconds, result, trajectory):
             accepted.append(CandidateSentence(
                 span_start, span_end, "", accepted=True,
                 diagnostics={
                     "cluster_span_synthesized": True,
+                    "identity_trajectory": trajectory.assess(span_start, span_end),
                     "cluster_tier": "A",
                     "cluster_identity": True,
                     "cluster_would_accept": True,
@@ -518,53 +597,61 @@ def apply_cluster_gate(accepted, rejected, turns, result, *, mode, min_seconds=1
             tier_a_spans.append((span_start, span_end))
             synthesized += 1
         if synthesized:
-            # 合成 span 来自不同轮次的合并区间，互相之间也可能包含——
-            # 再跑一次包含去重保证 Tier A 零重叠。
             accepted[:] = _deduplicate_tier_a(accepted)
             accepted.sort(key=lambda c: (c.start, c.end))
-    refined_b = sum(
-        1 for c in borderline if c.diagnostics.get("cluster_tier") == "B")
-    # Stage 21：四模型自适应校准融合打分器
-    for c in [*accepted, *rejected, *borderline]:
-        if not hasattr(c, 'diagnostics') or not isinstance(c.diagnostics, dict):
-            continue
-        p_sc = float(getattr(c, "speaker_score", 0.0) or 0.0)
-        s_sc = float(c.diagnostics.get("camplus_score") or 0.0)
-        w_sc = float(c.diagnostics.get("wavlm_score") or 0.0)
-        floors = result.diagnostics.get("profile_floors") or {}
-        p_n = (p_sc - floors.get("primary", 0.58)) / max(0.15, 1.0 - floors.get("primary", 0.58))
-        s_n = (s_sc - floors.get("secondary", 0.51)) / max(0.15, 1.0 - floors.get("secondary", 0.51))
-        fusion = 0.4 * max(0.0, min(1.0, p_n)) + 0.3 * max(0.0, min(1.0, s_n)) + 0.3 * max(0.0, min(1.0, w_sc))
-        c.diagnostics["calibrated_fusion_score"] = round(fusion, 4)
+    if mode == 'enforce' and local:
+        # Preserve review access to audio where independently positive meso
+        # evidence disagrees with a resolved micro boundary. Never promote it.
+        from ..types import CandidateSentence
+        rows = [r for group in local.values() if isinstance(group,list)
+                for r in group if isinstance(r,dict) and r.get('span')]
+        coarse = [r['span'] for r in rows if r.get('scale') != 'micro'
+                  and r.get('accepted') and r.get('identity_evidence',{}).get('accepted')]
+        forbidden = [*blocked_spans, *hard_source_spans]
+        for row in rows:
+            if row.get('micro_state') != 'other':
+                continue
+            a,b = row['span']
+            if (b-a < .4-1e-9 or not any(x <= a+1e-6 and y >= b-1e-6 for x,y in coarse)
+                    or any(min(b,y)>max(a,x) for x,y in forbidden)
+                    or _covered_ratio(a,b,[(c.start,c.end) for c in [*accepted,*borderline]]) >= 1.-1e-6):
+                continue
+            borderline.append(CandidateSentence(a,b,'',accepted=False,
+                reject_reason='多尺度声纹证据冲突，待复核',diagnostics={
+                    'cluster_tier':'B','cluster_reason':'multiscale_disagreement',
+                    'cluster_mode':mode,'review_only':True}))
+    for c in {id(c): c for c in [*accepted, *rejected, *borderline]}.values():
+        _calibrate_candidate(c, turns, result, local)
+        if local:
+            from .identity_heatmap import heatmap
+            c.diagnostics['identity_heatmap'] = heatmap(trajectory, c.start, c.end)
+    if mode == "enforce":
+        _refine_tier_b(borderline, accepted)
+        rejected_ids = {id(c) for c in rejected}
+        rejected.extend(c for c in borderline if id(c) not in rejected_ids)
+        rejected[:] = list({id(c): c for c in rejected}.values())
+        rejected.sort(key=lambda c: (c.diagnostics.get("cluster_tier") == "B",
+                                    c.diagnostics["tier_b_rank_score"]), reverse=True)
+    refined_b = sum(c.diagnostics.get("cluster_tier") == "B" for c in rejected)
     return {"removed": len(removed), "promoted": len(promoted),
             "cropped": len(cropped), "borderline": refined_b,
             "synthesized": sum(1 for c in accepted
                                if c.diagnostics.get("cluster_span_synthesized"))}
 
 
-def _deduplicate_tier_a(candidates, containment=0.85):
-    """Tier A 内部父子重复消解：仅当短片段被长片段包裹 >= 85% 自身时长时
-    去重（保留更完整的长句）。不设数量上限、不按分数替换——相邻独立短句
-    与 Tier A 时间轴覆盖均不受影响。"""
-    ordered = sorted(candidates, key=lambda c: (-c.duration, c.start))
-    selected: list = []
-    for cand in ordered:
-        if any(min(cand.end, e.end) - max(cand.start, e.start)
-               >= containment * max(1e-6, cand.duration)
-               for e in selected):
-            continue
-        selected.append(cand)
-    return sorted(selected, key=lambda c: (c.start, c.end))
-
-
 def _tier_b_rank(candidate) -> float:
-    """Tier B 捡漏优先级：上游已接受的候选（完整流水线验证过、只在簇层
-    无法确认）显著优先于从未被任何环节接受的候选。"""
-    upstream = 0.8 if candidate.diagnostics.get("cluster_removed") else 0.0
-    return (upstream
-            + 0.5 * float(getattr(candidate, "speaker_score", 0.0) or 0.0)
-            + 0.3 * float(_secondary_hint(candidate) or 0.0)
-            + 0.2 * float(_window_min(candidate) or 0.0))
+    """Prefer calibrated identity evidence, penalizing clear impostor victories."""
+    diag = candidate.diagnostics
+    cm_p, cm_s = diag.get("cohort_cm_p", diag.get("cm_p")), diag.get("cohort_cm_s", diag.get("cm_s"))
+    loses = ((isinstance(cm_p, (int, float)) and cm_p < 0)
+             or (isinstance(cm_s, (int, float)) and cm_s < -.05))
+    def score(value):
+        return float(value) if isinstance(value, (int, float)) and math.isfinite(value) else 0.
+    return (.65 * score(diag.get("calibrated_fusion_score"))
+            + .15 * score(getattr(candidate, "speaker_score", 0))
+            + .05 * score(_secondary_hint(candidate))
+            + .15 * score(_window_min(candidate))
+            + (.05 if diag.get("cluster_removed") else 0) - (.6 if loses else 0))
 
 
 def _covered_ratio(span_start, span_end, spans) -> float:
@@ -581,19 +668,13 @@ def _covered_ratio(span_start, span_end, spans) -> float:
 
 def _refine_tier_b(borderline, accepted, tier_a_coverage=0.85,
                    mutual_containment=0.80):
-    """Tier B 无损精炼：互斥 + 包含去重 + 置信度排序，绝不设数量上限。
-
-    仅隐藏两类纯重复碎片：已被 Tier A 覆盖 >= 85% 时长（covered_by_tier_a），
-    或与更高优先级 Tier B 候选重叠 >= 80% 自身时长（tier_b_nms_suppressed）。
-    其余全部保留并按 _tier_b_rank 降序排列——Tier A ∪ Tier B 的时间轴
-    覆盖面积与精炼前完全一致，覆盖率一分不掉。
-    """
+    """Suppress fully covered duplicates while retaining unique audio."""
     if not borderline:
         return
     tier_a_spans = [(a.start, a.end) for a in accepted]
     survivors = []
     for candidate in borderline:
-        if _covered_ratio(candidate.start, candidate.end, tier_a_spans) >= tier_a_coverage:
+        if _covered_ratio(candidate.start, candidate.end, tier_a_spans) >= max(tier_a_coverage, 1.-1e-6):
             candidate.diagnostics["cluster_tier"] = "covered_by_tier_a"
             continue
         survivors.append(candidate)
@@ -601,7 +682,7 @@ def _refine_tier_b(borderline, accepted, tier_a_coverage=0.85,
     kept: list = []
     for candidate in ranked:
         if any(min(candidate.end, k.end) - max(candidate.start, k.start)
-               >= mutual_containment * max(1e-6, candidate.duration)
+               >= max(mutual_containment, 1.-1e-6) * max(1e-6, candidate.duration)
                for k in kept):
             candidate.diagnostics["cluster_tier"] = "tier_b_nms_suppressed"
             continue
@@ -610,12 +691,7 @@ def _refine_tier_b(borderline, accepted, tier_a_coverage=0.85,
 
 
 def _deduplicate_tier_a(candidates, min_overlap=0.15):
-    """消除 Tier A 内部互相重叠或包裹的冗余片段（父子重复导出）。
-
-    优先保留：1) 非救援标记段优于救援段；2) 窗口最低分无明显短板时保留
-    更完整的长句；3) 若长句窗口最低分比干净子句低 0.06 以上（长句带了
-    杂音尾巴），用高纯度子句替换污染长句。
-    """
+    """Resolve overlapping exports, preferring complete clean intervals."""
     ordered = sorted(
         candidates,
         key=lambda c: (
@@ -627,16 +703,17 @@ def _deduplicate_tier_a(candidates, min_overlap=0.15):
     )
     selected = []
     for cand in ordered:
-        conflict = False
-        for i, existing in enumerate(selected):
+        conflicts = [(i, e) for i, e in enumerate(selected)
+                     if min(cand.end, e.end)-max(cand.start, e.start) > min_overlap]
+        conflict = bool(conflicts)
+        for i, existing in conflicts:
             ov = min(cand.end, existing.end) - max(cand.start, existing.start)
             if ov <= min_overlap:
                 continue
             c_wmin = _window_min(cand) or 0.0
             e_wmin = _window_min(existing) or 0.0
-            if (cand.duration < existing.duration
+            if (len(conflicts) == 1 and cand.duration < existing.duration
                     and c_wmin >= e_wmin + 0.06 and ov >= 0.8 * cand.duration):
-                # 高纯度短子句替换带杂音尾巴的长父句。
                 selected[i] = cand
             conflict = True
             break
@@ -667,17 +744,17 @@ def _has_strong_family_overlap(candidate, turns, result):
 
 
 def _has_family_overlap(candidate, turns, result):
-    """候选与目标家族证据重叠。
-
-    成员轮次 / 边缘轮次 / 未聚类旁白轮次，以及"灰簇"（簇质心过了主通道
-    参考下限但未达标的次级簇）——灰簇不是明确反向证据，只能降级待试听。
-    """
+    """Include uncertain clusters when retaining candidates for review."""
     target_ids = set(result.target_cluster_ids) or (
         {result.target_cluster_id} if result.target_cluster_id is not None else set())
     qualified = set(result.diagnostics.get("qualified_cluster_ids") or ())
     primary_floor = (result.diagnostics.get("profile_floors") or {}).get("primary")
     cluster_scores = {
         c.cluster_id: c.primary_target_score for c in result.clusters}
+    # Formerly unclustered short/singleton turns remain reviewable. Gaining a
+    # cluster ID is not independent evidence that a voice belongs to a rival.
+    sparse_ids = {c.cluster_id for c in result.clusters
+                  if len(c.members) < 3 or c.total_speech_seconds < 6.}
     for turn in turns:
         if min(turn.end, candidate.end) <= max(turn.start, candidate.start):
             continue
@@ -686,7 +763,7 @@ def _has_family_overlap(candidate, turns, result):
         if len(result.borderline_membership) == len(turns) and result.borderline_membership[turn.index]:
             return True
         cluster_id = result.cluster_of[turn.index]
-        if cluster_id in target_ids | qualified | {-1}:
+        if cluster_id in target_ids | qualified | sparse_ids | {-1}:
             return True
         if (primary_floor is not None and cluster_id in cluster_scores
                 and cluster_scores[cluster_id] >= primary_floor):

@@ -1,18 +1,20 @@
 param(
     [string]$WorkspaceRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')),
+    [string]$GptRoot = $env:VOICE_EXTRACT_GPT_ROOT,
     [switch]$WhatIf
 )
 
 $ErrorActionPreference = 'Stop'
 $toolRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$gptRoot = Join-Path $WorkspaceRoot 'GPT-SoVITS-v2pro-20250604'
+if (-not $GptRoot) { $GptRoot = Join-Path $WorkspaceRoot 'GPT-SoVITS' }
 $modelRoot = Join-Path $toolRoot 'model'
 
 function Fetch-File {
     param(
         [string]$Url,
         [string]$Destination,
-        [string]$ExpectedSha256 = ''
+        [string]$ExpectedSha256 = '',
+        [switch]$PreserveExisting
     )
 
     $usable = Test-Path -LiteralPath $Destination -PathType Leaf
@@ -21,6 +23,9 @@ function Fetch-File {
     }
     if ($usable -and $ExpectedSha256) {
         $usable = (Get-FileHash -LiteralPath $Destination -Algorithm SHA256).Hash -eq $ExpectedSha256
+        if (-not $usable -and $PreserveExisting) {
+            throw "Existing trained model has a different checksum; it was preserved: $Destination"
+        }
     }
     if ($usable) {
         Write-Host ('[OK] {0}' -f $Destination) -ForegroundColor Green
@@ -56,7 +61,23 @@ Fetch-File 'https://huggingface.co/lj1995/GPT-SoVITS/resolve/main/sv/pretrained_
 Fetch-File 'https://modelscope.cn/models/iic/speech_campplus_sv_zh-cn_16k-common/resolve/master/campplus_cn_common.bin' (Join-Path $modelRoot 'speaker\campplus_voxceleb\campplus_voxceleb.bin')
 Fetch-File 'https://huggingface.co/microsoft/wavlm-base-plus-sv/resolve/feb593a6c23c1cc3d9510425c29b0a14d2b07b1e/config.json?download=true' (Join-Path $modelRoot 'speaker\wavlm-base-plus-sv\config.json')
 Fetch-File 'https://huggingface.co/microsoft/wavlm-base-plus-sv/resolve/feb593a6c23c1cc3d9510425c29b0a14d2b07b1e/preprocessor_config.json?download=true' (Join-Path $modelRoot 'speaker\wavlm-base-plus-sv\preprocessor_config.json')
-Fetch-File 'https://huggingface.co/microsoft/wavlm-base-plus-sv/resolve/feb593a6c23c1cc3d9510425c29b0a14d2b07b1e/pytorch_model.bin?download=true' (Join-Path $modelRoot 'speaker\wavlm-base-plus-sv\pytorch_model.bin')
+Fetch-File 'https://github.com/guhechudaisuki/-Voice-Extractor/releases/download/v3.0/wavlm_reinforced_pytorch_model.bin' (Join-Path $modelRoot 'speaker\wavlm-base-plus-sv\pytorch_model.bin') 'e906bce2fa42fb497a1d1a9ecf81548adb7e03b12a5644e32d2f42f0d6500fad' -PreserveExisting
+Fetch-File 'https://github.com/guhechudaisuki/-Voice-Extractor/raw/main/models/anime_t3/classifier_v2.pt' (Join-Path $toolRoot 'models\anime_t3\classifier_v2.pt') 'a86a47947dddf8f8d638e2764bee79c086b19910d4673b53f371a9b821e4401c' -PreserveExisting
+Fetch-File 'https://github.com/guhechudaisuki/-Voice-Extractor/releases/download/model-assets/anime_speaker_char_ecapa.onnx' (Join-Path $toolRoot 'models\anime-speaker-char\anime_speaker_char_ecapa.onnx') 'd4e0ce7d55501fbb1a71d18ae7d3146d6fbd2d5aee8369d3171a82418f44d3a8'
+Fetch-File 'https://github.com/guhechudaisuki/-Voice-Extractor/releases/download/model-assets/anime_speaker_va_ecapa.onnx' (Join-Path $toolRoot 'models\anime-speaker-va\anime_speaker_va_ecapa.onnx') '9d2d285e55cb5eb4ba09fe703119cfec4ae715ba3ba4df89a97cfec606e3d986'
+
+$prototypeSource = Join-Path $toolRoot 'models\wavlm-base-plus-sv\auto_negatives.npz'
+$prototypeTarget = Join-Path $modelRoot 'speaker\wavlm-base-plus-sv\auto_negatives.npz'
+if ((Test-Path -LiteralPath $prototypeSource -PathType Leaf) -and
+    -not (Test-Path -LiteralPath $prototypeTarget)) {
+    if ($WhatIf) {
+        Write-Host ('INSTALL {0} -> {1}' -f $prototypeSource, $prototypeTarget)
+    } else {
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $prototypeTarget) | Out-Null
+        Copy-Item -LiteralPath $prototypeSource -Destination $prototypeTarget
+    }
+}
+
 Fetch-File 'https://huggingface.co/onnx-community/wespeaker-voxceleb-resnet34-LM/resolve/6a61a1833ff2583aabeba044f5c8221f00b67ceb/onnx/model.onnx?download=true' (Join-Path $modelRoot 'speaker\wespeaker-resnet34-lm\onnx\model.onnx') '3955447B0499DC9E0A4541A895DF08B03C69098EBA4E56C02B5603E9F7F4FCBB'
 Fetch-File 'https://huggingface.co/csukuangfj/sherpa-onnx-pyannote-segmentation-3-0/resolve/main/model.onnx?download=true' (Join-Path $toolRoot 'models\overlap\model.onnx') '220AD67CA923BEF2FA91F2390C786097BF305BCEB5E261D4AF67B38E938E1079'
 Fetch-File 'https://zenodo.org/records/3987831/files/Cnn10_mAP%3D0.380.pth?download=1' (Join-Path $toolRoot 'models\panns\Cnn10_mAP=0.380.pth')
@@ -119,5 +140,5 @@ if ($missingFunAsr.Count -gt 0) {
 if ($WhatIf) {
     Write-Host 'WhatIf complete. No files were downloaded.'
 } else {
-    & (Join-Path $PSScriptRoot 'check_assets.ps1') -WorkspaceRoot $WorkspaceRoot
+    & (Join-Path $PSScriptRoot 'check_assets.ps1') -WorkspaceRoot $WorkspaceRoot -GptRoot $GptRoot
 }

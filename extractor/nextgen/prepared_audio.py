@@ -1,9 +1,4 @@
-"""Bounded paired reads from already decoded 16 kHz raw and UVR WAV files.
-
-The singing pass and UVR must have run upstream. This module measures a stable
-raw-to-stem delay from multiple speech anchors, then maps both views back to the
-same original sample timeline. Ambiguous alignment is an error, not zero lag.
-"""
+"""Read aligned 16 kHz raw and separated audio on a shared source timeline."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -61,11 +56,7 @@ def estimate_stem_delay(raw_path: Path, stem_path: Path,
                         maximum_delay_samples: int = 3200,
                         minimum_correlation: float = 0.55,
                         maximum_disagreement_samples: int = 8) -> AlignmentReport:
-    """Sample-lag cross correlation on independent voiced spans.
-
-    This verifies timing only, not identity, singing or separation quality.
-    Anchors must be disjoint and long enough for a distinctive waveform.
-    """
+    """Estimate sample lag from disjoint speech anchors; reject ambiguous alignment."""
     from scipy.signal import correlate
 
     _, raw_length = _mono_geometry(raw_path)

@@ -7,6 +7,11 @@ Subtitle timing can annotate proposals but never creates a voiced boundary.
 
 from __future__ import annotations
 
+
+def reserves_audio(candidate):
+    """Only independently accepted candidates can block overlapping rescues."""
+    return bool(candidate.accepted and not candidate.diagnostics.get('lattice_recovery_proposal'))
+
 import re
 from dataclasses import asdict, dataclass
 from typing import Iterable
@@ -15,6 +20,48 @@ from .types import TimeSpan
 
 
 ANALYSIS_SAMPLE_RATE = 16000
+
+
+class CandidateLattice:
+    """Sample-exact proposal regions decoded by the acoustic identity field.
+
+    Candidates contribute boundaries, never votes; the trajectory enforces
+    detector barriers and local acoustic support.
+    """
+
+    def __init__(self, trajectory, spans):
+        self.trajectory = trajectory
+        self.regions = []
+        for a, b in sorted(set(_samples(TimeSpan(float(a), float(b))) for a, b in spans if b > a)):
+            if self.regions and a <= self.regions[-1][1]:
+                self.regions[-1][1] = max(self.regions[-1][1], b)
+            else:
+                self.regions.append([a, b])
+
+    def decode(self, minimum, certified_short=()):
+        result = []
+        for a,b in self.regions:
+            result.extend(self.trajectory.decode(a/ANALYSIS_SAMPLE_RATE, b/ANALYSIS_SAMPLE_RATE, minimum))
+        from .recall import MIN_TARGET_SECONDS, subtract_intervals
+        for a, b in subtract_intervals(certified_short, result):
+            if b - a >= MIN_TARGET_SECONDS - 1e-9:
+                result.extend(self.trajectory.decode(a, b, MIN_TARGET_SECONDS))
+        return sorted(set(result))
+
+
+def recovery_proposals(turns, regions=(), raw_turns=(), blocked=()):
+    """Cheap interval coverage for the identity lattice; no identity decisions.
+
+    Retain original turns and their locator/raw intersections. Detector barriers
+    are carved before any proposal can be decoded or promoted.
+    """
+    from .extraction_guards import carve_tainted_spans
+    seeds = list(turns)
+    for region in [*regions,*raw_turns]:
+        seeds.extend(TimeSpan(max(t.start,region.start),min(t.end,region.end))
+                     for t in turns if min(t.end,region.end)-max(t.start,region.start)>=.35-1e-9)
+    clean,_ = carve_tainted_spans(seeds,blocked,minimum_seconds=.35,padding=0.)
+    return [TimeSpan(a,b) for a,b in sorted({(round(s.start,5),round(s.end,5)) for s in clean})]
 
 
 @dataclass(frozen=True)

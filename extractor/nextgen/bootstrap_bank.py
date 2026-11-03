@@ -1,7 +1,7 @@
 """Target embedding banks with validated, content-bound training provenance."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 import os
@@ -148,7 +148,6 @@ def evidence_spans(vectors):
 
 def merge_profile(profile, vectors):
     """Duration-weighted evidence with half the weight anchored to user input."""
-    from .identity_cluster import TargetProfile
     rows = list(vectors)
     if not rows:
         return profile
@@ -162,8 +161,7 @@ def merge_profile(profile, vectors):
         matrix = np.stack([getattr(row, name) for row in rows])
         if matrix.shape[1:] != original.shape:
             raise ValueError("bootstrap embedding dimensions differ from reference")
-        # Keep the original identity anchor at half the weight irrespective of
-        # bank size. Reference floors remain fixed across all rounds.
+        # Preserve the reference's half-weight anchor and fixed acceptance floors.
         centers.append(_unit(_unit(weights @ matrix) + _unit(original)))
-    return TargetProfile(*centers, profile.primary_reference_floor,
-                         profile.secondary_reference_floor, source="merged")
+    return replace(profile, primary_centroid=centers[0], secondary_centroid=centers[1],
+                   source="merged")

@@ -1,8 +1,4 @@
-"""Prepared-candidate engine for independent testing, not desktop integration.
-
-Preprocessing has to finish singing -> UVR -> VAD before this entry. It cannot
-silently regenerate the source, bypass event masks, or use transcript labels.
-"""
+"""Evaluate prepared candidates after singing detection, separation and VAD."""
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
@@ -102,9 +98,7 @@ def run_prepared(source: SourceTimeline, candidates: tuple[Candidate, ...], sess
                     ledger.add(part)
                     queued_keys.add(part.key)
                     queue.append((part, True))
-    # Independently verified upstream events apply across all proposals. Model
-    # observations are scoped to the candidate/context that produced them: a
-    # mistaken parent prediction must not veto a newly reviewed child.
+    # Share detector masks; keep model observations scoped to their candidate context.
     hard = tuple(row for row in evidence if row.kind in (
         EvidenceKind.OTHER, EvidenceKind.SINGING, EvidenceKind.OVERLAP,
     ))

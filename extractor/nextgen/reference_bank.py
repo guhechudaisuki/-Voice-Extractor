@@ -17,8 +17,7 @@ class Reference:
     role: str  # "target" or an opaque user-provided exclusion-group ID
     raw_digest: str
     stem_digest: str
-    # Near-duplicates are supplied by a verified audio-fingerprint stage,
-    # not inferred from speaker cosine (same voice is not duplicate audio).
+    # Duplicate groups come from audio fingerprints, not speaker similarity.
     duplicate_group: str | None = None
 
     def __post_init__(self) -> None:

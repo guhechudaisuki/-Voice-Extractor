@@ -36,7 +36,7 @@
     </div>
   </header>
 
-  <main class="stage">
+  <main class="workspace">
 
     <!-- ── 试听标注 ─────────────────────────────────────────── -->
     <section class="panel is-on" id="p-review">
@@ -52,6 +52,7 @@
           <select id="batchSelect" class="field"></select>
 
           <div class="batch-meta" id="batchMeta"></div>
+          <button class="mini-btn" id="discoverSpeakersBtn">🔍 角色簇探索 / 导出参考种子</button>
 
           <div class="view-switch">
             <button class="chip is-on" data-view="player">播放器</button>
@@ -68,7 +69,10 @@
             <button class="chip" data-filter="tierA">✅ 主输出</button>
             <button class="chip" data-filter="tierB">⚡ 边缘捡漏</button>
             <button class="chip" data-filter="removed">🚫 撤下</button>
-            <button class="chip" data-filter="todo">未标</button>
+            <button class="chip" data-filter="unreviewed">未标</button>
+            <button class="chip" data-filter="active" title="优先复核模型分歧大、声线不同的未标片段">高信息量</button>
+            <button class="chip" id="liveRecalibrate" title="至少 10 条标注，含 3 正 / 3 负">按本批标注重排</button>
+            <button class="chip" id="rescoreModel">用最新强化模型重评本批次</button>
             <button class="chip" data-filter="done">已标</button>
             <button class="chip" data-filter="cluster" id="clusterFilterChip" hidden>目标簇</button>
           </div>
@@ -88,6 +92,7 @@
 
           <div class="scope">
             <canvas id="waveCanvas"></canvas>
+            <span id="identityHeatLegend" class="muted" hidden>声纹证据：绿＝支持 · 红＝冲突 · 灰＝缺失（窗口投影）</span>
             <div class="scope-head" id="scopeHead"></div>
             <div class="scope-empty" id="scopeEmpty">选择右侧片段开始试听</div>
           </div>
@@ -100,17 +105,18 @@
           </div>
 
           <div class="transport">
-            <button class="tbtn" id="prevBtn" title="上一句 (←)">◀◀</button>
+            <button class="tbtn" id="prevBtn" title="上一句 (↑ / W)">◀◀</button>
             <button class="tbtn tbtn-main" id="playBtn" title="播放 / 暂停 (空格)">
               <span id="playLabel">播放</span>
             </button>
             <button class="tbtn" id="replayBtn" title="重播 (R)">↺</button>
-            <button class="tbtn" id="nextBtn" title="下一句 (→)">▶▶</button>
+            <button class="tbtn" id="nextBtn" title="下一句 (↓ / S)">▶▶</button>
           </div>
 
-          <blockquote class="line" id="sttLine">（无识别文本）</blockquote>
+          <blockquote class="line" id="sttLine" role="textbox" aria-label="全句转写修订" contenteditable="false" title="标为目标匹配后可直接编辑，自动保存">（无识别文本）</blockquote>
 
           <div class="readout" id="readout"></div>
+          <p class="pad-note">1–6 标注 · Space 播放/停止 · R 重播/保留段 · ↑↓ / W S 上下句</p>
         </div>
 
         <!-- 簇视图：和播放器同位置互斥显示，由「簇」标签切换 -->
@@ -179,8 +185,10 @@
               <button class="mini-btn" id="trimFromPlayhead">从播放头起</button>
               <button class="mini-btn" id="keepPlayBtn">▶ 试听保留段</button>
             </div>
-            <input type="text" id="partialText" class="field" style="width:100%;margin-top:6px"
-                   placeholder="保留段台词（可微调；留空 = 导出时自动按字幕/比例截取）">
+            <input type="text" id="trimRanges" class="field" style="width:100%;margin-top:6px"
+                   placeholder="多个污染区间：0.5-1.2; 2.8-3.4（留空使用上方单区间）">
+            <textarea id="partialText" class="field" rows="2" style="width:100%;margin-top:6px"
+                   placeholder="保留段台词；多个保留段按顺序逐行填写，留空使用识别文本"></textarea>
           </div>
 
           <div class="rail-foot">
@@ -191,18 +199,32 @@
             <div class="foot-btns">
               <button class="mini-btn" id="undoBtn" title="撤销上一步 (Ctrl+Z)">撤销</button>
               <button class="mini-btn" id="trustMainBtn" title="把未标注的 Tier A 主输出全部标为目标匹配">一键信任主输出</button>
+              <button class="mini-btn" id="trustBorderlineBtn" title="采纳评分达标或具有纯净子段证据的边缘句，保留已有人工标注">⚡ 采纳高分边缘句</button>
               <button class="mini-btn solid" id="exportBtn">导出 ZIP</button>
             </div>
             <label class="check material-identity"><input type="checkbox" id="includeMaterial" disabled>
-              <span>附带训练原料（全部标注和音频，ZIP 可直接强化）</span></label>
+              <span>附带训练原料（已标注子集和音频，ZIP 可直接强化）</span></label>
             <label class="check material-identity"><input type="checkbox" id="includeGptList" checked>
               <span>附带 GPT-SoVITS train.list</span></label>
-            <div class="save-state" id="materialState">全部片段打标后可选导出原料</div>
+            <label class="check">导出质量
+              <select id="minQuality" class="field"><option value="">全部质量</option><option value="Silver">Gold + Silver</option><option value="Gold">仅 Gold</option></select>
+            </label>
+            <label class="check">说话人 <input id="exportSpeaker" class="field" value="target"></label>
+            <label class="check"><input type="checkbox" id="restoreHighFrequencies"><span>Gold 高频细节回填（需原轨与相干性检查）</span></label>
+            <label class="check">未知语言的回退值 <input id="exportLanguage" class="field" value="JA"></label>
+            <div class="save-state" id="materialState">已有标注即可导出原料</div>
             <div class="save-state" id="saveState">随点即存</div>
+            <button class="mini-btn" id="mergeDatasets">合并多个已复核批次</button>
           </div>
         </div>
       </div>
     </section>
+
+    <dialog id="speakerPanel">
+      <div class="rail-head"><strong>🔍 全片角色簇探索</strong><button class="mini-btn" id="closeSpeakersBtn">关闭</button></div>
+      <p id="speakerStatus" role="status">每簇可导出 Top-4 纯净参考 WAV，并填入提取页。</p>
+      <div id="speakerList"></div>
+    </dialog>
 
     <!-- ── 提取任务 ─────────────────────────────────────────── -->
     <section class="panel" id="p-extract">
@@ -218,14 +240,17 @@
             <span class="form-label">待提取的音频 / 视频路径</span>
             <textarea id="targetsInput" class="field area" rows="3"
               placeholder="每行一个路径。目录里的全部音视频也会被处理。"></textarea>
+            <button type="button" class="mini-btn" data-browse="targetsInput" data-kind="media">选择本地音视频或目录</button>
           </label>
 
           <label class="form-row">
             <span class="form-label">目标人物参考音频</span>
             <textarea id="refsInput" class="field area" rows="3"
               placeholder="每行一个参考音频；放同一角色的多段，覆盖不同情绪与录音条件。"></textarea>
+            <button type="button" class="mini-btn" data-browse="refsInput" data-kind="media">选择本地参考音频</button>
           </label>
 
+          <label class="form-row"><span>导出采样率</span><select id="exportSampleRate" class="field"><option value="16000">16 kHz</option><option value="24000">24 kHz · 保留母带</option><option value="32000">32 kHz · 保留母带</option><option value="44100">44.1 kHz · 保留母带</option><option value="48000">48 kHz · 不超过原始频宽</option></select></label>
           <details class="subtitle-bindings" id="subtitleBindingsPanel">
             <summary>字幕辅助（可选）<span id="subtitleBindingCount" class="counter">未绑定</span></summary>
             <p class="form-help">为目标文件填写对应字幕路径，留空则不使用。支持 ASS、SSA、SRT、VTT；绑定时请填写具体音视频文件路径。</p>
@@ -235,7 +260,8 @@
           <label class="form-row">
             <span class="form-label">排除角色（可选，逗号分隔，每组是同一人）</span>
             <textarea id="excludeInput" class="field area" rows="2"
-              placeholder="每组一行，组内用逗号分隔：&#10;绿.mp3, 绿2.mp3&#10;丽奈.mp3"></textarea>
+              placeholder="每组一行，组内用逗号分隔：&#10;speaker_a_1.mp3, speaker_a_2.mp3&#10;speaker_b.mp3"></textarea>
+            <button type="button" class="mini-btn" data-browse="excludeInput" data-kind="media">选择本地排除角色音频</button>
           </label>
 
           <div class="form-grid">
@@ -282,17 +308,18 @@
     <section class="panel" id="p-training">
       <div class="settings training-panel">
         <h2>模型强化 <span class="counter">从人工标注学习</span></h2>
-        <p class="form-help">选择 annotations 目录中的训练 ZIP，无需解压。ZIP 内含标注、片段音频和参考音频，可汇总不同集、不同电脑的 ZIP。强化成功后模型自动保存回原位置。</p>
+        <p class="form-help">选择 annotations 目录中的训练 ZIP，无需解压。ZIP 内含标注、片段音频和参考音频，可汇总不同集、不同电脑的 ZIP。全局模型通过独立留出集验证后自动保存。</p>
         <label class="form-row"><span class="form-label">选择一个或多个训练 ZIP</span>
           <input class="field" id="trainingFiles" type="file" accept=".zip" multiple>
         </label>
-        <p class="form-help">每次最多 30 份，单份最多 4 GB，合计最多 8 GB。模型记住训练成功的 ZIP 哈希，重复 ZIP 自动跳过；重新打包后哈希不同则按新 ZIP 处理。首次强化至少需要 2 段目标匹配和 2 段整句非目标。其余标签保留，暂不参与二分类训练。</p>
+        <p class="form-help">每次最多 30 份，单份最多 4 GB，合计最多 8 GB。已训练过的相同 ZIP 自动跳过。首次强化至少需要 2 段目标样本和 2 段非目标样本、3 个独立来源；训练集与留出集均须包含正负样本。「部分非目标」会按标注区间切分，其中错人区间作为困难负例参与强化。其余标签保留，不参与二分类训练。</p>
         <div class="run-btns">
           <button class="mini-btn solid big" id="trainBtn">开始强化</button>
           <button class="mini-btn" id="discardModelBtn" disabled>清理临时文件</button>
+          <button class="mini-btn" id="rollbackModelBtn" disabled>回滚至上一次模型备份</button>
         </div>
         <p class="save-state" id="trainingState" role="status">等待原料文件</p>
-        <p class="form-help" id="trainingStorage">原料副本与中间文件使用临时磁盘。强化成功后模型直接保留在原位置，清理或关闭不会删除它。</p>
+        <p class="form-help" id="trainingStorage">原料副本与中间文件使用临时磁盘。强化成功后全局模型持久保存，清理或关闭不会删除它。</p>
         <pre class="term training-report" id="trainingReport">训练报告将在这里显示。</pre>
         <p class="form-help">强化后的模型供后续提取直接使用，下次启动仍然保留。训练数据上的结果不等于实际识别准确率，效果应以独立语音验证为准。</p>
       </div>
@@ -351,5 +378,6 @@
 </div>
 
 <script src="/static/js/studio.js"></script>
+<script src="/static/js/wave3.js"></script>
 </body>
 </html>

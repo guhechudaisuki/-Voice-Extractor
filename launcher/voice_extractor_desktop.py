@@ -100,6 +100,7 @@ class VoiceExtractorDesktop:
         self.singing_var = tk.BooleanVar(value=True)
         self.all_sentences_var = tk.BooleanVar(value=False)
         self.video_segments_var = tk.BooleanVar(value=False)
+        self.export_rate_var = tk.StringVar(value='16000')
         self.cluster_bootstrap_var = tk.BooleanVar(value=False)
         self.subtitle_status_var = tk.StringVar(value="字幕：未绑定（可选）")
 
@@ -380,7 +381,8 @@ class VoiceExtractorDesktop:
         from desktop_settings_tab import DesktopSettingsTab
         from launcher.desktop_training_tab import DesktopTrainingTab
         output_base = Path(__file__).resolve().parent.parent / "output"
-        self.review_tab = DesktopReviewTab(self.main_notebook, self.root, output_base)
+        self.review_tab = DesktopReviewTab(self.main_notebook, self.root, output_base,
+                                          set_references=self._use_discovered_references)
         self.training_tab = DesktopTrainingTab(self.main_notebook, self.root,
             python_provider=lambda: self.context.python if self.context else sys.executable,
             environment_provider=lambda: self.context.backend_environment() if self.context else {})
@@ -532,6 +534,9 @@ class VoiceExtractorDesktop:
         output_frame = ttk.Frame(options, style="Card.TFrame")
         output_frame.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(10, 0))
         output_frame.columnconfigure(0, weight=1)
+        ttk.Label(output_frame, text='导出采样率（高于 16k 时保留母带）').grid(row=2, column=0, sticky='w')
+        ttk.Combobox(output_frame, textvariable=self.export_rate_var, state='readonly',
+                     values=('16000', '24000', '32000', '44100', '48000'), width=10).grid(row=2, column=1)
         ttk.Label(output_frame, text="结果保存位置（默认 output）").grid(
             row=0, column=0, columnspan=2, sticky="w", pady=(0, 3)
         )
@@ -980,6 +985,13 @@ class VoiceExtractorDesktop:
     def _add_references(self) -> None:
         self._add_paths(self.references, self.reference_list, AUDIO_TYPES)
 
+    def _use_discovered_references(self, paths) -> None:
+        self.references[:] = list(dict.fromkeys(str(path) for path in paths))
+        self.reference_list.delete(0, 'end')
+        for path in self.references:
+            self.reference_list.insert('end', path)
+        self.main_notebook.select(0)
+
     def _add_targets(self) -> None:
         self._add_paths(self.targets, self.target_list, MEDIA_TYPES)
         self._refresh_target_list()
@@ -1147,8 +1159,9 @@ class VoiceExtractorDesktop:
                 "use_singing_detector": bool(self.singing_var.get()),
                 "export_all_sentences": bool(self.all_sentences_var.get()),
                 "export_video_clips": bool(self.video_segments_var.get()),
+                "export_sample_rate": int(self.export_rate_var.get()),
                 "cluster_bootstrap": bool(self.cluster_bootstrap_var.get()),
-                "cluster_identity_mode": "enforce" if self.cluster_bootstrap_var.get() else "audit",
+                "cluster_identity_mode": "enforce",
             },
         }
 
@@ -1526,7 +1539,9 @@ class VoiceExtractorDesktop:
 def main() -> int:
     if getattr(sys, "frozen", False):
         from launcher.portable_resources import initialize_portable_process
-        initialize_portable_process(Path(sys.executable).resolve().parent)
+        install_root = Path(sys.executable).resolve().parent
+        initialize_portable_process(install_root)
+        os.environ['VOICE_EXTRACT_WAVLM_MODEL'] = str(install_root / 'resource/model/speaker/wavlm-base-plus-sv')
     root = tk.Tk()
     VoiceExtractorDesktop(root)
     from desktop_handoff import announce_ready

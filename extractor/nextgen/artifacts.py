@@ -34,7 +34,7 @@ class ModelCard:
     backbone_digest: str
     dataset_digest: str
     split_digest: str
-    stage: str  # research or validated; neither claims universal accuracy
+    stage: str  # research or validated
     reports: tuple[str, ...]
     limitations: str
     supervision: dict[str, dict[str, int]] = field(default_factory=dict)
@@ -128,18 +128,13 @@ def write_research_checkpoint(directory: Path, model: TemporalIdentityModel, *,
     (directory / "model.json").write_text(json.dumps({
         "schema": 1, "heads": HEADS, "config": model.config, "card": asdict(card),
     }, ensure_ascii=False, indent=2), encoding="utf-8")
-    # Calibration is deliberately absent. Saving trained weights does not make
-    # a valid operating point appear, nor authorize export through old gates.
+    # Trained weights require separate calibration before inference.
     return card
 
 
 def write_research_calibration(directory: Path, calibration: InferenceCalibration, *,
                                dataset_digest: str) -> Path:
-    """Bind an audited calibration selection to exact research weights/data.
-
-    This does not promote model status. Independent acoustic evaluation and a
-    separately reviewed promotion are required before production may load it.
-    """
+    """Bind calibration to exact weights and data without promoting model status."""
     require_digest(dataset_digest)
     directory = Path(directory).resolve(strict=True)
     metadata = json.loads((directory / "model.json").read_text(encoding="utf-8"))
@@ -155,8 +150,7 @@ def write_research_calibration(directory: Path, calibration: InferenceCalibratio
     destination = directory / "calibration.json"
     with destination.open("x", encoding="utf-8") as stream:
         json.dump(asdict(calibration), stream, ensure_ascii=False, indent=2)
-    # A research card records the exact calibration artifact too. This still
-    # cannot promote the model; validated status additionally requires audits.
+    # Recording calibration preserves research status until validation is complete.
     metadata["card"]["calibration_digest"] = file_digest(destination)
     temporary = directory / "model.json.tmp"
     temporary.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")

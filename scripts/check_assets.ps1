@@ -1,10 +1,11 @@
 param(
-    [string]$WorkspaceRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..'))
+    [string]$WorkspaceRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')),
+    [string]$GptRoot = $env:VOICE_EXTRACT_GPT_ROOT
 )
 
 $ErrorActionPreference = 'Stop'
 $toolRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$gptRoot = Join-Path $WorkspaceRoot 'GPT-SoVITS-v2pro-20250604'
+if (-not $GptRoot) { $GptRoot = Join-Path $WorkspaceRoot 'GPT-SoVITS' }
 $modelRoot = Join-Path $toolRoot 'model'
 $python = if ($env:VOICE_EXTRACT_PYTHON) { $env:VOICE_EXTRACT_PYTHON } else { Join-Path $gptRoot 'runtime\python.exe' }
 
@@ -28,7 +29,11 @@ $checks = @(
     @{ Name='FSMN-VAD'; Path=(Join-Path $modelRoot 'stt\speech_fsmn_vad_zh-cn-16k-common-pytorch\model.pt') },
     @{ Name='CT-Punc'; Path=(Join-Path $modelRoot 'stt\punc_ct-transformer_zh-cn-common-vocab272727-pytorch\model.pt') },
     @{ Name='CAM++'; Path=(Join-Path $modelRoot 'speaker\campplus_voxceleb\campplus_voxceleb.bin') },
-    @{ Name='WavLM SV'; Path=(Join-Path $modelRoot 'speaker\wavlm-base-plus-sv\pytorch_model.bin') },
+    @{ Name='WavLM SV'; Path=(Join-Path $modelRoot 'speaker\wavlm-base-plus-sv\pytorch_model.bin'); Hash='e906bce2fa42fb497a1d1a9ecf81548adb7e03b12a5644e32d2f42f0d6500fad' },
+    @{ Name='Identity classifier'; Path=(Join-Path $toolRoot 'models\anime_t3\classifier_v2.pt'); Hash='a86a47947dddf8f8d638e2764bee79c086b19910d4673b53f371a9b821e4401c' },
+    @{ Name='WavLM auto negatives'; Path=(Join-Path $toolRoot 'models\wavlm-base-plus-sv\auto_negatives.npz') },
+    @{ Name='Anime character ONNX'; Path=(Join-Path $toolRoot 'models\anime-speaker-char\anime_speaker_char_ecapa.onnx') },
+    @{ Name='Anime voice actor ONNX'; Path=(Join-Path $toolRoot 'models\anime-speaker-va\anime_speaker_va_ecapa.onnx') },
     @{ Name='WavLM config'; Path=(Join-Path $modelRoot 'speaker\wavlm-base-plus-sv\config.json') },
     @{ Name='WavLM preprocessor'; Path=(Join-Path $modelRoot 'speaker\wavlm-base-plus-sv\preprocessor_config.json') },
     @{

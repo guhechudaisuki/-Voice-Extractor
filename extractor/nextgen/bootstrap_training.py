@@ -29,6 +29,12 @@ def collect_vectors(analyzer, turns, result, blocked_spans=()):
                 or turn.index in result.outliers
                 or any(min(turn.end, b) > max(turn.start, a) for a, b in blocked_spans)):
             continue
+        clean = result.diagnostics.get("turn_clean_spans", {}).get(str(turn.index))
+        if clean is not None and clean != [[turn.start, turn.end]]:
+            # A certified child does not make its full-turn embedding safe to reuse.
+            continue
+        if turn.index in (result.diagnostics.get("raw_rescued_turns") or ()):
+            continue  # Original-audio evidence cannot certify a damaged stem vector.
         supports = result.diagnostics.get("bootstrap_supports", {}).get(str(turn.index), ())
         rows.append(BootstrapVector(analyzer.source_hash, turn.start, turn.end,
                     turn.speech_seconds, turn.primary, turn.secondary, min(scores), tuple(supports)))
@@ -37,13 +43,11 @@ def collect_vectors(analyzer, turns, result, blocked_spans=()):
 
 def analyze_with_bootstrap(analyzer, spans, *, output_dir, blocked_spans=(), max_rounds=3,
                            margin=.06, keep_narration=True, require_dominant=False):
-    """Only this analyzer's current audio and references are read.
-
-    Reuse encoders, embeddings and fixed cluster candidates. Each round sees
-    the previous round's bank; thresholds and original identity never drift.
-    """
+    """Expand current-file references while keeping identity anchors and floors fixed."""
     if type(max_rounds) is not int or not 1 <= max_rounds <= 10:
         raise ValueError("自举轮数必须为 1–10 的整数")
+    blocked_spans = tuple(blocked_spans)
+    analyzer.temporal_blocked_spans = blocked_spans
     turns, candidates, _ = analyzer.analyze(spans, margin=margin, temporal=False,
         keep_narration=keep_narration, require_dominant=require_dominant)
     result, local = analyzer.verify_temporal(turns, candidates, margin=margin)

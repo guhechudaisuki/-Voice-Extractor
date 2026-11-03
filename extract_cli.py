@@ -56,6 +56,8 @@ def main() -> int:
         help="目标包含视频时，同时导出对应的视频片段",
     )
     parser.add_argument("--no-overlap", action="store_true", help="关闭多人重叠检测")
+    parser.add_argument('--export-sample-rate', type=int, default=16000,
+                        choices=(16000, 24000, 32000, 44100, 48000), help='导出采样率；高于 16k 时保留母带')
     parser.add_argument("--no-singing", action="store_true", help="关闭唱歌检测")
     args = parser.parse_args()
     subtitle_targets = [Path(target).resolve() for target, _subtitle in args.subtitle]
@@ -75,6 +77,7 @@ def main() -> int:
             use_singing_detector=not args.no_singing,
             export_all_sentences=args.all_sentences,
             export_video_clips=args.video_segments,
+            export_sample_rate=args.export_sample_rate,
         )
     ).run_many(
         [Path(item) for item in args.reference],

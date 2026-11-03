@@ -1,12 +1,6 @@
-/* Voice Extractor Studio — 声纹提取工作台
- *
- * 视觉语言：声纹本身是频谱，所以主色用青→紫的频谱渐变，而不是通用的琥珀。
- * 琥珀保留给"判定为目标的那个说话人簇"，在整套配色里是唯一的高饱和暖色，
- * 一旦出现就明确表示"这是程序选中的那个人"。
- */
+/* Voice Extractor Studio. Amber identifies the selected target cluster. */
 
 :root {
-  /* 底色：偏蓝的暗夜，比纯黑耐看，也不会让面板显得脏 */
   --bg: #07080f;
   --bg-2: #0b0d18;
   --panel: rgba(22, 26, 44, 0.72);
@@ -30,7 +24,7 @@
     135deg, rgba(77, 227, 255, 0.16) 0%, rgba(160, 107, 255, 0.16) 100%
   );
 
-  /* 目标簇专用暖色，与频谱色形成唯一对比 */
+  /* 目标簇颜色 */
   --amber: #ffc247;
   --amber-dim: rgba(255, 194, 71, 0.38);
   --amber-glow: rgba(255, 194, 71, 0.22);
@@ -63,7 +57,6 @@ body {
   font-size: 14px;
   line-height: 1.5;
   overflow: hidden;
-  /* 两团频谱光晕当作背景，固定不动，不参与滚动 */
   background-image:
     radial-gradient(1100px 620px at 12% -8%, rgba(77, 227, 255, 0.10), transparent 62%),
     radial-gradient(1000px 640px at 92% 108%, rgba(160, 107, 255, 0.11), transparent 60%);
@@ -93,7 +86,6 @@ body {
   box-shadow: 0 0 14px rgba(96, 220, 255, 0.65);
   position: relative;
 }
-/* 呼吸灯：唯一一处自动动画，用来表示"服务在跑" */
 .brand-dot::after {
   content: "";
   position: absolute; inset: -4px;
@@ -166,7 +158,7 @@ body {
 
 /* ── 主体 ─────────────────────────────────────────────────── */
 
-.stage { flex: 1; min-height: 0; position: relative; }
+.workspace { flex: 1; min-height: 0; position: relative; }
 
 .panel { position: absolute; inset: 0; display: none; padding: 14px; }
 .panel.is-on { display: block; }
@@ -186,7 +178,6 @@ body {
   overflow: hidden;
 }
 
-/* 卡片顶部一道频谱细线，是整套界面的识别记号 */
 .rail::before {
   content: "";
   position: absolute; top: 0; left: 0; right: 0; height: 1px;
@@ -255,7 +246,7 @@ input[type="checkbox"] { width: 15px; height: 15px; accent-color: var(--cyan); c
 
 .batch-meta b { color: var(--ink-2); font-weight: 600; }
 
-.filters { display: flex; gap: 6px; }
+.filters { display: flex; flex-wrap: wrap; gap: 6px; }
 
 .chip {
   padding: 5px 11px;
@@ -432,6 +423,7 @@ input[type="checkbox"] { width: 15px; height: 15px; accent-color: var(--cyan); c
 }
 
 .scope canvas { display: block; width: 100%; height: 100%; cursor: crosshair; }
+#identityHeatLegend { position: absolute; left: 8px; top: 6px; right: 8px; font-size: 10px; pointer-events: none; }
 
 .scope-head {
   position: absolute; left: 0; top: 0; bottom: 0;
@@ -472,7 +464,6 @@ input[type="checkbox"] { width: 15px; height: 15px; accent-color: var(--cyan); c
   box-shadow: 0 6px 18px rgba(0, 0, 0, 0.3);
 }
 
-/* 播放键是页面上唯一的实心渐变按钮 */
 .tbtn-main {
   flex: 2;
   background: var(--spectrum);
@@ -538,7 +529,6 @@ input[type="checkbox"] { width: 15px; height: 15px; accent-color: var(--cyan); c
   overflow: hidden;
   transition: border-color .18s, background .18s, box-shadow .18s, transform .18s;
 }
-/* 悬停时左侧亮起一道色条，颜色即该裁决的语义色 */
 .pad::before {
   content: "";
   position: absolute; left: 0; top: 0; bottom: 0; width: 2px;
@@ -573,7 +563,6 @@ input[type="checkbox"] { width: 15px; height: 15px; accent-color: var(--cyan); c
 .pad[data-label="singing"]:hover { border-color: var(--warn); box-shadow: 0 8px 22px rgba(255, 180, 84, 0.14); }
 .pad[data-label="skip"]:hover { border-color: var(--ink-3); }
 
-/* 选中态：整块染上语义色，键盘上的字母块反白 */
 .pad.is-set .pad-key { color: #07080f; }
 
 .pad[data-label="correct"].is-set {
@@ -624,6 +613,7 @@ input[type="checkbox"] { width: 15px; height: 15px; accent-color: var(--cyan); c
   border: 1px solid rgba(255, 180, 84, 0.34);
   border-radius: var(--r-sm);
 }
+[hidden] { display: none !important; }
 .trim-title { font-size: 12px; color: var(--warn); }
 .trim-row { display: flex; align-items: center; gap: 8px; }
 .trim-dash { color: var(--ink-3); }
@@ -829,6 +819,10 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 }
 
 @media (max-width: 760px) {
+  #p-review .deck { flex-direction: column; overflow-y: auto; }
+  #p-review .rail { width: 100%; min-width: 0; flex-shrink: 0; }
+  #p-review .rail-play { min-height: 400px; }
+  #p-review .seg-list { max-height: 220px; }
   .rack { height: auto; min-height: 52px; flex-wrap: wrap; gap: 8px; padding: 10px 14px; }
   .rack-brand { flex-shrink: 0; }
   .rack-tail { gap: 5px; }
@@ -843,3 +837,28 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 @media (prefers-reduced-motion: reduce) {
   * { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
 }
+/* 音频质量与说话人探索 */
+.quality-badge { display: inline-block; padding: 3px 7px; border: 1px solid currentColor; border-radius: 6px; font-size: 11px; white-space: nowrap; }
+.quality-gold { color: #e9c969; background: #493a171f; }
+.quality-silver { color: #bdd4ec; background: #21395530; }
+.quality-review { color: #ffa39f; background: #4a202030; }
+#speakerPanel { width: min(760px, 90vw); max-height: 85vh; overflow: auto; color: #edf2ff; background: #151b27; border: 1px solid #46506a; border-radius: 14px; padding: 24px; }
+#speakerPanel::backdrop { background: #030916b8; }
+#speakerStatus { white-space: pre-wrap; overflow-wrap: anywhere; margin: 16px 0; }
+.speaker-card { padding: 16px; margin: 12px 0; border: 1px solid #38445a; border-radius: 10px; }
+.speaker-card p { margin: 8px 0; overflow-wrap: anywhere; }
+.foot-btns { flex-wrap: wrap; }
+.training-panel .run-btns { flex-wrap: wrap; align-items: center; }
+.training-panel .run-btns > button { flex: 0 0 auto; white-space: nowrap; }
+.training-panel #rollbackRole { flex: 1 1 220px; width: auto; min-width: 0; }
+
+/* Corpus tools share Studio's existing surfaces and focus treatment. */
+.wave3-dialog { width: min(760px, 90vw); max-height: 85vh; overflow: auto; padding: 20px; color: var(--text, #e8e8f0); background: #171922; border: 1px solid #424554; border-radius: 14px; }
+.wave3-dialog::backdrop { background: #0009; }
+.wave3-file-list { max-height: 50vh; overflow: auto; margin: 16px 0; }
+.wave3-file-row { display: flex; align-items: center; gap: 10px; padding: 8px; overflow-wrap: anywhere; }
+.wave3-file-row button { color: inherit; background: transparent; border: 0; text-align: left; cursor: pointer; }
+.wave3-dialog input[type=number] { width: 72px; margin: 8px; }
+.line[contenteditable=true] { outline: 1px dashed #9c87d5; border-radius: 6px; cursor: text; }
+.line[contenteditable=true]:focus { outline: 2px solid #b9a0ff; }
+.seg.role-promoted { border-left: 3px solid #61d6a1; }

@@ -332,33 +332,58 @@ class SingingDetector:
                 cursor += hop_seconds
             plans.append((max(span.start, span.end - window_seconds), span.end))
 
-        dirty: list[TimeSpan] = []
+        dirty = self._singing_windows(
+            waveform, plans, window_seconds, threshold,
+            lambda value, message: progress(0.65 * value, message),
+        )
+        regions = _merge_spans(dirty, gap=0.0)
+        local_plans: list[tuple[float, float]] = []
+        for region in regions:
+            cursor = region.start
+            while cursor + 0.8 < region.end:
+                local_plans.append((cursor, cursor + 0.8))
+                cursor += 0.2
+            local_plans.append((max(region.start, region.end - 0.8), region.end))
+        local_dirty = self._singing_windows(
+            waveform, local_plans, 0.8, threshold,
+            lambda value, message: progress(0.65 + 0.35 * value, message),
+        )
+        dirty = []
+        for region in regions:
+            confirmed = [part for part in local_dirty
+                         if region.start <= part.start and part.end <= region.end]
+            # Short context can miss sustained singing. Preserve the coarse
+            # finding when local windows cannot resolve it at all.
+            dirty.extend(confirmed or [region])
+        dirty = _merge_spans(dirty, gap=0.03)
+        progress(1.0, f"歌声扫描完成：{len(dirty)} 段局部污染")
+        return _subtract_spans(spans, dirty), dirty
+
+    def _singing_windows(
+        self,
+        waveform: torch.Tensor,
+        plans: list[tuple[float, float]],
+        window_seconds: float,
+        threshold: float,
+        progress: Callable[[float, str], None],
+    ) -> list[TimeSpan]:
         target_samples = max(32000, int(round(window_seconds * 32000)))
-        progress(0.0, f"歌声扫描 0/{len(plans)}")
+        dirty: list[TimeSpan] = []
         batch_size = 16
         for offset in range(0, len(plans), batch_size):
             batch_plans = plans[offset : offset + batch_size]
-            batch_waveforms: list[torch.Tensor] = []
+            parts: list[torch.Tensor] = []
             for start, end in batch_plans:
-                begin = int(round(start * 32000))
-                finish = int(round(end * 32000))
-                part = waveform[begin:finish]
-                if part.numel() < target_samples:
-                    part = F.pad(part, (0, target_samples - part.numel()))
-                else:
-                    part = part[:target_samples]
-                batch_waveforms.append(part)
+                part = waveform[round(start * 32000):round(end * 32000)]
+                part = F.pad(part, (0, max(0, target_samples - part.numel())))
+                parts.append(part[:target_samples])
             with torch.inference_mode():
-                batch_scores = self.model(torch.stack(batch_waveforms).to(self.device)).float().cpu()
-            for (start, end), scores in zip(batch_plans, batch_scores):
-                singing = float(scores[self.singing_indices].max())
-                speech = float(scores[self.speech_indices].max())
+                scores = self.model(torch.stack(parts).to(self.device)).float().cpu()
+            for (start, end), values in zip(batch_plans, scores):
+                singing = float(values[self.singing_indices].max())
+                speech = float(values[self.speech_indices].max())
                 if singing >= threshold and singing >= speech * 0.80:
                     dirty.append(TimeSpan(start, end))
             completed = min(len(plans), offset + len(batch_plans))
             progress(completed / len(plans), f"歌声扫描 {completed}/{len(plans)}")
-        # Singing predictions often dip below the threshold for a few windows
-        # inside one continuous song. Bridge those short gaps so isolated
-        # vocal fragments are not sent to speaker matching or transcription.
-        dirty = _merge_spans(dirty, gap=3.0)
-        return _subtract_spans(spans, dirty), dirty
+        return dirty

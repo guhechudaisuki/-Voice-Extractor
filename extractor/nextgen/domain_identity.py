@@ -1,10 +1,4 @@
-"""Reference-conditioned, frozen anime-speaker evidence for local speech parts.
-
-This is an independent acoustic witness, not a calibrated open-set classifier.
-The optional exclusion roles are anonymous: their names convey no identity to
-the models. Without exclusions this module abstains rather than treating the
-nearest target reference as proof that no other speaker exists.
-"""
+"""Compare local speech against supplied target and exclusion voices with frozen anime encoders."""
 from __future__ import annotations
 
 from collections import defaultdict
@@ -37,9 +31,7 @@ class ReferenceAudio:
             raise ValueError("Anime reference audio must be resampled to 16 kHz")
         if self.stem.ndim != 1 or self.raw.ndim != 1:
             raise ValueError("Reference audio must be mono")
-        # Existing UVR reference crops can end up to ~35 ms shorter than the
-        # matching original crop. That is acceptable for utterance embeddings,
-        # but a larger difference suggests the files were paired incorrectly.
+        # Allow 35 ms of UVR truncation when pairing utterance references.
         if abs(self.stem.numel() - self.raw.numel()) > self.sample_rate // 20:
             raise ValueError("Reference raw/stem audio must align within 50 ms")
 
@@ -86,9 +78,7 @@ def classify(scores: tuple[ModelViewScore, ...]) -> DomainVerdict:
     if len(supporting) >= 2 and any(row.channel == "stem" for row in supporting):
         return DomainVerdict("target_supported", scores)
 
-    # A negative identity is only a local witness when the same user-supplied
-    # role wins in both differently trained stem models and in a raw view.
-    # Different roles winning separate models are disagreement, not certainty.
+    # Require the same exclusion role to win both stem models and one raw view.
     stem = [row for row in scores if row.channel == "stem"]
     if (stem[0].nearest_role is not None
             and stem[0].nearest_role == stem[1].nearest_role
@@ -149,6 +139,19 @@ class DomainReferenceBank:
         self.encoders = dict(encoders)
         self.roles = tuple(sorted({item.role for item in unique if item.role != "target"}))
         self.vectors = {key: np.stack(rows) for key, rows in grouped.items()}
+        self.target_floors: dict[tuple[str, str], float] = {}
+        for variant in VARIANTS:
+            for channel in CHANNELS:
+                targets = self.vectors[(variant, channel, "target")]
+                if len(targets) >= 2:
+                    similarities = targets @ targets.T
+                    off_diagonal = similarities[~np.eye(len(targets), dtype=bool)]
+                    lower, upper = (0.28, 0.45) if variant == "char" else (0.18, 0.35)
+                    floor = float(np.clip(np.quantile(off_diagonal, 0.20) - 0.04,
+                                          lower, upper))
+                else:
+                    floor = 0.32 if variant == "char" else 0.20
+                self.target_floors[(variant, channel)] = floor
 
     def score(self, *, stem: torch.Tensor, raw: torch.Tensor,
               sample_rate: int) -> DomainVerdict:
@@ -161,12 +164,21 @@ class DomainReferenceBank:
             for channel in CHANNELS:
                 vector = encoder.encode(stem if channel == "stem" else raw,
                                         sample_rate=sample_rate)
-                target = float(np.median(self.vectors[(variant, channel, "target")] @ vector))
-                role_scores = {
-                    role: float((self.vectors[(variant, channel, role)] @ vector).max())
-                    for role in self.roles
-                }
-                nearest_role = (max(role_scores, key=role_scores.get) if role_scores else None)
+                dots = self.vectors[(variant, channel, "target")] @ vector
+                target = (max(float(np.median(dots)),
+                              float(np.sort(dots)[-2:].mean()) - 0.02)
+                          if len(dots) >= 2 else float(dots[0]))
+                role_scores = {}
+                for role in self.roles:
+                    r_dots = self.vectors[(variant, channel, role)] @ vector
+                    role_scores[role] = (float(np.sort(r_dots)[-2:].mean())
+                                         if len(r_dots) >= 3 else float(r_dots.max()))
+                if not self.roles:
+                    nearest_other = self.target_floors[(variant, channel)]
+                    nearest_role = "baseline_floor"
+                else:
+                    nearest_role = max(role_scores, key=role_scores.get)
+                    nearest_other = role_scores[nearest_role]
                 scores.append(ModelViewScore(variant, channel, target,
-                                             role_scores.get(nearest_role), nearest_role))
+                                             nearest_other, nearest_role))
         return classify(tuple(scores))

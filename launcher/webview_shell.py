@@ -1,12 +1,7 @@
-"""桌面端 WebView2 套壳：无边框窗口里加载本机的 WebUI。
+"""Host the local WebUI in WebView2 or an Edge application window.
 
-为什么套壳：tkinter 能做的视觉上限很低（没有 CSS、没有阴影、渐变要逐像素画），
-而两个界面各维护一套代码会导致功能不同步。套壳之后桌面端与网页端是同一份
-界面代码，功能和外观天然一致。
-
-依赖 Microsoft Edge WebView2 运行时（Windows 11 与打过补丁的 Windows 10 自带）。
-没有它时本模块返回失败，由调用方回退到原来的 tkinter 界面——不能让桌面端
-因为缺少一个可选依赖就打不开。
+Return a nonzero status when neither backend can open, allowing the launcher
+to fall back to the native desktop interface.
 
 用法：
 
@@ -32,8 +27,8 @@ BASE_DIR = Path(os.environ.get("VOICE_EXTRACT_DATA_ROOT", LAUNCHER_DIR.parent))
 SETTINGS_PATH = BASE_DIR / "voice_extractor_settings.json"
 SERVER_PY = LAUNCHER_DIR / "webui_server.py"
 
-# 与网页版 CSS 的 --bg 保持一致，窗口底色相同才不会在加载时闪白。
-WINDOW_BG = "#0c0d10"
+# Match studio.css to avoid a white flash during loading.
+WINDOW_BG = "#07080f"
 
 
 def load_port() -> int:
@@ -64,7 +59,7 @@ def wait_for_server(port: int, timeout: float = 40.0, process=None) -> bool:
 
 
 def server_is_healthy(port: int, timeout: float = 2.0) -> bool:
-    """确认端口后面真的是本项目的服务，而不是恰好占用了同一端口的别人。"""
+    """Check the settings endpoint before reusing an occupied port."""
     try:
         with urllib.request.urlopen(
             f"http://127.0.0.1:{port}/api/settings", timeout=timeout
@@ -76,7 +71,7 @@ def server_is_healthy(port: int, timeout: float = 2.0) -> bool:
 
 
 def start_server(port: int) -> subprocess.Popen | None:
-    """在后台拉起 WebUI 服务。已经在跑就返回 None。"""
+    """Start a background server, or return None when one is already healthy."""
     if not 1 <= port <= 65535:
         raise ValueError("WebUI 端口必须在 1–65535 之间")
     if port_is_open(port):
@@ -136,8 +131,7 @@ def run_shell(port: int) -> int:
         text_select=False,
     )
 
-    # 无边框 + 自绘标题栏只有在 pywebview 的 edgechromium 后端才稳，
-    # 这里保持系统边框，避免不同 WebView2 版本上出现拖不动或关不掉的情况。
+    # Native borders preserve window controls across WebView2 versions.
     try:
         webview.start(
             gui="edgechromium",
@@ -185,7 +179,7 @@ def main(argv=None) -> int:
         print(str(exc), file=sys.stderr)
         return 3
     finally:
-        # 服务由外部启动时不要关它；自己起的在窗口关闭后收掉。
+        # Only stop the server started by this process.
         if owned is not None and owned.poll() is None:
             try:
                 with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/lifecycle", timeout=2) as response:

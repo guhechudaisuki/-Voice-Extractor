@@ -5,11 +5,7 @@ from pathlib import Path
 import numpy as np
 
 def load_review(path: Path | None, *, source_sha256: str | None = None) -> list[dict]:
-    """读用户试听结论。
-
-    真实文件用的是 excluded_clips[]，每条有 span 与 reason；部分错误的那条
-    额外带 negative_span。这里统一成 [{span, kind}] 列表，不依赖 reason 的文字。
-    """
+    """Normalize excluded_clips and optional negative_span labels into span/kind rows."""
     if path is None:
         return []
     data = json.loads(path.read_text(encoding="utf-8"))
@@ -21,7 +17,7 @@ def load_review(path: Path | None, *, source_sha256: str | None = None) -> list[
         span = row.get("span") or [row.get("start"), row.get("end")]
         if not span or len(span) != 2 or span[0] is None or span[1] is None:
             continue
-        # 带 negative_span 的是"部分非目标"：整句有一半是别人。
+        # negative_span 标记句内污染，而非整句身份错误。
         kind = row.get("kind") or (
             "mixed" if row.get("negative_span") else "entire_other"
         )
@@ -83,9 +79,80 @@ def review_clip(row: dict, turns, result) -> dict:
     }
 
 
+def _member_angular_geometry(turns, indexes):
+    """Store exact pairwise angles without exporting the encoder vectors."""
+    count = len(indexes)
+    if count < 2:
+        return None
+    distances = np.zeros((count, count), dtype=np.float64)
+    supports = np.zeros((count, count), dtype=np.int32)
+    channels = []
+    for channel in ("primary", "secondary", "tertiary"):
+        valid, vectors = [], []
+        dimension = None
+        for position, index in enumerate(indexes):
+            raw = getattr(turns[index], channel, None)
+            if raw is None:
+                continue
+            vector = np.asarray(raw, dtype=np.float64)
+            if vector.ndim != 1 or not vector.size or not np.isfinite(vector).all():
+                continue
+            norm = float(np.linalg.norm(vector))
+            if norm == 0 or (dimension is not None and vector.size != dimension):
+                continue
+            dimension = vector.size
+            valid.append(position)
+            vectors.append(vector / norm)
+        if len(valid) < 2:
+            continue
+        matrix = np.stack(vectors)
+        angles = np.arccos(np.clip(matrix @ matrix.T, -1., 1.)) / np.pi
+        selected = np.ix_(valid, valid)
+        distances[selected] += angles
+        supports[selected] += 1
+        channels.append(channel)
+    if not channels:
+        return None
+    upper = np.triu_indices(count, 1)
+    return {
+        "method": "mean_multiview_angular_distance",
+        "member_indexes": list(indexes),
+        "channels": channels,
+        "upper_triangle": [round(float(total / support), 6) if support else None
+                           for total, support in zip(distances[upper], supports[upper])],
+    }
+
+
 def summarize(result, turns, review: list[dict]) -> dict:
     """把判决结果整理成可读报告，重点是"错人的段落在哪个簇"。"""
     clusters = []
+    def normalized(vector):
+        vector = np.asarray(vector, dtype=np.float64)
+        return vector / max(float(np.linalg.norm(vector)), 1e-12)
+
+    centroids = {c.cluster_id: (normalized(c.primary_centroid), normalized(c.secondary_centroid))
+                 for c in result.clusters}
+
+    def member_geometry(index, cluster):
+        turn = turns[index]
+        p, s = normalized(turn.primary), normalized(turn.secondary)
+        own_pc, own_sc = centroids[cluster.cluster_id]
+        own_p, own_s = float(p @ own_pc), float(s @ own_sc)
+        others = [c for c in result.clusters if c.cluster_id != cluster.cluster_id
+                  and not (cluster.is_target and c.is_target)]
+        nearest_p = max(((float(p @ centroids[c.cluster_id][0]), c.cluster_id) for c in others),
+                        default=None)
+        nearest_s = max(((float(s @ centroids[c.cluster_id][1]), c.cluster_id) for c in others),
+                        default=None)
+        margin_p = own_p - nearest_p[0] if nearest_p else None
+        margin_s = own_s - nearest_s[0] if nearest_s else None
+        return {"primary_cluster_score": round(own_p, 5),
+                "secondary_cluster_score": round(own_s, 5),
+                "distinctiveness_margin": round(min(margin_p, margin_s), 5) if nearest_p else None,
+                "cluster_margin_primary": round(margin_p, 5) if nearest_p else None,
+                "cluster_margin_secondary": round(margin_s, 5) if nearest_s else None,
+                "nearest_cluster_primary": nearest_p[1] if nearest_p else None,
+                "nearest_cluster_secondary": nearest_s[1] if nearest_s else None}
     for cluster in result.clusters:
         members = [
             {
@@ -94,17 +161,25 @@ def summarize(result, turns, review: list[dict]) -> dict:
                     round(turns[index].start, 3), round(turns[index].end, 3),
                 ],
                 "speech_seconds": round(turns[index].speech_seconds, 3),
+                **member_geometry(index, cluster),
                 "accepted_by_cluster": bool(
                     result.membership[index] and index in set(cluster.members)
                 ),
             }
             for index in cluster.members
         ]
+        # Discovery needs geometric outliers separately from target-membership outliers.
+        secondary_median = float(np.median([m["secondary_cluster_score"] for m in members])) if members else 0.
+        discovery_outliers = [m["index"] for m in members
+                              if m["primary_cluster_score"] < cluster.primary_median - .18
+                              or m["secondary_cluster_score"] < secondary_median - .18]
+        margins = [m["distinctiveness_margin"] for m in members if m["distinctiveness_margin"] is not None]
         clusters.append(
             {
                 "cluster_id": cluster.cluster_id,
                 "member_count": len(cluster.members),
                 "total_speech_seconds": cluster.total_speech_seconds,
+                "reference_prior_weight": cluster.prior_weight,
                 "primary_cohesion": cluster.primary_cohesion,
                 "primary_median": cluster.primary_median,
                 "target_score": cluster.target_score,
@@ -115,6 +190,9 @@ def summarize(result, turns, review: list[dict]) -> dict:
                 "target_margin": cluster.target_margin,
                 "is_target": cluster.is_target,
                 "outliers": list(cluster.outliers),
+                "discovery_outliers": discovery_outliers,
+                "distinctiveness_margin": float(np.median(margins)) if margins else None,
+                "member_acoustic_geometry": _member_angular_geometry(turns, cluster.members),
                 "members": members,
             }
         )

@@ -42,11 +42,7 @@ class SpeechIsland:
 
 @dataclass(frozen=True)
 class AcousticGap:
-    """A real pause located by an independent waveform/VAD boundary check.
-
-    The change head only requests an inspection here. A caller must explicitly
-    certify both endpoints; a nearby low energy sample alone cannot do that.
-    """
+    """A waveform/VAD pause with independently verified speech endpoints."""
     span: SampleSpan
     left_complete: bool
     right_complete: bool
@@ -64,12 +60,7 @@ def propose_change_parts(
     parent: Candidate, frames: tuple[FramePrediction, ...], gaps: tuple[AcousticGap, ...],
     *, change_min: float, tolerance_samples: int,
 ) -> tuple[Candidate, ...]:
-    """Keep the parent and propose independently reviewable speech parts.
-
-    The frame score does not grant a sample-exact cut. Only a verified local
-    pause with independently complete neighboring speech edges can be used.
-    Fragments remain alternatives until the new exact spans are reviewed.
-    """
+    """Retain the parent and propose children at verified acoustic pauses."""
     if (not math.isfinite(change_min) or not 0 <= change_min <= 1
             or type(tolerance_samples) is not int or tolerance_samples < 0):
         raise ValueError("Invalid calibrated change rule")
@@ -113,12 +104,7 @@ def propose_change_parts(
 def propose_unresolved_change_sides(
     parent: Candidate, frames: tuple[FramePrediction, ...], *, change_min: float,
 ) -> tuple[Candidate, ...]:
-    """Preserve both identities around a continuous, unverified voice change.
-
-    The high-change cells remain an unknown band. These proposals deliberately
-    have incomplete inner endpoints, so they can gather local evidence but can
-    never be exported until a separate boundary refinement verifies the cut.
-    """
+    """Propose both sides of an unresolved change with incomplete inner endpoints."""
     if not math.isfinite(change_min) or not 0 <= change_min <= 1:
         raise ValueError("Invalid calibrated change rule")
     if any(a.span.end > b.span.start for a, b in zip(frames, frames[1:])):
@@ -174,15 +160,12 @@ def propose(
             if last > first and silence.kind(right.span.start - islands[last - 1].span.end) == "hard_split":
                 break
             span = SampleSpan(left.span.start, right.span.end)
-            # Limit combinatorial multi-island joins, not a single intact VAD
-            # island: silently dropping a long utterance loses all recall and
-            # cannot be repaired by later boundary or identity review.
+            # Limit multi-island joins while retaining intact long utterances.
             if span.length > maximum_samples and last > first:
                 break
             if any(span.intersection(mask) for mask in blocked):
                 break
-            # Tiny gaps do not authorize partial-utterance exports. Those
-            # atomic alternatives remain available for further boundary work.
+            # Keep atomic alternatives for independent boundary review.
             valid_start = first == 0 or silence.kind(left.span.start - islands[first - 1].span.end) != "inside_utterance"
             valid_end = last == len(islands) - 1 or silence.kind(islands[last + 1].span.start - right.span.end) != "inside_utterance"
             proposals.append(Candidate(
@@ -199,11 +182,7 @@ def propose(
 def select_verified(
     candidates: tuple[Candidate, ...], assessments: tuple[Assessment, ...],
 ) -> tuple[Candidate, ...]:
-    """Maximize unique verified speech samples; silence is never a reward.
-
-    Weighted interval scheduling avoids greedy long candidates deleting two
-    better complete alternatives. Ties prefer fewer files, then stable keys.
-    """
+    """Maximize verified speech coverage; ties prefer fewer files, then stable keys."""
     if len({row.key for row in candidates}) != len(candidates):
         raise ValueError("Duplicate candidate keys")
     if len({(row.source_sha256, row.sample_rate) for row in candidates}) > 1:

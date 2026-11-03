@@ -1,10 +1,4 @@
-"""Pure candidate assessment. Thresholds must come from a calibration artifact.
-
-No arithmetic mean of local identity scores authorizes output. Definite local
-contamination wins over the learned span-purity score. Unobservable consonants
-are not required to carry a standalone speaker embedding: the contextual purity
-head must support the entire span, and acoustic endpoints must be complete.
-"""
+"""Assess complete candidates using calibrated thresholds and local contamination evidence."""
 from __future__ import annotations
 
 import math
@@ -110,8 +104,7 @@ def assess(
                           tuple([item.span for item in hard] + contamination), calibration.version)
     reasons: list[str] = []
     risk: list[SampleSpan] = []
-    # Check the entire exported span, including VAD-negative gaps: those gaps
-    # can contain a missed short other-speaker sound. Context is not output.
+    # Audit VAD-negative gaps too; short competing speech may have escaped VAD.
     for speech in (candidate.output,):
         coverage = [part for frame in frames
                     if (part := frame.span.intersection(speech)) is not None]
