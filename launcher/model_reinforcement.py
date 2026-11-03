@@ -134,324 +134,6 @@ def rebind_classifier_references(items, progress, *, classifier_path: Path | Non
             'reference_sets': payload['calibration_reference_sets'], 'scope': 'universal'}
 
 
-def _negative_matrix(values, name):
-    import numpy as np
-    matrix = np.asarray(values, dtype=np.float64)
-    if matrix.ndim != 2 or not matrix.shape[1] or not np.isfinite(matrix).all():
-        raise ValueError(f"负例原型 {name} 维度或数值无效，历史原型未修改")
-    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
-    if np.any(norms <= 1e-12):
-        raise ValueError(f"负例原型 {name} 含零向量，历史原型未修改")
-    return matrix / np.maximum(norms, 1e-12)
-
-
-def _read_negative_prototypes(path):
-    """Read legacy libraries as well as the cumulative-support schema."""
-    import numpy as np
-    if not path.is_file():
-        return None, None, [], set()
-    try:
-        with np.load(path, allow_pickle=False) as data:
-            primary = _negative_matrix(data['primary'], 'primary')
-            secondary = _negative_matrix(data['secondary'], 'secondary')
-            if len(primary) != len(secondary):
-                raise ValueError('负例原型双通道数量不一致')
-            counts = np.asarray(data.get('support_counts', data.get('new_counts',
-                                np.ones(len(primary)))), dtype=np.float64)
-            if (counts.shape != (len(primary),) or not np.isfinite(counts).all()
-                    or np.any(counts < 0) or np.any(counts != np.floor(counts))
-                    or np.any(counts >= np.iinfo(np.int64).max)):
-                raise ValueError('负例原型支持度无效')
-            # Legacy new_counts recorded only that run, including zeros for
-            # untouched historical speakers. Every existing prototype has
-            # at least one supporting sample.
-            counts = np.maximum(counts, 1).astype(np.int64).tolist()
-            hashes = np.asarray(data.get('sample_sha256', []))
-            if hashes.ndim != 1:
-                raise ValueError('负例原型样本索引无效')
-            seen = {str(value) for value in hashes}
-            if any(len(value) != 64 or any(c not in '0123456789abcdef' for c in value)
-                   for value in seen):
-                raise ValueError('负例原型样本哈希无效')
-        return primary, secondary, counts, seen
-    except (OSError, ValueError, KeyError, EOFError) as exc:
-        raise ValueError(f'无法读取历史负例原型，已保留原文件：{exc}') from exc
-
-
-def _extract_negative_embeddings(paths, progress):
-    """Keep model loading separate from the persistent-library transaction."""
-    import numpy as np
-    import torch
-    from extractor.speaker import CAMPlusVerifier, SpeakerVerifier
-    from extractor.audio import load_mono
-    from extractor.config import ASSET_ROOT
-    from extractor.nextgen.anime_embedding import AnimeSpeakerOnnx, _MODEL_FILES
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    primary = secondary = None
-    anime = {}
-    try:
-        primary = SpeakerVerifier(device=device)
-        secondary = CAMPlusVerifier(device=device)
-        models = ASSET_ROOT / 'models'
-        if all((models / path).is_file() for path in _MODEL_FILES.values()):
-            for variant in ('char', 'va'):
-                anime['anime_' + variant] = AnimeSpeakerOnnx(models, variant, device=device)
-        else:
-            progress('动漫声纹模型未安装，保留已有动漫原型，本次仅更新常规原型')
-        vectors = {name: [] for name in ('primary', 'secondary', *anime)}
-        for index, path in enumerate(paths, 1):
-            wave = load_mono(Path(path), 16000)
-            vectors['primary'].append(primary._embedding_from_waveform(wave).detach().cpu().numpy().reshape(-1))
-            vectors['secondary'].append(secondary._embedding_from_waveform(wave).detach().cpu().numpy().reshape(-1))
-            for name, encoder in anime.items():
-                vectors[name].append(encoder.encode(wave, sample_rate=16000))
-            if index % 20 == 0:
-                progress(f'负例原型提取 {index}/{len(paths)}')
-        return {name: np.asarray(rows) for name, rows in vectors.items()}
-    finally:
-        if primary is not None:
-            primary.close()
-        if secondary is not None:
-            secondary.close()
-        for encoder in anime.values():
-            encoder.close()
-
-
-def _read_anime_prototypes(path, count):
-    """Missing views have zero support; their storage rows are never embeddings."""
-    import numpy as np
-    views = {}
-    if not path.is_file():
-        return views
-    with np.load(path, allow_pickle=False) as data:
-        for channel in ('anime_char', 'anime_va'):
-            if channel not in data:
-                continue
-            matrix = np.asarray(data[channel], dtype=np.float64)
-            support = np.asarray(data.get(channel + '_support_counts', np.ones(count)), dtype=np.float64)
-            if (matrix.shape != (count, 192) or support.shape != (count,)
-                    or not np.isfinite(matrix).all() or not np.isfinite(support).all()
-                    or np.any(support < 0) or np.any(support != np.floor(support))
-                    or np.any(support >= np.iinfo(np.int64).max)):
-                raise ValueError(f'历史 {channel} 原型或支持度无效，原文件未修改')
-            valid = support > 0
-            matrix[valid] = _negative_matrix(matrix[valid], channel)
-            matrix[~valid] = 0.
-            views[channel] = (matrix, support.astype(np.int64))
-    return views
-
-
-def _merge_negative_prototypes(old_primary, old_secondary, support_counts,
-                               new_primary, new_secondary, *, old_views=None, new_views=None):
-    """Primary cosine drives identity; both channels get a 0.2 moving update."""
-    import numpy as np
-    fresh_p = _negative_matrix(new_primary, 'new primary')
-    fresh_s = _negative_matrix(new_secondary, 'new secondary')
-    if len(fresh_p) != len(fresh_s):
-        raise ValueError('新负例双通道数量不一致')
-    if old_primary is not None and (old_primary.shape[1] != fresh_p.shape[1]
-                                   or old_secondary.shape[1] != fresh_s.shape[1]):
-        raise ValueError('负例原型维度与当前模型不一致，历史原型未修改')
-    primary = [] if old_primary is None else list(old_primary.copy())
-    secondary = [] if old_secondary is None else list(old_secondary.copy())
-    counts = list(support_counts)
-    new_counts = [0] * len(counts)
-    extra_views = old_views is not None or new_views is not None
-    old_views, new_views = old_views or {}, new_views or {}
-    fresh_views, view_vectors, view_supports = {}, {}, {}
-    for channel in sorted(set(old_views) | set(new_views)):
-        if channel in new_views:
-            fresh_views[channel] = _negative_matrix(new_views[channel], channel)
-            if fresh_views[channel].shape != (len(fresh_p), 192):
-                raise ValueError(f'{channel} 嵌入维度或数量与音频不一致')
-        old, supports = old_views.get(channel, (np.zeros((len(counts), 192)), np.zeros(len(counts))))
-        if old.shape != (len(counts), 192) or len(supports) != len(counts):
-            raise ValueError(f'{channel} 历史原型未与常规通道对齐')
-        view_vectors[channel], view_supports[channel] = list(old.copy()), list(supports)
-    added = 0
-    for index, (vector_p, vector_s) in enumerate(zip(fresh_p, fresh_s)):
-        similarities = np.asarray(primary) @ vector_p if primary else np.empty(0)
-        best = int(np.argmax(similarities)) if len(similarities) else -1
-        if best >= 0 and similarities[best] >= .82:
-            for vectors, fresh in ((primary, vector_p), (secondary, vector_s)):
-                merged = .8 * vectors[best] + .2 * fresh
-                vectors[best] = merged / np.linalg.norm(merged)
-            counts[best] += 1
-            new_counts[best] += 1
-        else:
-            best = len(primary)
-            primary.append(vector_p.copy())
-            secondary.append(vector_s.copy())
-            counts.append(1)
-            new_counts.append(1)
-            added += 1
-            for channel in view_vectors:
-                view_vectors[channel].append(np.zeros(192))
-                view_supports[channel].append(0)
-        for channel, fresh in fresh_views.items():
-            previous = view_vectors[channel][best]
-            merged = (.8 * previous + .2 * fresh[index]
-                      if view_supports[channel][best] else fresh[index].copy())
-            norm = np.linalg.norm(merged)
-            if norm <= 1e-12:
-                raise ValueError(f'{channel} 原型更新发生方向抵消，历史原型未修改')
-            view_vectors[channel][best] = merged / norm
-            view_supports[channel][best] += 1
-    # Stable order resolves equal-support ties in favour of historical memory.
-    keep = sorted(range(len(counts)), key=lambda i: (-counts[i], i))[:64]
-    result = (np.asarray(primary, dtype=np.float32)[keep],
-            np.asarray(secondary, dtype=np.float32)[keep],
-            np.asarray(counts, dtype=np.int64)[keep],
-            np.asarray(new_counts, dtype=np.int64)[keep], added)
-    if extra_views:
-        views = {channel: (np.asarray(rows, dtype=np.float32)[keep],
-                          np.asarray(view_supports[channel], dtype=np.int64)[keep])
-                 for channel, rows in view_vectors.items()}
-        return (*result, views)
-    return result
-
-
-def update_auto_negative_prototypes(items, model_dir: Path, progress, *, status=None, replay_vectors=None) -> int:
-    """Merge unique wrong-speaker clips into aligned multiview memory.
-
-    A primary cosine of at least 0.82 updates an existing speaker by a moving
-    average. Otherwise a new prototype is added. Cumulative sample support
-    selects the strongest 64 prototypes. The enclosing training operation
-    already holds reinforcement_lock for the installed model.
-    """
-    import numpy as np
-    import tempfile
-    wrong = [item for item in items if item.get('review', {}).get('label') == 'wrong']
-    if not wrong:
-        if status is not None:
-            status.update(state='no_wrong_samples', channels={})
-        return 0
-    model_dir = Path(model_dir)
-    existing = model_dir / 'auto_negatives.npz'
-    old_p, old_s, counts, seen = _read_negative_prototypes(existing)
-    old_views = _read_anime_prototypes(existing, len(counts))
-    from extractor.config import ASSET_ROOT
-    from extractor.nextgen.anime_embedding import _MODEL_FILES
-    anime_available = all((ASSET_ROOT / 'models' / path).is_file()
-                          for path in _MODEL_FILES.values())
-    missing_anime = any(channel not in old_views or np.any(old_views[channel][1] == 0)
-                        for channel in ('anime_char', 'anime_va'))
-    pending, backfill = {}, {}
-    for item in sorted(wrong, key=lambda value: str(value['path'])):
-        checksum = str(item.get('sha256') or '').lower()
-        if len(checksum) != 64 or any(c not in '0123456789abcdef' for c in checksum):
-            checksum = file_sha256(Path(item['path']))
-        if checksum not in seen:
-            pending.setdefault(checksum, Path(item['path']))
-        elif anime_available and missing_anime:
-            backfill.setdefault(checksum, Path(item['path']))
-    if not pending and not backfill:
-        progress('负例原型无需更新：本次错人音频均已学习')
-        if status is not None:
-            status.update(state='already_learned', channels={
-                channel: 'preserved' if channel in ('primary', 'secondary') or channel in old_views else 'unavailable'
-                for channel in ('primary', 'secondary', 'anime_char', 'anime_va')})
-        return 0
-    requested = [*pending.values(), *backfill.values()]
-    by_path = {str(item['path']):item['sha256'] for item in wrong}
-    stored = [dict((replay_vectors or {}).get(by_path[str(p)], {})) for p in requested]
-    if replay_vectors:
-        missing = [i for i, views in enumerate(stored) if not {'primary', 'secondary'} <= views.keys()]
-        if missing:
-            fresh = _extract_negative_embeddings([requested[i] for i in missing], progress)
-            if not isinstance(fresh, dict):
-                fresh = dict(zip(('primary', 'secondary'), fresh))
-            for offset, index in enumerate(missing):
-                stored[index] = {channel: matrix[offset] for channel, matrix in fresh.items()}
-        channels = set.intersection(*(set(v) for v in stored))
-        extracted = {c:np.stack([np.asarray(v[c]) for v in stored]) for c in channels}
-    else:
-        extracted = _extract_negative_embeddings(requested, progress)
-    if isinstance(extracted, dict):
-        fresh_p, fresh_s = extracted['primary'], extracted['secondary']
-        fresh_views = {name: extracted[name] for name in ('anime_char', 'anime_va') if name in extracted}
-    else:
-        fresh_p, fresh_s = extracted
-        fresh_views = {}
-    if len(fresh_p) != len(requested) or len(fresh_s) != len(requested):
-        raise ValueError('负例嵌入数量与音频不一致，历史原型未修改')
-    new_size = len(pending)
-    if pending:
-        primary, secondary, supports, new_counts, added, views = _merge_negative_prototypes(
-            old_p, old_s, counts, fresh_p[:new_size], fresh_s[:new_size], old_views=old_views,
-            new_views={channel: matrix[:new_size] for channel, matrix in fresh_views.items()})
-    else:
-        primary, secondary = old_p.copy(), old_s.copy()
-        supports, new_counts = np.asarray(counts, dtype=np.int64), np.zeros(len(counts), dtype=np.int64)
-        added = 0
-        views = {channel: (matrix.copy(), support.copy())
-                 for channel, (matrix, support) in old_views.items()}
-    backfilled = set()
-    if backfill and fresh_views:
-        probes_p = _negative_matrix(fresh_p[new_size:], 'backfill primary')
-        probes_s = _negative_matrix(fresh_s[new_size:], 'backfill secondary')
-        for channel, matrix in fresh_views.items():
-            probes = _negative_matrix(matrix[new_size:], channel)
-            if probes.shape != (len(backfill), 192):
-                raise ValueError(f'{channel} 补齐嵌入维度或数量与音频不一致')
-            vectors, support = views.setdefault(channel, (
-                np.zeros((len(primary), 192), dtype=np.float32),
-                np.zeros(len(primary), dtype=np.int64)))
-            missing = support == 0
-            for index, (probe_p, probe_s) in enumerate(zip(probes_p, probes_s)):
-                matches_p, matches_s = primary @ probe_p, secondary @ probe_s
-                best = int(np.argmax(matches_p))
-                # Legacy libraries have no clip-to-prototype map. Both views must
-                # select the same existing speaker before filling an absent view.
-                if (matches_p[best] < .82 or best != int(np.argmax(matches_s))
-                        or not missing[best]):
-                    continue
-                merged = (.8 * vectors[best] + .2 * probes[index]
-                          if support[best] else probes[index])
-                norm = float(np.linalg.norm(merged))
-                if norm <= 1e-12:
-                    raise ValueError(f'{channel} 补齐原型发生方向抵消，历史原型未修改')
-                vectors[best] = merged / norm
-                support[best] += 1
-                backfilled.add(channel)
-    if not pending and not backfilled:
-        progress('动漫记忆尚未补齐：本次旧样本没有与缺失原型形成双通道一致匹配')
-        if status is not None:
-            status.update(state='backfill_pending', samples=0, channels={
-                channel: 'preserved' if channel in ('primary', 'secondary') or channel in old_views else 'unavailable'
-                for channel in ('primary', 'secondary', 'anime_char', 'anime_va')})
-        return 0
-    extra = {key: value for channel, (matrix, channel_counts) in views.items()
-             for key, value in ((channel, matrix), (channel + '_support_counts', channel_counts))}
-    model_dir.mkdir(parents=True, exist_ok=True)
-    descriptor, name = tempfile.mkstemp(prefix='.auto_negatives_', suffix='.tmp', dir=model_dir)
-    temporary = Path(name)
-    try:
-        # Passing a handle prevents numpy silently appending '.npz' to '.tmp'.
-        with os.fdopen(descriptor, 'wb') as stream:
-            # Only numeric arrays and validated content hashes cross this boundary.
-            np.savez(stream, primary=primary, secondary=secondary,
-                     support_counts=supports, new_counts=new_counts,
-                     sample_sha256=np.asarray(sorted(seen | set(pending)), dtype='U64'),
-                     schema=np.asarray(3, dtype=np.int32), **extra)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, existing)
-    finally:
-        temporary.unlink(missing_ok=True)
-    progress(f'负例原型库已更新：共 {len(primary)} 个原型；本次新增样本 {len(pending)} 条')
-    if backfilled:
-        progress('已补齐历史原型的动漫证据，常规声纹与累计样本支持数未重复更新')
-    if status is not None:
-        status.update(state='updated', samples=len(pending), prototypes=len(primary),
-                      channels={channel: 'updated' if (pending and channel in ('primary', 'secondary'))
-                                or (pending and channel in fresh_views) or channel in backfilled
-                                else 'preserved' if channel in ('primary', 'secondary') or channel in views else 'unavailable'
-                                for channel in ('primary', 'secondary', 'anime_char', 'anime_va')})
-    return added
-
-
-
 def train(paths: list[Path], destination: Path, progress, *, model_path: Path | None = None) -> dict:
     from extractor.config import WAVLM_SV_MODEL
     current = Path(model_path) if model_path else active_speaker_path(WAVLM_SV_MODEL)
@@ -516,11 +198,11 @@ def source_groups(items):
     return [find(group) for group in groups]
 
 
-def _update_global_memory(directory, bank, chosen, current_items, group_by_key, held_out,
+def _calibrate_global_classifier(directory, bank, current_items, group_by_key, held_out,
                         report, progress, *, snapshot=True):
-    """Publish non-gradient updates independently of projection validation.
+    """Calibrate the classifier independently of projection validation.
 
-    Held-out sources never enter either the prototypes or classifier calibration.
+    Held-out sources never enter classifier calibration.
     Pending samples remain pending for future multi-source gradient training.
     """
     reserved = {source for source, split in bank.get('source_split', {}).items() if split == 'holdout'}
@@ -533,24 +215,6 @@ def _update_global_memory(directory, bank, chosen, current_items, group_by_key, 
     if snapshot:
         snapshot_global_models(active_speaker_path(directory), CLASSIFIER_V2_MODEL)
     training_items = [current_items[k] for k in chosen if k in current_items]
-    try:
-        memory = report['negative_memory'] = {}
-        # Historical audio may already be deleted; cached vectors remain usable.
-        prototype_items = [(current_items[k] if k in current_items else
-                            {**bank['entries'][k]['item'], 'path': 'replay:'+k})
-                           for k in chosen if k in current_items or
-                           {'primary', 'secondary'} <= bank['entries'][k].get('vectors', {}).keys()]
-        replay_vectors = {bank['entries'][k]['item']['sha256']:bank['entries'][k]['vectors']
-                          for k in chosen if bank['entries'][k].get('vectors')}
-        update_auto_negative_prototypes(prototype_items or training_items, directory, progress,
-                                        status=memory, replay_vectors=replay_vectors)
-        report['channel_updates'].update({
-            channel: 'memory_' + state for channel, state in memory.get('channels', {}).items()})
-    except Exception as exc:  # 原型库失败不影响已完成的模型强化
-        report['negative_memory'] = {'state': 'failed', 'error': str(exc)}
-        report['channel_updates'].update({name: 'failed' for name in (
-            'primary', 'secondary', 'anime_char', 'anime_va')})
-        progress(f"负例原型库更新失败（其他已完成通道不受影响）: {type(exc).__name__}: {exc}")
     try:
         from extractor.config import CLASSIFIER_V2_MODEL
         classifier = Path(CLASSIFIER_V2_MODEL)
@@ -680,7 +344,7 @@ def _train_current(paths, destination, progress, current, *, items=None):
 
     current_items = {sample_fingerprint(item):item for item in selected}
     added = []
-    for item in selected:
+    for index, item in enumerate(selected):
         key = sample_fingerprint(item)
         if key in bank['entries']:
             continue
@@ -692,18 +356,11 @@ def _train_current(paths, destination, progress, current, *, items=None):
             bank['entries'][key]['calibration_references'] = torch.cat([
                 reference_features[file_sha256(Path(p))] for p in item['reference_paths']])
             added.append(key)
+        if (index + 1) % 10 == 0 or index + 1 == len(selected):
+            progress(f'声纹特征已提取 {index + 1}/{len(selected)}')
     del encoder
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    if added:
-        try:
-            vectors = _extract_negative_embeddings([current_items[k]['path'] for k in added],progress)
-            for index,key in enumerate(added):
-                bank['entries'][key]['vectors'] = {
-                    name:torch.as_tensor(matrix[index]).float().cpu() for name,matrix in vectors.items()}
-        except Exception as exc:
-            report['replay_auxiliary_error'] = str(exc)
-            progress(f'辅助声纹特征暂不可用，已保留 WavLM 经验特征：{exc}')
     keys = list(bank['entries'])
     all_items = [bank['entries'][k]['item'] for k in keys]
     groups = source_groups(all_items)
@@ -713,7 +370,7 @@ def _train_current(paths, destination, progress, current, *, items=None):
                   source_count=len(set(groups)), source_fingerprints_complete=all(i.get('source_sha256') for i in all_items))
     # Pending samples survive a failed cold-start validation without changing weights.
     if not held_out:
-        _update_global_memory(directory, bank, keys, current_items, dict(zip(keys, groups)),
+        _calibrate_global_classifier(directory, bank, current_items, dict(zip(keys, groups)),
                             held_out, report, progress)
         report.update(status='validation_unavailable', validation_gate={'passed':False,
             'reason':'已保存经验特征；需要至少三个独立来源，且训练与留出集均有正负样本'})
@@ -822,7 +479,7 @@ def _train_current(paths, destination, progress, current, *, items=None):
     report['validation_gate'] = {'passed': best_state is not None, 'baseline': baseline,
                                   'best': best_metrics, 'best_epoch': best_epoch, 'epochs_run': epoch + 1}
     if best_state is None:
-        _update_global_memory(directory, bank, chosen, current_items, group_by_key,
+        _calibrate_global_classifier(directory, bank, current_items, group_by_key,
                             held_out, report, progress)
         report.update(status='rejected_holdout', initial_loss=initial_loss,
                       training_clips=sum(g not in held_out for g in groups),
@@ -859,7 +516,7 @@ def _train_current(paths, destination, progress, current, *, items=None):
     # Register the staged hash before publication; a crash cannot orphan replay.
     replace_model(staged, current, base_sha256)
     report['channel_updates']['wavlm'] = 'weights_updated'
-    _update_global_memory(directory, bank, chosen, current_items, group_by_key, held_out,
+    _calibrate_global_classifier(directory, bank, current_items, group_by_key, held_out,
                         report, progress, snapshot=False)
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
     write_meta(directory,bank,report)

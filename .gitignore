@@ -100,9 +100,6 @@ modelscope_cache/
 !/models/anime_t3/
 /models/anime_t3/*
 !models/anime_t3/classifier_v2.pt
-!/models/wavlm-base-plus-sv/
-/models/wavlm-base-plus-sv/*
-!models/wavlm-base-plus-sv/auto_negatives.npz
 /model/*
 !/model/speaker/
 /model/speaker/*

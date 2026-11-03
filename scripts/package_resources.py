@@ -6,7 +6,6 @@ import ast
 import hashlib
 import os
 from pathlib import Path
-import re
 import subprocess
 import zipfile
 
@@ -17,7 +16,6 @@ EXCLUDED_DIRECTORIES = {'__pycache__', 'bin', 'obj', 'tests', 'test', 'evaluatio
 RUNTIME_SUFFIXES = {'.py', '.json', '.yaml', '.yml', '.txt', '.csv', '.html', '.css', '.js',
                     '.svg', '.png', '.ico', '.typed', '.dll', '.pyd', '.so'}
 MODEL_FILES = ('models/anime_t3/classifier_v2.pt',
-               'models/wavlm-base-plus-sv/auto_negatives.npz',
                'models/anime-speaker-char/anime_speaker_char_ecapa.onnx',
                'models/anime-speaker-va/anime_speaker_va_ecapa.onnx')
 
@@ -54,20 +52,7 @@ def validate_model(path: Path) -> None:
         if sha256(path) != ast.literal_eval(asset.args[2]):
             raise ValueError('The trained classifier does not match the desktop manifest')
         return
-    import numpy as np
-    allowed = {'primary', 'secondary', 'support_counts', 'new_counts', 'sample_sha256', 'schema',
-               'anime_char', 'anime_va', 'anime_char_support_counts', 'anime_va_support_counts'}
-    with np.load(path, allow_pickle=False) as data:
-        if not {'primary', 'secondary'}.issubset(data.files) or set(data.files) - allowed:
-            raise ValueError('Unexpected learned prototype metadata')
-        for name in data.files:
-            values = data[name]
-            if name == 'sample_sha256':
-                if values.dtype.kind != 'U' or any(
-                        not re.fullmatch(r'[a-f0-9]{64}', value) for value in values.flat):
-                    raise ValueError('Invalid learned prototype sample checksums')
-            elif values.dtype.kind not in 'iuf':
-                raise ValueError('Learned prototypes must contain numeric arrays only')
+    raise ValueError(f'Unsupported runtime model: {path.name}')
 
 
 def collect_files(gpt_root: Path) -> dict[str, Path]:

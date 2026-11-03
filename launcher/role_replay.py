@@ -47,7 +47,7 @@ def save_bank(directory, bank):
     atomic_save_projection(Path(directory) / 'replay_bank.pt', bank)
 
 
-def add_entry(bank, item, query, references, *, pcm_sha256=None, vectors=None):
+def add_entry(bank, item, query, references, *, pcm_sha256=None):
     """Deduplicate PCM aliases; contradictory labels require explicit correction."""
     key = sample_fingerprint(item)
     content = (item.get('source_sha256'), pcm_sha256 or item['sha256'])
@@ -63,8 +63,7 @@ def add_entry(bank, item, query, references, *, pcm_sha256=None, vectors=None):
     metadata['pcm_sha256'] = pcm_sha256 or item['sha256']
     metadata['role_reference_sha256'] = role_hashes(item)
     bank['entries'][key] = dict(item=metadata, query=query.detach().cpu().clone(),
-        references=[v.detach().cpu().clone() for v in references], content=list(content),
-        vectors=vectors or {})
+        references=[v.detach().cpu().clone() for v in references], content=list(content))
     return True
 
 

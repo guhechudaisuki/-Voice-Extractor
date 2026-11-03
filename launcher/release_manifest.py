@@ -3,7 +3,6 @@ RESOURCE_URL = 'https://github.com/guhechudaisuki/-Voice-Extractor/releases/down
 RESOURCE_SHA256 = '18055d1c6ca829078bc50e1dca4c652764c8f3ebfa788f01ce206971b4c68ac6'
 REQUIRED_MODEL_FILES = (
     'models/anime_t3/classifier_v2.pt',
-    'models/wavlm-base-plus-sv/auto_negatives.npz',
     'models/anime-speaker-char/anime_speaker_char_ecapa.onnx',
     'models/anime-speaker-va/anime_speaker_va_ecapa.onnx',
 )

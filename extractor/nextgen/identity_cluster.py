@@ -435,27 +435,6 @@ def cluster_turns(
     )
 
 
-def historical_negative_matches_target(primary, secondary, profile):
-    """A previous task's negative may be this task's protagonist.
-
-    Explicit exclusions are unaffected. One matching reference view is enough
-    to abstain from using *historical* memory as a veto.
-    """
-    for vector, centroid, references, floor in (
-        (primary, profile.primary_centroid, profile.primary_references, profile.primary_reference_floor),
-        (secondary, profile.secondary_centroid, profile.secondary_references, profile.secondary_reference_floor)):
-        if vector is None:
-            continue
-        vector = _unit(vector)
-        refs = _unit_rows(references)
-        score = float(vector @ _unit(centroid))
-        if refs is not None and len(refs):
-            score = max(score, float(np.max(refs @ vector)))
-        if score >= floor:
-            return True
-    return False
-
-
 def assign_target(
     turns: Sequence[TurnEvidence],
     clusters: Sequence[Cluster],
@@ -513,11 +492,6 @@ def assign_target(
     scales = list(exclusion_scales) if exclusion_scales is not None else [1.0] * len(exclusion_centroids)
     if len(scales) != len(exclusion_centroids):
         raise ValueError("排除余量因子数量必须与排除角色一致")
-    exempt = {role for role, centroid in exclusion_centroids if role.startswith('auto_neg_')
-              and historical_negative_matches_target(centroid, secondary_by_role.get(role), profile)}
-    filtered = [(row, scale) for row, scale in zip(exclusion_centroids, scales) if row[0] not in exempt]
-    exclusion_centroids = [row for row, _ in filtered]
-    scales = [scale for _, scale in filtered]
 
     def cluster_exclusion_ok(cluster: Cluster) -> bool:
         """Retain strict matches; uncertain exclusion views need independent support."""
@@ -625,7 +599,6 @@ def assign_target(
         "largest_cluster_id": scored[0].cluster_id if scored else None,
         "exclusion_reliability": exclusion_audit or {},
         "exclusion_consensus": exclusion_decisions,
-        "historical_target_exemptions": sorted(exempt),
     }
     if qualified:
         # 供滑窗 Cohort 守卫区分"目标家族簇"与真正的冒认者簇。

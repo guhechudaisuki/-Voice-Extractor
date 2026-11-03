@@ -94,9 +94,9 @@ python extract_cli.py `
 
 安装器在 `resource/model` 和 `resource/models` 下管理模型。主要资源包括 UVR5 人声分离、ERes2NetV2 与 CAM++ 声纹匹配、WavLM 与 WeSpeaker 复核、歌声及重叠检测，以及中文和多语言语音识别模型。
 
-`models/anime_t3/classifier_v2.pt` 是随仓库保存的局部身份分类器。当前安装器使用 Microsoft 预训练 WavLM 权重，以安装配置记录的 SHA-256 为准；历史下载文件名中的 `reinforced` 不表示它经过本项目强化。角色与声优声纹 ONNX 模型通过 [模型资源发布页](https://github.com/guhechudaisuki/-Voice-Extractor/releases/tag/model-assets) 分发。
+`models/anime_t3/classifier_v2.pt` 保存全局参考条件分类器的校准参数，身份评分使用当前任务参考音频与 WavLM 投影。安装器从 [模型资源发布页](https://github.com/guhechudaisuki/-Voice-Extractor/releases/tag/model-assets) 下载经过多说话人配对训练的 WavLM 权重及角色、声优声纹 ONNX 模型，并校验 SHA-256。WavLM 仅更新说话人投影层，保留预训练骨干；同一模型服务于不同目标参考，无须为每个角色建立独立模型。
 
-模型强化成功后保留本地权重；若生成 `auto_negatives.npz`，其中的习得排除原型也属于运行资产。资源打包可附带这些原型，训练素材、标注记录及本机配置不进入发布包。模型校验值更新时应同时更新安装配置与发布清单。
+模型强化成功后保留本地权重。训练素材、标注记录及本机配置不进入发布包。模型校验值更新时应同时更新安装配置与发布清单。
 
 资源脚本：
 

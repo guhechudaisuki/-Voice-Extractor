@@ -167,8 +167,8 @@ COMPONENTS = (
             ),
             DirectFile(
                 "pytorch_model.bin",
-                "https://github.com/guhechudaisuki/-Voice-Extractor/releases/download/v3.0/wavlm_reinforced_pytorch_model.bin",
-                "e906bce2fa42fb497a1d1a9ecf81548adb7e03b12a5644e32d2f42f0d6500fad",
+                "https://github.com/guhechudaisuki/-Voice-Extractor/releases/download/model-assets/wavlm_reinforced_pytorch_model.bin",
+                "0fde81fc23bdf3944f9167156fab1852025159d4414aa98bb22e58071bb39586",
             ),
         ),
         check_file="pytorch_model.bin",
@@ -258,7 +258,7 @@ COMPONENTS = (
             DirectFile(
                 "classifier_v2.pt",
                 "https://github.com/guhechudaisuki/-Voice-Extractor/raw/main/models/anime_t3/classifier_v2.pt",
-                "a86a47947dddf8f8d638e2764bee79c086b19910d4673b53f371a9b821e4401c",
+                "a43ed3b3d0285d61b72d52b102ab5b0aae388e5e3e2dc88a26c0f56a108747a4",
             ),
         ),
         check_file="classifier_v2.pt",
@@ -1393,7 +1393,6 @@ def ensure_assets(
 ) -> dict[str, Path]:
     assets, missing = scan_assets(layout, gpt_root)
     if not missing:
-        _install_auto_negatives(layout, source_root, assets)
         reporter(0.92, "本地模型检查完成，全部可用")
         return assets
     total = len(missing)
@@ -1437,25 +1436,7 @@ def ensure_assets(
     assets, missing = scan_assets(layout, gpt_root)
     if missing:
         raise RuntimeError("仍缺少模型：" + "、".join(spec.label for spec in missing))
-    _install_auto_negatives(layout, source_root, assets)
     return assets
-
-
-def _install_auto_negatives(
-    layout: InstallLayout, source_root: Path, assets: dict[str, Path],
-) -> None:
-    model = assets.get("wavlm_model")
-    if model is None:
-        return
-    destination = model / "auto_negatives.npz"
-    if destination.exists() or destination.is_symlink():
-        return
-    relative = Path("models/wavlm-base-plus-sv/auto_negatives.npz")
-    for root in (layout.resource, source_root):
-        source = root / relative
-        if source.is_file() and source.stat().st_size:
-            copy_if_missing(source, destination)
-            return
 
 
 def ensure_local_tools(
@@ -1621,7 +1602,6 @@ def load_cached_context(
         return None
 
     layout.prepare()
-    _install_auto_negatives(layout, source_root, assets)
     if schema is None or settings.get("complete") is not True:
         try:
             save_settings(
@@ -1670,7 +1650,6 @@ def finalize_inspected_context(
     install_executable(layout)
     python = Path(str(python_value))
     assets = {str(key): Path(str(path)) for key, path in assets_value.items()}
-    _install_auto_negatives(layout, source_root, assets)
     gpt_value = inspection.get("gpt_root")
     gpt_root = Path(str(gpt_value)) if gpt_value else infer_gpt_root(python)
     ffmpeg, ffprobe, uvr_code, sv_code = ensure_local_tools(

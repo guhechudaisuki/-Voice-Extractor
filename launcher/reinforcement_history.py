@@ -72,7 +72,8 @@ def stage_checkpoint(current: Path, staged: Path, projection, history: dict):
         save_file(state, str(staged), metadata=metadata)
         checked = load_file(str(staged), device='cpu')
     else:
-        torch.save(state, staged)
+        from extractor.model_store import atomic_save_projection
+        atomic_save_projection(staged, state)
         checked = torch.load(staged, map_location='cpu', weights_only=True)
     for key, value in projection.state_dict().items():
         if not torch.equal(checked['feature_extractor.' + key], value.detach().cpu()):
@@ -84,7 +85,9 @@ def stage_checkpoint(current: Path, staged: Path, projection, history: dict):
 
 def completion_message(report: dict) -> str:
     auxiliary = report.get('channel_updates', {})
-    detail = '；全局负例记忆和参考条件分类器已执行独立更新' if auxiliary else ''
+    state = auxiliary.get('local_classifier')
+    detail = ('；参考条件分类器已校准' if state == 'recalibrated' else
+              '；参考条件分类器校准失败，保留原配置' if state == 'failed' else '')
     if report['status'] == 'validation_unavailable':
         return '全局 WavLM 权重保留：来源不足，经验已进入全局回放池' + detail
     if report['status'] == 'rejected_holdout':

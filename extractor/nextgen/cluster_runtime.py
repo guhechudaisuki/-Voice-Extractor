@@ -104,10 +104,6 @@ class ClusterAnalyzer:
     anime_hash = ""
     anime_cache = None
 
-    auto_negatives: list = []
-    auto_negative_anime = None
-    auto_negative_anime_support = None
-    auto_negative_hash = ""
     cross_bank: tuple = ()
 
     def __init__(self, stem, references, negative_groups=(), *, device="cuda",
@@ -188,66 +184,6 @@ class ClusterAnalyzer:
                 cache.writable = False
         self.profile, self.negatives = self._profiles()
         self.bootstrap_provenance = None
-
-    def _load_auto_negatives(self):
-        """Load aligned memory views, ignoring unsupported auxiliary storage rows."""
-        from zipfile import BadZipFile
-        from ..config import WAVLM_SV_MODEL
-        from .identity_cluster import historical_negative_matches_target
-        path = WAVLM_SV_MODEL / "auto_negatives.npz"
-        self.auto_negatives = []
-        self.auto_negative_anime = {}
-        self.auto_negative_anime_support = {}
-        self.anime_memory_audit = {}
-        self.auto_negative_hash = ""
-        if not path.is_file():
-            return []
-        try:
-            with np.load(path, allow_pickle=False) as data:
-                primary = np.asarray(data["primary"], dtype=np.float64)
-                secondary = np.asarray(data["secondary"], dtype=np.float64)
-                if (primary.ndim != 2 or secondary.ndim != 2 or not len(primary)
-                        or len(primary) != len(secondary)
-                        or not primary.shape[1] or not secondary.shape[1]
-                        or not np.isfinite(primary).all() or not np.isfinite(secondary).all()
-                        or np.any(np.linalg.norm(primary, axis=1) == 0)
-                        or np.any(np.linalg.norm(secondary, axis=1) == 0)):
-                    return []
-                for name in ("anime_char", "anime_va"):
-                    if name not in data:
-                        continue
-                    try:
-                        matrix = np.asarray(data[name], dtype=np.float64)
-                        support = np.asarray(data.get(name + "_support_counts", np.ones(len(primary))),
-                                             dtype=np.float64)
-                    except (OSError, ValueError, KeyError, EOFError, TypeError, BadZipFile):
-                        self.progress(f"忽略无法读取的习得 {name} 记忆，常规声纹仍可用")
-                        continue
-                    if (matrix.shape != (len(primary), 192) or support.shape != (len(primary),)
-                            or not np.isfinite(support).all() or np.any(support < 0)
-                            or np.any(support != np.floor(support))):
-                        self.progress(f"忽略未对齐的习得 {name} 记忆，常规声纹仍可用")
-                        continue
-                    valid = ((support > 0) & np.isfinite(matrix).all(axis=1)
-                             & (np.linalg.norm(matrix, axis=1) > 0))
-                    for index in np.flatnonzero(valid):
-                        role = f"auto_neg_{index}"
-                        self.auto_negative_anime.setdefault(role, {})[name] = unit(matrix[index])
-                        self.auto_negative_anime_support.setdefault(role, {})[name] = int(support[index])
-        except (OSError, ValueError, KeyError, EOFError, TypeError, BadZipFile):
-            self.auto_negative_anime = {}
-            self.auto_negative_anime_support = {}
-            return []
-        roles = [(f"auto_neg_{i}", unit(primary[i]), unit(secondary[i]))
-                 for i in range(len(primary))
-                 if not historical_negative_matches_target(primary[i], secondary[i], self.profile)]
-        kept = {role for role, _, _ in roles}
-        self.auto_negative_anime = {role: views for role, views in self.auto_negative_anime.items() if role in kept}
-        self.auto_negative_anime_support = {role: views for role, views in self.auto_negative_anime_support.items() if role in kept}
-        self.auto_negatives = roles
-        self.auto_negative_hash = file_digest(path)
-        self.progress(f"已加载习得排除原型 {len(roles)} 个（来自历史标注）")
-        return roles
 
     def bank_context(self):
         return {"encoding_version": self.encoding_version,
@@ -665,51 +601,15 @@ class ClusterAnalyzer:
         return {"enabled": self.raw_stem is not None, "measured_spans": 0}
 
     def anime_scores(self, start: float, end: float, profile=None) -> tuple[float, float] | None:
-        """Return reference support, hedged only by corroborated learned competitors."""
+        """Return support measured against the current target references."""
         profile = profile or self.profile
         if profile.anime_char_centroid is None or profile.anime_va_centroid is None:
             return None
         vectors = self.embed_anime(start, end)
         if vectors is None:
             return None
-        scores = (profile_score(vectors[0], profile.anime_char_centroid, profile.anime_char_references),
-                  profile_score(vectors[1], profile.anime_va_centroid, profile.anime_va_references))
-        if not self.auto_negative_anime:
-            return scores
-        return self._anime_memory_support(start, end, vectors, scores, profile)
-
-    def _anime_memory_support(self, start, end, vectors, scores, profile):
-        """A learned rival can remove an anime rescue bonus, never supply a veto.
-
-        Both anime views must identify the same rival. A prototype matching the
-        current target references is irrelevant negative memory from another
-        target-selection session and cannot suppress that target's evidence.
-        """
-        channels = ("anime_char", "anime_va")
-        probes = tuple(unit(vector) for vector in vectors)
-        floors = (profile.anime_char_reference_floor, profile.anime_va_reference_floor)
-        ordinary = {role: (p, s) for role, p, s in self.auto_negatives}
-        competitors = []
-        for role, views in self.auto_negative_anime.items():
-            if not all(name in views for name in channels) or role not in ordinary:
-                continue
-            primary, secondary = ordinary[role]
-            reference_match = (
-                profile_score(primary, profile.primary_centroid, profile.primary_references),
-                profile_score(secondary, profile.secondary_centroid, profile.secondary_references))
-            if (reference_match[0] >= profile.primary_reference_floor
-                    and reference_match[1] >= profile.secondary_reference_floor):
-                continue
-            margins = tuple(score - float(probe @ views[name])
-                            for name, probe, score in zip(channels, probes, scores))
-            if all(margin < 0 for margin in margins):
-                competitors.append({"role": role, "margins": list(margins)})
-        adjusted = tuple(min(score, floor) for score, floor in zip(scores, floors)) if competitors else scores
-        self.anime_memory_audit[(float(start), float(end))] = {
-            "raw_scores": list(scores), "support_scores": list(adjusted),
-            "corroborated_competitors": competitors,
-        }
-        return adjusted
+        return (profile_score(vectors[0], profile.anime_char_centroid, profile.anime_char_references),
+                profile_score(vectors[1], profile.anime_va_centroid, profile.anime_va_references))
 
     def anime_decision(self, scores, primary, secondary, tertiary=None, profile=None):
         """Return positive support for a register change without rejecting existing evidence."""
@@ -765,15 +665,10 @@ class ClusterAnalyzer:
     def analyze(self, spans, *, margin=0.06, temporal=True, keep_narration=True, require_dominant=True):
         turns = self.evidence(spans)
         clusters = cluster_turns(turns)
-        auto = self._load_auto_negatives()
-        exclusions = [(role, p) for role, p, _ in self.negatives] + [
-            (role, p) for role, p, _ in auto]
-        secondaries = [(role, s) for role, _, s in self.negatives] + [
-            (role, s) for role, _, s in auto]
-        scales = [1.0] * len(self.negatives) + [0.75] * len(auto)
+        exclusions = [(role, p) for role, p, _ in self.negatives]
+        secondaries = [(role, s) for role, _, s in self.negatives]
         result = assign_target(turns, clusters, self.profile,
                                exclusions, secondaries,
-                               exclusion_scales=scales,
                                exclusion_audit=getattr(self, "exclusion_audit", None),
                                exclusion_tertiary_centroids=self.tertiary_negatives,
                                margin_floor=margin,
@@ -896,8 +791,6 @@ class ClusterAnalyzer:
     def _rescue_competitor_wins(self, turn, result, primary, secondary, scores, turns):
         """A rescue cannot override a positively identified independent speaker."""
         _, rivals = self.scores(primary, secondary)
-        rivals += [(role, float(unit(primary) @ p), float(unit(secondary) @ s))
-                   for role, p, s in self.auto_negatives]
         rivals += [(str(c.cluster_id), float(unit(primary) @ c.primary_centroid),
                     float(unit(secondary) @ c.secondary_centroid)) for c in result.clusters
                    if turn.index not in c.members and c.cluster_id not in result.target_cluster_ids
@@ -934,10 +827,6 @@ class ClusterAnalyzer:
                           "hash": self.anime_hash or None,
                           "cache_hits": self.anime_cache.hits if self.anime_cache else 0,
                           "cache_misses": self.anime_cache.misses if self.anime_cache else 0},
-                "learned_exclusions": {"sha256": self.auto_negative_hash or None,
-                    "prototypes": len(self.auto_negatives),
-                    "anime_char": sum("anime_char" in views for views in (self.auto_negative_anime or {}).values()),
-                    "anime_va": sum("anime_va" in views for views in (self.auto_negative_anime or {}).values())},
                 "tertiary": {"enabled": self.tertiary is not None,
                              "hash": self.tertiary_hash or None,
                              "cache_hits": self.tertiary_cache.hits if self.tertiary_cache else 0,

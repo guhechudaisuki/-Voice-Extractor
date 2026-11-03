@@ -61,22 +61,10 @@ Fetch-File 'https://huggingface.co/lj1995/GPT-SoVITS/resolve/main/sv/pretrained_
 Fetch-File 'https://modelscope.cn/models/iic/speech_campplus_sv_zh-cn_16k-common/resolve/master/campplus_cn_common.bin' (Join-Path $modelRoot 'speaker\campplus_voxceleb\campplus_voxceleb.bin')
 Fetch-File 'https://huggingface.co/microsoft/wavlm-base-plus-sv/resolve/feb593a6c23c1cc3d9510425c29b0a14d2b07b1e/config.json?download=true' (Join-Path $modelRoot 'speaker\wavlm-base-plus-sv\config.json')
 Fetch-File 'https://huggingface.co/microsoft/wavlm-base-plus-sv/resolve/feb593a6c23c1cc3d9510425c29b0a14d2b07b1e/preprocessor_config.json?download=true' (Join-Path $modelRoot 'speaker\wavlm-base-plus-sv\preprocessor_config.json')
-Fetch-File 'https://github.com/guhechudaisuki/-Voice-Extractor/releases/download/v3.0/wavlm_reinforced_pytorch_model.bin' (Join-Path $modelRoot 'speaker\wavlm-base-plus-sv\pytorch_model.bin') 'e906bce2fa42fb497a1d1a9ecf81548adb7e03b12a5644e32d2f42f0d6500fad' -PreserveExisting
-Fetch-File 'https://github.com/guhechudaisuki/-Voice-Extractor/raw/main/models/anime_t3/classifier_v2.pt' (Join-Path $toolRoot 'models\anime_t3\classifier_v2.pt') 'a86a47947dddf8f8d638e2764bee79c086b19910d4673b53f371a9b821e4401c' -PreserveExisting
+Fetch-File 'https://github.com/guhechudaisuki/-Voice-Extractor/releases/download/model-assets/wavlm_reinforced_pytorch_model.bin' (Join-Path $modelRoot 'speaker\wavlm-base-plus-sv\pytorch_model.bin') '0fde81fc23bdf3944f9167156fab1852025159d4414aa98bb22e58071bb39586' -PreserveExisting
+Fetch-File 'https://github.com/guhechudaisuki/-Voice-Extractor/raw/main/models/anime_t3/classifier_v2.pt' (Join-Path $toolRoot 'models\anime_t3\classifier_v2.pt') 'a43ed3b3d0285d61b72d52b102ab5b0aae388e5e3e2dc88a26c0f56a108747a4' -PreserveExisting
 Fetch-File 'https://github.com/guhechudaisuki/-Voice-Extractor/releases/download/model-assets/anime_speaker_char_ecapa.onnx' (Join-Path $toolRoot 'models\anime-speaker-char\anime_speaker_char_ecapa.onnx') 'd4e0ce7d55501fbb1a71d18ae7d3146d6fbd2d5aee8369d3171a82418f44d3a8'
 Fetch-File 'https://github.com/guhechudaisuki/-Voice-Extractor/releases/download/model-assets/anime_speaker_va_ecapa.onnx' (Join-Path $toolRoot 'models\anime-speaker-va\anime_speaker_va_ecapa.onnx') '9d2d285e55cb5eb4ba09fe703119cfec4ae715ba3ba4df89a97cfec606e3d986'
-
-$prototypeSource = Join-Path $toolRoot 'models\wavlm-base-plus-sv\auto_negatives.npz'
-$prototypeTarget = Join-Path $modelRoot 'speaker\wavlm-base-plus-sv\auto_negatives.npz'
-if ((Test-Path -LiteralPath $prototypeSource -PathType Leaf) -and
-    -not (Test-Path -LiteralPath $prototypeTarget)) {
-    if ($WhatIf) {
-        Write-Host ('INSTALL {0} -> {1}' -f $prototypeSource, $prototypeTarget)
-    } else {
-        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $prototypeTarget) | Out-Null
-        Copy-Item -LiteralPath $prototypeSource -Destination $prototypeTarget
-    }
-}
 
 Fetch-File 'https://huggingface.co/onnx-community/wespeaker-voxceleb-resnet34-LM/resolve/6a61a1833ff2583aabeba044f5c8221f00b67ceb/onnx/model.onnx?download=true' (Join-Path $modelRoot 'speaker\wespeaker-resnet34-lm\onnx\model.onnx') '3955447B0499DC9E0A4541A895DF08B03C69098EBA4E56C02B5603E9F7F4FCBB'
 Fetch-File 'https://huggingface.co/csukuangfj/sherpa-onnx-pyannote-segmentation-3-0/resolve/main/model.onnx?download=true' (Join-Path $toolRoot 'models\overlap\model.onnx') '220AD67CA923BEF2FA91F2390C786097BF305BCEB5E261D4AF67B38E938E1079'

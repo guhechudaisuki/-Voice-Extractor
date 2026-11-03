@@ -15,8 +15,7 @@ def global_model_paths():
     else:
         from extractor.config import WAVLM_SV_MODEL, CLASSIFIER_V2_MODEL
         model_dir, classifier = Path(WAVLM_SV_MODEL), Path(CLASSIFIER_V2_MODEL)
-    return {'speaker': active_speaker_path(model_dir),
-            'auto_negatives': model_dir / 'auto_negatives.npz', 'classifier': classifier}
+    return {'speaker': active_speaker_path(model_dir), 'classifier': classifier}
 
 
 def _rollback_targets(paths):
@@ -27,9 +26,12 @@ def _rollback_targets(paths):
     if not isinstance(metadata, dict):
         raise ValueError('全局回滚备份清单无效')
     expected = [str(path.resolve()) for path in paths.values()]
+    recorded = metadata.get('paths')
     present = metadata.get('present')
-    if (metadata.get('paths') != expected or not isinstance(present, list)
-            or any(name not in expected for name in present)):
+    if (not isinstance(recorded, list) or not all(isinstance(name, str) for name in recorded)
+            or len(set(recorded)) != len(recorded)
+            or [name for name in recorded if name in expected] != expected
+            or not isinstance(present, list) or any(name not in recorded for name in present)):
         raise ValueError('全局回滚备份与当前安装路径不一致')
     targets = {name: str(path.resolve()) in present for name, path in paths.items()}
     for name, existed in targets.items():

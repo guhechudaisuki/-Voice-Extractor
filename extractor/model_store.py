@@ -44,7 +44,7 @@ def active_speaker_path(model_dir: Path) -> Path:
 
 def snapshot_global_models(current: Path, classifier: Path):
     """Back up all global inference artifacts, including previously absent files."""
-    paths = [Path(current), Path(current).parent / 'auto_negatives.npz', Path(classifier)]
+    paths = [Path(current), Path(classifier)]
     marker = Path(current).parent / 'global_rollback.json'
     # Finish every potentially large copy before replacing the previous backup
     # generation. A failed auxiliary copy must leave the old rollback intact.
@@ -85,9 +85,9 @@ def rollback_global_models(model_dir: Path, classifier: Path):
     with reinforcement_lock(current):
         marker = Path(model_dir) / 'global_rollback.json'
         metadata = json.loads(marker.read_text(encoding='utf-8'))
-        paths = [current, Path(model_dir) / 'auto_negatives.npz', Path(classifier)]
+        paths = [current, Path(classifier)]
         present = set(metadata['present'])
-        if metadata['paths'] != [str(p.resolve()) for p in paths]:
+        if not {str(p.resolve()) for p in paths}.issubset(metadata['paths']):
             raise ValueError('全局回滚备份与当前安装路径不一致')
         for path in paths:
             if str(path.resolve()) in present and not path.with_suffix(path.suffix + '.previous').is_file():

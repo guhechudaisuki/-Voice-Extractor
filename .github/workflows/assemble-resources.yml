@@ -71,10 +71,8 @@ jobs:
               code_roots = {'extractor', 'launcher', 'vendor', 'dependencies'}
               assets = {'tools/ffmpeg.exe', 'tools/ffprobe.exe',
                         'models/anime_t3/classifier_v2.pt',
-                        'models/wavlm-base-plus-sv/auto_negatives.npz',
                         'models/anime-speaker-char/anime_speaker_char_ecapa.onnx',
-                        'models/anime-speaker-va/anime_speaker_va_ecapa.onnx',
-                        'model/speaker/wavlm-base-plus-sv/auto_negatives.npz'}
+                        'models/anime-speaker-va/anime_speaker_va_ecapa.onnx'}
               excluded = {'tests', 'test', 'evaluation', 'docs', 'examples', '__pycache__'}
               suffixes = {'.py', '.json', '.yaml', '.yml', '.txt', '.csv', '.html', '.css',
                           '.js', '.svg', '.png', '.ico', '.typed', '.dll', '.pyd', '.so'}
@@ -83,7 +81,6 @@ jobs:
                           'dependencies/eres2net/ERes2NetV2.py', 'dependencies/LICENSE.GPT-SoVITS',
                           'tools/ffmpeg.exe', 'tools/ffprobe.exe',
                           'models/anime_t3/classifier_v2.pt',
-                          'models/wavlm-base-plus-sv/auto_negatives.npz',
                           'models/anime-speaker-char/anime_speaker_char_ecapa.onnx',
                           'models/anime-speaker-va/anime_speaker_va_ecapa.onnx'}
               seen = set()
