@@ -13,7 +13,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from launcher.training_material import import_packages
-from launcher.reinforcement_validation import classification_metrics, non_regressing
+from launcher.reinforcement_validation import classification_metrics, non_regressing, paired_decision_audit
 from launcher.reinforcement_history import completion_message, read_history, stage_checkpoint
 from launcher.role_samples import role_hashes, sample_fingerprint
 from extractor.model_store import (active_speaker_path, file_sha256, reinforcement_lock,
@@ -415,7 +415,7 @@ def _train_current(paths, destination, progress, current, *, items=None):
         return queries, references, labels, weights
     def embeddings(head, query, reference):
         return F.normalize(head(query), dim=-1), F.normalize(head(reference), dim=-1)
-    def evaluate(indexes):
+    def evaluate(indexes, *, collect_scores=False):
         total_loss, total_weight, correct = 0., 0., 0
         all_scores, all_labels = [], []
         with torch.no_grad():
@@ -430,12 +430,18 @@ def _train_current(paths, destination, progress, current, *, items=None):
                 total_loss += float((losses * weights).sum())
                 total_weight += float(weights.sum())
                 correct += int(((scores >= .8) == labels.bool()).sum())
-        return {**classification_metrics(all_scores, all_labels), 'pairs': len(indexes), 'sources': len({pairs[i][3] for i in indexes}),
+        metrics = {**classification_metrics(all_scores, all_labels), 'pairs': len(indexes), 'sources': len({pairs[i][3] for i in indexes}),
                 'positive': sum(pairs[i][2] for i in indexes), 'negative': sum(1-pairs[i][2] for i in indexes),
                 'loss': total_loss / total_weight if total_weight else None,
                 'accuracy_at_cosine_080': correct / len(indexes) if indexes else None}
+        if collect_scores:
+            metrics['_scores'] = all_scores
+        return metrics
     initial_loss = evaluate(train_idx)['loss']
-    baseline = evaluate(test_idx)
+    baseline = evaluate(test_idx, collect_scores=True)
+    baseline_scores = baseline.pop('_scores')
+    test_labels = [pairs[i][2] for i in test_idx]
+    baseline['sample_guard'] = paired_decision_audit(baseline_scores, baseline_scores, test_labels)
     best_state, best_metrics, best_epoch, stale = None, baseline, 0, 0
     optimizer = torch.optim.Adam(projection.parameters(), lr=1e-5)
     generator = torch.Generator().manual_seed(20260930)
@@ -467,7 +473,9 @@ def _train_current(paths, destination, progress, current, *, items=None):
             loss.backward()
             torch.nn.utils.clip_grad_norm_(projection.parameters(), 1.)
             optimizer.step()
-        measured = evaluate(test_idx)
+        measured = evaluate(test_idx, collect_scores=True)
+        measured['sample_guard'] = paired_decision_audit(
+            measured.pop('_scores'), baseline_scores, test_labels)
         if non_regressing(measured, baseline) and measured['loss'] < best_metrics['loss'] - 1e-7:
             best_state = {k: v.detach().cpu().clone() for k, v in projection.state_dict().items()}
             best_metrics, best_epoch, stale = measured, epoch + 1, 0

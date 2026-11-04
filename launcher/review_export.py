@@ -5,6 +5,7 @@ from pathlib import Path
 import hashlib
 import json
 import math
+import re
 import tempfile
 import unicodedata
 import wave
@@ -14,24 +15,20 @@ from launcher.training_material import (export_package, partial_keep_segments,
                                         reviewable, validated_rows, training_text,
                                         prepare_training_audio, write_training_manifests, export_language)
 from launcher.training_workspace import Workspace
-
-
-def _clip_text(row: dict) -> str:
-    text = training_text(row)
-    # GPT-SoVITS 训练清单按行解析，文本中的竖线与换行会破坏格式。
-    return _list_text(text)
+from extractor.recall import MIN_TARGET_SECONDS
 
 
 def _list_text(text: str) -> str:
+    # GPT-SoVITS 训练清单按行解析，文本中的竖线与换行会破坏格式。
     return ' '.join(text.replace('|', '／').splitlines()).strip()
 
 
 def _partial_clip_text(row: dict, review: dict, keep: tuple[float, float]) -> str:
-    """取保留段台词：优先用户修订，其次重叠过半的字幕，最后按时长截取。
+    """Use explicit crop text or complete, genuinely timed ASR units only.
 
-    字幕使用原音频时间轴，保留区间使用片段内的相对时间。
+    Missing text keeps the WAV available for transcription; it must never
+    invent a training label from duration ratios or translated subtitles.
     """
-    duration = max(1e-6, float(row.get("end") or 0) - float(row.get("start") or 0))
     for item in review.get('partial_texts') or ():
         if (isinstance(item, dict) and item.get('start') == keep[0]
                 and item.get('end') == keep[1] and item.get('text')):
@@ -46,38 +43,44 @@ def _partial_clip_text(row: dict, review: dict, keep: tuple[float, float]) -> st
             return _list_text(parts[keeps.index(keep)])
     abs_start = float(row.get("start") or 0) + float(keep[0])
     abs_end = float(row.get("start") or 0) + float(keep[1])
-    fragments = []
+    full = (_list_text(str(review['revised_text'])) if review.get('revised_text') is not None
+            else training_text(row, review))
+    normalized = re.sub(r'\s+', '', full)
+    positions = [i for i, char in enumerate(full) if not char.isspace()]
     diagnostics = row.get("diagnostics") or {}
-    for key in ("word_timestamps", "subtitle_reference", "subtitle_cues", "stt_fragments"):
+    for key in ("word_timestamps", "stt_fragments"):
         entries = diagnostics.get(key)
-        if not isinstance(entries, list):
+        if not isinstance(entries, list) or not entries:
             continue
+        fragments = []
         for entry in entries:
             if not isinstance(entry, dict):
-                continue
+                break
             text = str(entry.get("text") or "").strip()
-            start = entry.get("aligned_start", entry.get("start"))
-            end = entry.get("aligned_end", entry.get("end"))
-            if not text or not isinstance(start, (int, float)) \
-                    or not isinstance(end, (int, float)):
-                continue
-            overlap = min(abs_end, float(end)) - max(abs_start, float(start))
-            if overlap >= 0.5 * max(1e-6, float(end) - float(start)):
-                fragments.append((float(start), float(end), text))
-        if fragments:
-            break
-    if fragments:
+            start, end = _finite(entry.get('start')), _finite(entry.get('end'))
+            if (not text or start is None or end is None or end <= start
+                    or entry.get('timing_estimated')
+                    or (entry.get('diagnostics') or {}).get('timing_estimated')):
+                break
+            fragments.append((start, end, re.sub(r'\s+', '', text)))
+        if len(fragments) != len(entries):
+            continue
         fragments.sort()
-        text = "".join(piece for _s, _e, piece in fragments)
-        return _list_text(text)
-    full = _clip_text(row)
-    if not full:
-        return ""
-    left = max(0.0, min(1.0, keep[0] / duration))
-    right = max(0.0, min(1.0, keep[1] / duration))
-    begin = int(len(full) * left)
-    finish = max(begin + 1, int(len(full) * right))
-    return full[begin:finish].strip()
+        if (''.join(text for _, _, text in fragments) != normalized
+                or any(a[1] > b[0] + 1e-6 for a, b in zip(fragments, fragments[1:]))):
+            continue
+        selected, cursor = [], 0
+        for start, end, text in fragments:
+            if min(abs_end, end) > max(abs_start, start) + 1e-9:
+                if start < abs_start - 1e-6 or end > abs_end + 1e-6:
+                    # Even one sliced word makes the full crop's label unsafe.
+                    return ''
+                selected.append((cursor, cursor + len(text)))
+            cursor += len(text)
+        if selected:
+            begin, finish = selected[0][0], selected[-1][1]
+            return _list_text(full[positions[begin]:positions[finish] if finish < len(positions) else len(full)])
+    return ''
 
 
 def _finite(value):
@@ -196,7 +199,7 @@ def _report_markdown(report: dict) -> str:
     for bucket, item in report['duration_buckets'].items():
         lines.append(f"| {bucket} | {item['count']} | {item['ratio']:.1%} |")
     lines += ['', '分桶边界：1.2 ≤ t < 3，3 ≤ t < 6，6 ≤ t ≤ 10；未知质量不计为通过。',
-        f"质量过滤：{len(report['skipped_quality'])} 句；同内容去重：{len(report['duplicate_ordinals'])} 句；裁切失败或不足 1 秒：{len(report['skipped_partial'])} 句。", '']
+        f"质量过滤：{len(report['skipped_quality'])} 句；同内容去重：{len(report['duplicate_ordinals'])} 句；裁切失败或不足 {MIN_TARGET_SECONDS:g} 秒：{len(report['skipped_partial'])} 句。", '']
     return '\n'.join(lines)
 
 
@@ -240,7 +243,8 @@ def export_review_zip(batch: Path, manifest: dict, reviews: dict, destination: P
                     cropped = label == 'partial'
                     source_duration = max(0.0, float(row.get('end') or 0) - float(row.get('start') or 0))
                     try:
-                        keeps = ([span for span in partial_keep_segments(row, review) if span[1] - span[0] >= 1.0]
+                        keeps = ([span for span in partial_keep_segments(row, review)
+                                  if span[1] - span[0] >= MIN_TARGET_SECONDS - 1e-9]
                                  if cropped else [(0., source_duration)])
                     except (TypeError, ValueError):
                         keeps = []
@@ -275,21 +279,10 @@ def export_review_zip(batch: Path, manifest: dict, reviews: dict, destination: P
                         identities.add(identity)
                         written.add(relative)
                         prepared = temporary / f'prepared_{ordinal:06d}_{piece_index:02d}.wav'
-                        hf_audit = None
-                        if restore_high_frequencies and grade=='Gold':
-                            try:
-                                from extractor.hf_restoration import restore_export
-                                restored = temporary/f'hf_{ordinal:06d}_{piece_index:02d}.wav'
-                                hf_audit = restore_export(audio,restored,row,keep,grade)
-                                if hf_audit['applied']:
-                                    measured = _quality(row,restored,cropped=True)
-                                    if (measured.get('quality_grade')=='Gold' and
-                                            measured.get('snr_db',0)>=qc.get('snr_db',0)-.1):
-                                        audio,qc=restored,measured
-                                    else:
-                                        hf_audit={'applied':False,'reason':'post_restoration_quality_gate'}
-                            except (ImportError,OSError,ValueError,RuntimeError) as exc:
-                                hf_audit={'applied':False,'reason':'unavailable','detail':str(exc)}
+                        # Old clients may still send the retired flag. It can
+                        # never authorize adding any sample from the raw mix.
+                        hf_audit = ({'applied': False, 'reason': 'stem_only_policy'}
+                                    if restore_high_frequencies else None)
                         duration = prepare_training_audio(audio, prepared)
                         valid_text = any(unicodedata.category(char)[0] in 'LN' for char in text)
                         if not valid_text:

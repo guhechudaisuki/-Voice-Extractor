@@ -66,9 +66,9 @@
 
           <div class="filters" id="filters">
             <button class="chip is-on" data-filter="all">全部</button>
-            <button class="chip" data-filter="tierA">✅ 主输出</button>
-            <button class="chip" data-filter="tierB">⚡ 边缘捡漏</button>
-            <button class="chip" data-filter="removed">🚫 撤下</button>
+            <button class="chip" data-filter="tierA" hidden>主输出</button>
+            <button class="chip" data-filter="tierB" hidden>已保存候选</button>
+            <button class="chip" data-filter="removed" hidden>已撤下</button>
             <button class="chip" data-filter="unreviewed">未标</button>
             <button class="chip" data-filter="active" title="优先复核模型分歧大、声线不同的未标片段">高信息量</button>
             <button class="chip" id="liveRecalibrate" title="至少 10 条标注，含 3 正 / 3 负">按本批标注重排</button>
@@ -199,7 +199,7 @@
             <div class="foot-btns">
               <button class="mini-btn" id="undoBtn" title="撤销上一步 (Ctrl+Z)">撤销</button>
               <button class="mini-btn" id="trustMainBtn" title="把未标注的 Tier A 主输出全部标为目标匹配">一键信任主输出</button>
-              <button class="mini-btn" id="trustBorderlineBtn" title="采纳评分达标或具有纯净子段证据的边缘句，保留已有人工标注">⚡ 采纳高分边缘句</button>
+              <button class="mini-btn" id="trustBorderlineBtn" title="采纳评分达标或具有纯净子段证据的已保存候选，保留已有人工标注" hidden>采纳高分候选</button>
               <button class="mini-btn solid" id="exportBtn">导出 ZIP</button>
             </div>
             <label class="check material-identity"><input type="checkbox" id="includeMaterial" disabled>
@@ -210,7 +210,6 @@
               <select id="minQuality" class="field"><option value="">全部质量</option><option value="Silver">Gold + Silver</option><option value="Gold">仅 Gold</option></select>
             </label>
             <label class="check">说话人 <input id="exportSpeaker" class="field" value="target"></label>
-            <label class="check"><input type="checkbox" id="restoreHighFrequencies"><span>Gold 高频细节回填（需原轨与相干性检查）</span></label>
             <label class="check">未知语言的回退值 <input id="exportLanguage" class="field" value="JA"></label>
             <div class="save-state" id="materialState">已有标注即可导出原料</div>
             <div class="save-state" id="saveState">随点即存</div>

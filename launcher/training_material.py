@@ -20,7 +20,9 @@ SCHEMA = 2
 def training_text(row: dict, review: dict | None = None) -> str:
     if review and review.get('label') == 'correct' and review.get('revised_text') is not None:
         return ' '.join(str(review['revised_text']).replace('|', '／').splitlines()).strip()
-    for key in ('whisper_text', 'subtitle_text', 'text'):
+    # Match the final transcript shown during review, including Chinese ASR
+    # refinement. Subtitle-only text can be a translation, never a speech label.
+    for key in ('text', 'whisper_text'):
         value = str(row.get(key) or '').strip()
         if value:
             return ' '.join(value.replace('|', '／').splitlines()).strip()
@@ -305,7 +307,8 @@ def reviewable(batch_dir: Path, manifest: dict) -> list[tuple[int, dict, Path, s
         diagnostics = row.get("diagnostics") or {}
         if not isinstance(diagnostics, dict):
             diagnostics = {}
-        # Tier B（边缘待捡漏）片段同样可试听：音频由流水线写入 _borderline/。
+        # Retain review access to explicitly saved diagnostic clips and old
+        # batches that already contain low-confidence or cluster-veto audio.
         if not (row.get("accepted") or diagnostics.get("cluster_removed")
                 or diagnostics.get("cluster_tier") == "B"):
             continue
@@ -361,7 +364,8 @@ def partial_keep_segments(row: dict, review: dict) -> list[tuple[float, float]]:
 def _cut_to_archive(archive: zipfile.ZipFile, clip: Path, start: float, end: float,
                     name: str, workspace: Path) -> Path | None:
     """从片段音频切出保留区间，添加 20ms 淡入淡出及峰值保护。"""
-    if end - start < 0.5:
+    from extractor.recall import MIN_TARGET_SECONDS
+    if end - start < MIN_TARGET_SECONDS - 1e-9:
         return None
     from launcher.audio_export import write_clip
     temporary = workspace / (name.replace("/", "_"))

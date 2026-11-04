@@ -359,7 +359,7 @@ def _positive_fine_review(candidate, evidence):
 
 
 def apply_cluster_gate(accepted, rejected, turns, result, *, mode, min_seconds=1.2,
-                       blocked_spans=(), local=None):
+                       blocked_spans=(), local=None, island_arbitration=None):
     if mode == "off":
         return {"removed": 0, "promoted": 0, "cropped": 0, "borderline": 0}
     removed, promoted, cropped, borderline = [], [], [], []
@@ -382,6 +382,46 @@ def apply_cluster_gate(accepted, rejected, turns, result, *, mode, min_seconds=1
     supported = [tuple(row['span']) for rows in (local or {}).values() for row in rows
                  if row.get('accepted') and not row.get('hard_veto')
                  and not row.get('identity_evidence', {}).get('exclusion_evidence', {}).get('conflict')]
+    # Independently verified islands can extend an existing positive core.
+    # Keeping only the old window bounds would truncate an island even when
+    # its complete identity trajectory passes. This only proposes bounds;
+    # the lattice and detector barriers still apply. Verify the entire island
+    # independently here: an original parent may lack a rescue marker and
+    # therefore never enter the later rescue-only arbitration.
+    from ..utterance_assembly import confirmed_islands, strong_island
+    cores = tuple(supported)
+    clean_sources = [c for c in source_pool if not c.diagnostics.get('review_only')
+                     and not any(c.diagnostics.get(k) for k in (*HARD_VETOES, 'pitch_register_mismatch'))]
+    contexts = {}
+    for source in clean_sources:
+        islands = confirmed_islands([source])
+        parent = (source.start, source.end)
+        evidence = source.diagnostics.get('experimental_final_island_evidence') or {}
+        # The independent encoder needs the continuous utterance, not a short
+        # phoneme tail. Its context must itself have exact four-view support
+        # and a clean trajectory; unrelated adjacent speech cannot enlarge it.
+        whole_supported = (parent in islands or strong_island({
+            'state': 'target_supported', 'domain_margins': evidence.get('whole_domain_margins')}))
+        if not whole_supported or not trajectory.assess(*parent)['accepted']:
+            continue
+        for a, b in islands:
+            if parent[0] <= a and b <= parent[1]:
+                contexts.setdefault((a, b), []).append(parent)
+    extension_audit, arbitration_cache = [], {}
+    for (a, b), parents in sorted(contexts.items()):
+        if (not any(min(b, y) - max(a, x) >= MIN_TARGET_SECONDS - 1e-9 for x, y in cores)
+                or not subtract_intervals([(a, b)], cores)
+                or not trajectory.assess(a, b)['accepted']):
+            continue
+        parent = min(parents, key=lambda span: (span[1] - span[0], span))
+        if parent not in arbitration_cache:
+            arbitration_cache[parent] = (island_arbitration(*parent) if island_arbitration is not None
+                else {'accepted': False, 'reason': 'independent_encoder_unavailable'})
+        evidence = arbitration_cache[parent]
+        extension_audit.append({**evidence, 'span': [a, b], 'arbitration_span': list(parent)})
+        if evidence.get('accepted') is True:
+            supported.append((a, b))
+    result.diagnostics['island_extension_arbitration'] = extension_audit
     positive_union = []
     for a, b in sorted(set(supported)):
         if positive_union and a <= positive_union[-1][1]:

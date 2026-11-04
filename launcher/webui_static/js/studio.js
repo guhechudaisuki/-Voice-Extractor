@@ -1065,6 +1065,17 @@ function refreshMeta() {
   const clusterSummary = $("clusterSummary");
   const acceptedCount = app.segments.filter((seg) => seg.accepted).length;
   const removedCount = app.segments.length - acceptedCount;
+  const hasBorderline = app.segments.some((seg) => !seg.accepted && seg.cluster_tier === "B");
+  const hasRemoved = app.segments.some((seg) => !seg.accepted && seg.cluster_tier !== "B");
+  for (const [filter, available] of [["tierA", acceptedCount > 0 && removedCount > 0],
+                                   ["tierB", hasBorderline], ["removed", hasRemoved]]) {
+    document.querySelector(`[data-filter="${filter}"]`).hidden = !available;
+    if (!available && app.filter === filter) app.filter = "all";
+  }
+  document.querySelectorAll("[data-filter]").forEach((chip) => {
+    chip.classList.toggle("is-on", chip.dataset.filter === app.filter);
+  });
+  $("trustBorderlineBtn").hidden = !hasBorderline;
   $("batchMeta").innerHTML =
     `<span><b>${acceptedCount}</b> 输出</span>` +
     (removedCount ? `<span>· ${removedCount} 撤下可试听</span>` : "") +
@@ -1133,7 +1144,7 @@ $("exportBtn").addEventListener("click", async () => {
   try {
     const response = await fetch(`/api/export_verified/${encodeURIComponent(batchId)}`, {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ speaker: $("exportSpeaker").value, language: $("exportLanguage").value, include_material: includeMaterial, gpt_sovits_list: includeGptList, min_quality_grade: $("minQuality").value || null, restore_high_frequencies: $('restoreHighFrequencies').checked }),
+      body: JSON.stringify({ speaker: $("exportSpeaker").value, language: $("exportLanguage").value, include_material: includeMaterial, gpt_sovits_list: includeGptList, min_quality_grade: $("minQuality").value || null }),
     });
     const data = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(data.detail || "HTTP " + response.status);
@@ -1164,7 +1175,7 @@ $("trustMainBtn").addEventListener("click", async () => {
   renderList();
   refreshMeta();
   if (await save(false)) {
-    toast(`已信任 ${pending.length} 段主输出；请切到「⚡ 边缘捡漏」继续捡漏`, "ok");
+    toast(`已将 ${pending.length} 段输出标为目标匹配`, "ok");
   }
 });
 

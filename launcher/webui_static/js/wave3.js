@@ -90,8 +90,7 @@
       try {
         const data = await request('/api/datasets/merge', {method:'POST',headers:{'Content-Type':'application/json'},
           body:JSON.stringify({batch_ids:ids,speaker:$('exportSpeaker').value,language:$('exportLanguage').value,
-            target_lufs:Number(loudness.value),true_peak:Number(peak.value),min_quality_grade:$('minQuality').value||null,
-            restore_high_frequencies:$('restoreHighFrequencies').checked})});
+            target_lufs:Number(loudness.value),true_peak:Number(peak.value),min_quality_grade:$('minQuality').value||null})});
         download(data); status.textContent = `已导出 ${data.valid_count} 段，去重 ${data.duplicate_count} 段`;
       } catch (error) { status.textContent = error.message; }
       finally { action.disabled = false; }

@@ -267,6 +267,15 @@ class IdentityTrajectory:
                     continue
                 margins = island.get("domain_margins") or {}
                 values = [float(value) for value in margins.values() if _finite(value)]
+                # Four independent model/track margins certify this exact
+                # island. A micro-window abstention must not erase that fact.
+                # This marker adds no score and cannot override any barrier.
+                if (state == 'target_supported' and not evidence.get('whole_conflict')
+                        and not island.get('excluded_role_rejected')
+                        and all(_finite(margins.get(f'{variant}_{track}'))
+                                and margins[f'{variant}_{track}'] > 0.
+                                for variant in ('char', 'va') for track in ('stem', 'raw'))):
+                    self.observations.append(_Observation(start, end, 0., 'island_identity'))
                 if state == "unresolved" and not values:
                     continue
                 paired_views = [[margins.get(encoder + "_" + track)
@@ -405,7 +414,8 @@ class IdentityTrajectory:
             if micro:
                 local = self._density((a + b) / 2, micro)
                 coarse_positive = any(row.kind == 'coarse' and row.value > 0. for row in active)
-                identity = local > 0. or coarse_positive
+                identity = (local > 0. or coarse_positive
+                            or any(row.kind == 'island_identity' for row in active))
                 barrier = barrier or any(row in self._micro_barriers for row in micro)
             elif any(row.kind == 'coarse_boundary' for row in active):
                 barrier = True

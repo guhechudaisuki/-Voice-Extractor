@@ -4,6 +4,7 @@ import csv
 import io
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -61,6 +62,7 @@ from .subtitle_assistance import (
 )
 from .types import BatchPipelineResult, CandidateSentence, PipelineResult, TimeSpan
 from .recall import MIN_TARGET_SECONDS, recover_raw_vad, annotate_raw_recovery
+from .sentence_continuity import has_exact_target_certificate, merge_certified_contiguous
 
 LOGGER = logging.getLogger(__name__)
 
@@ -652,6 +654,9 @@ class ExtractionPipeline:
 
     def _split_micro_window_changes(self, spans, verifier, profile, waveform, progress):
         output, cuts = [], []
+        splitter = LocalSpeakerTurnSplitter(
+            verifier.primary, secondary=verifier.secondary,
+            secondary_factory=verifier._boundary_secondary_factory)
 
         def embed_windows(windows):
             return verifier.primary._embeddings_from_waveforms([
@@ -661,6 +666,7 @@ class ExtractionPipeline:
             points = detect_speaker_change_valleys(
                 waveform, span.start, span.end, embed_windows=embed_windows,
                 target_centroid=profile.primary.centroid)
+            points = splitter.confirm_boundary_proposals(waveform, span, points)
             edges = [span.start, *points, span.end]
             output.extend(TimeSpan(start, end) for start, end in zip(edges, edges[1:]))
             cuts.extend(points)
@@ -675,13 +681,23 @@ class ExtractionPipeline:
         for candidate in accepted:
             parent = TimeSpan(candidate.start, candidate.end)
             parts = subtitle_atomic_spans(self._subtitle_guide, [parent])
+            # A proposed micro cut is not new identity evidence. The final
+            # multichannel trajectory has already checked this exact interval;
+            # rechecking its short phonemes can wrongly revoke a whole sentence.
+            blocked = [*self._raw_blocked_spans,
+                       *(TimeSpan(*span) for span in self.options.user_excluded_spans)]
+            if (parts == [parent] and has_exact_target_certificate(candidate)
+                    and not any(span.start < parent.end and span.end > parent.start
+                                for span in blocked)):
+                output.append(candidate)
+                continue
             separated = []
             for part in parts:
                 edges = [part.start, *(point for point in self._speaker_change_points
                                       if part.start + 1e-6 < point < part.end - 1e-6), part.end]
                 separated.extend(TimeSpan(start, end) for start, end in zip(edges, edges[1:]))
             parts, _removed = carve_tainted_spans(
-                separated, self._raw_blocked_spans, waveform,
+                separated, blocked, waveform,
                 minimum_seconds=MIN_TARGET_SECONDS, padding=0.)
             if len(parts) == 1 and parts[0] == parent:
                 output.append(candidate)
@@ -1219,6 +1235,12 @@ class ExtractionPipeline:
                     rejected.append(child)
             progress(0.80, f"实验性局部身份终审：{index}/{total}")
         accepted_turns.sort(key=lambda item: (item.start, item.end))
+        from .utterance_assembly import recheck_short_exclusion_tails
+        reconsidered = recheck_short_exclusion_tails(
+            rejected, accepted_turns, domain_for,
+            blocked=blocked, margin=max(.06, self.options.cluster_target_margin))
+        if reconsidered:
+            progress(0.80, f"短尾音独立复核：{reconsidered} 段解除近似声纹否决，交最终身份筛选")
         return withheld, rescued
 
     def _experimental_reassemble_internal_other_tails(
@@ -2440,6 +2462,7 @@ class ExtractionPipeline:
             TimeSpan(start, end)
             for start, end in self.options.user_excluded_spans
         ]
+        excluded_spans.extend(self._raw_blocked_spans)
         accepted_count = 0
         for candidate in list(rejected):
             if candidate.reject_reason != "声纹匹配不足":
@@ -2449,14 +2472,14 @@ class ExtractionPipeline:
             if candidate.diagnostics.get("excluded_role_rejected"):
                 continue
             if not (
-                self.options.min_output_seconds
+                MIN_TARGET_SECONDS - 1e-9
                 <= candidate.duration
                 <= self.options.max_sentence_seconds
             ):
                 continue
             span = TimeSpan(candidate.start, candidate.end)
             if any(
-                min(span.end, excluded.end) - max(span.start, excluded.start) > 0.05
+                min(span.end, excluded.end) - max(span.start, excluded.start) > 1e-9
                 for excluded in excluded_spans
             ):
                 continue
@@ -2468,15 +2491,16 @@ class ExtractionPipeline:
                 # would duplicate half of an existing sentence.
                 continue
             wave = self._waveform_span(stem_waveform, span)
-            if wave.numel() < window:
+            if wave.numel() < round(MIN_TARGET_SECONDS * sr) - 1:
                 continue
             scores = []
-            for pos in window_starts(wave.numel()):
+            # score_window pads its encoder input, never the source interval.
+            for pos in window_starts(wave.numel()) or [0]:
                 value = scorer(
-                    TimeSpan(span.start + pos / sr, span.start + (pos + window) / sr),
+                    TimeSpan(span.start + pos / sr, min(span.end, span.start + (pos + window) / sr)),
                     wave[pos:pos + window],
                 )
-                if value is None:
+                if value is None or not math.isfinite(value):
                     scores = []
                     break
                 scores.append(value)
@@ -4968,9 +4992,9 @@ class ExtractionPipeline:
         export_stem, raw_master, export_rate = prepare_masters(
             stem, source_media, output_dir, self.options.export_sample_rate)
         for candidate in [*accepted, *rejected]:
+            candidate.diagnostics['aligned_vocal_audio'] = str(export_stem.resolve())
             if raw_master:
                 candidate.diagnostics['aligned_raw_audio'] = str(raw_master.resolve())
-                candidate.diagnostics['aligned_vocal_audio'] = str(export_stem.resolve())
             candidate.diagnostics['export_sample_rate'] = export_rate
         cluster_report = getattr(self, "_cluster_report", None)
         if cluster_report is not None:
@@ -5025,43 +5049,6 @@ class ExtractionPipeline:
                 write_clip(export_stem, rejected_path, candidate.start, candidate.end, sample_rate=export_rate)
                 _record_acoustic_quality(candidate, rejected_path)
                 candidate.audio_file = str(rejected_path.relative_to(output_dir))
-        cluster_removed = [c for c in rejected
-                           if c.diagnostics.get("cluster_removed")
-                           and c.diagnostics.get("cluster_tier") != "B"]
-        if cluster_removed:
-            outlier_dir = output_dir / "cluster_outliers"
-            outlier_dir.mkdir(exist_ok=True)
-            for index, candidate in enumerate(cluster_removed, 1):
-                path = outlier_dir / f"{index:04d}.wav"
-                write_clip(export_stem, path, candidate.start, candidate.end, sample_rate=export_rate)
-                _record_acoustic_quality(candidate, path)
-                candidate.audio_file = str(path.relative_to(output_dir))
-                path.with_suffix(".txt").write_text(
-                    f"{candidate.start:.3f}–{candidate.end:.3f}\n{candidate.reject_reason}\n"
-                    f"簇 {candidate.diagnostics.get('cluster_ids')}；目标簇 "
-                    f"{candidate.diagnostics.get('cluster_target_id')}", encoding="utf-8")
-        # Keep uncertain candidates in a separate review directory regardless
-        # of whether the caller requested rejected audio.
-        borderline = [c for c in rejected if c.diagnostics.get("cluster_tier") == "B"]
-        if borderline:
-            borderline_dir = output_dir / "_borderline"
-            borderline_dir.mkdir(exist_ok=True)
-            for index, candidate in enumerate(borderline, 1):
-                stem_name = f"{index:04d}_{_safe_name(candidate.text or candidate.whisper_text)}"
-                path = borderline_dir / f"{stem_name}.wav"
-                write_clip(export_stem, path, candidate.start, candidate.end, sample_rate=export_rate)
-                _record_acoustic_quality(candidate, path)
-                candidate.audio_file = str(path.relative_to(output_dir))
-                text_path = borderline_dir / f"{stem_name}.txt"
-                text_path.write_text(
-                    candidate.text or candidate.whisper_text or "", encoding="utf-8")
-                path.with_suffix(".txt").write_text(
-                    f"{candidate.start:.3f}–{candidate.end:.3f}\n"
-                    f"{candidate.text or candidate.whisper_text or ''}\n"
-                    f"{candidate.diagnostics.get('cluster_reason', '')}\n"
-                    f"簇 {candidate.diagnostics.get('cluster_ids')}", encoding="utf-8")
-                candidate.audio_file = str(path.relative_to(output_dir))
-
         subtitle_guide = getattr(self, "_subtitle_guide", None)
         if subtitle_guide is not None:
             for candidate in [*accepted, *rejected]:
@@ -5260,6 +5247,7 @@ class ExtractionPipeline:
                     mode=self.options.cluster_identity_mode,
                     min_seconds=self.options.min_output_seconds,
                     blocked_spans=blocked, local=local,
+                    island_arbitration=analyzer.wespeaker_island_evidence,
                 )
                 # STT 精裁阶段要用已验证干净区间判定每个文本分片的归属。
                 self._cluster_accepted_spans = list(
@@ -5287,7 +5275,7 @@ class ExtractionPipeline:
                 progress(0.80, f"簇级判决 {self.options.cluster_identity_mode}："
                          f"目标簇 {cluster_result.target_cluster_id}，"
                          f"通过 {sum(cluster_result.membership)} 轮，撤下 {changes['removed']} 段，"
-                         f"边缘池 {changes.get('borderline', 0)} 段")
+                         f"身份未决 {changes.get('borderline', 0)} 段不导出")
             finally:
                 analyzer.close()
 
@@ -7003,14 +6991,33 @@ class ExtractionPipeline:
                                    if span.start <= item.start and item.end <= span.end]
                         parent = min(parents, key=lambda span: span.duration) if parents else item
                         item.diagnostics["acoustic_parent_span"] = [parent.start, parent.end]
-                self._refine_cropped_sentences(
-                    accepted_turns, target_waveform,
-                    [*blocked_join_spans, *pre_singing_spans, *residual_singing, *overlap_evidence])
                 self._enforce_atomic_boundaries(
                     accepted_turns, rejected, verifier, profile, target_waveform, exclusion_profiles)
                 pitch_rejected = self._filter_pitch_register(accepted_turns, rejected, target_waveform)
                 if pitch_rejected:
-                    progress(0.80, f"声道几何复核：{pitch_rejected} 段声纹边缘冲突转入待复核")
+                    progress(0.80, f"声道几何复核：{pitch_rejected} 段声纹边缘冲突未通过筛选")
+                before_join = len(accepted_turns)
+                from .utterance_assembly import gap_verifier
+                regions = (self._cluster_report or {}).get('diagnostics', {}).get('trajectory_spans', ())
+                assembly_blocks = [*((s.start, s.end) for s in self._raw_blocked_spans),
+                                   *self.options.user_excluded_spans]
+                accepted_turns = merge_certified_contiguous(
+                    accepted_turns,
+                    regions=regions,
+                    blocked=assembly_blocks,
+                    maximum_seconds=min(20., self.options.max_sentence_seconds),
+                    maximum_gap_seconds=self.options.silence_split_seconds,
+                    gap_verified=gap_verifier(
+                        target_waveform, regions=regions,
+                        sources=[*accepted_turns, *rejected], blocked=assembly_blocks),
+                )
+                # Assemble first: snapping two internal edges independently can
+                # create a new gap in an otherwise certified continuous sentence.
+                self._refine_cropped_sentences(
+                    accepted_turns, target_waveform,
+                    [*blocked_join_spans, *pre_singing_spans, *residual_singing, *overlap_evidence])
+                if len(accepted_turns) < before_join:
+                    progress(0.80, f"连续目标语音合并：消除 {before_join - len(accepted_turns)} 处重复切口")
                 certified = sum(
                     self._install_acoustic_identity_certificate(candidate)
                     for candidate in accepted_turns
@@ -7069,44 +7076,6 @@ class ExtractionPipeline:
                     progress=lambda value, message: progress(0.92 + 0.02 * value, message))
             else:
                 progress(0.92, "筛选完成：没有目标人物回合，跳过 STT")
-            # Supply transcripts for candidates held for manual review.
-            borderline_turns = [
-                c for c in rejected if c.diagnostics.get("cluster_tier") == "B"]
-            if borderline_turns:
-                # 作用域修复：无论主输出多少段，Tier B 边缘池永远补齐台词。
-                if segmenter is None:
-                    segmenter = WhisperSegmenter(self.device)
-                progress(0.93, f"为 {len(borderline_turns)} 段边缘候选补齐 STT 台词")
-                borderline_transcribed = segmenter.transcribe_spans(
-                    stem,
-                    [TimeSpan(c.start, c.end) for c in borderline_turns],
-                    progress=lambda value, message: progress(0.93, message),
-                )
-                by_borderline: dict[int, list[CandidateSentence]] = {}
-                for fragment in borderline_transcribed:
-                    span_index = int(fragment.diagnostics.get("transcription_span_index", -1))
-                    by_borderline.setdefault(span_index, []).append(fragment)
-                for index, candidate in enumerate(borderline_turns):
-                    fragments = by_borderline.get(index, [])
-                    if not fragments:
-                        continue
-                    fragments.sort(key=lambda item: (item.start, item.end))
-                    candidate_text = ""
-                    for fragment in fragments:
-                        candidate_text = self._join_transcript_text(
-                            candidate_text, fragment.whisper_text)
-                    candidate_text = candidate_text.strip()
-                    if not candidate_text:
-                        continue
-                    candidate.whisper_text = candidate_text
-                    candidate.language = _language_from_text(candidate_text, "auto")
-                    corrected, correction = self._correct_text_with_subtitle(
-                        candidate_text, candidate.language,
-                        candidate.start, candidate.end, self._subtitle_guide)
-                    candidate.text = corrected
-                    if correction:
-                        candidate.diagnostics.update(correction)
-                    candidate.diagnostics["stt_fragment_count"] = len(fragments)
             self._refine_cropped_sentences(
                 accepted, target_waveform,
                 [*blocked_join_spans, *pre_singing_spans, *residual_singing, *overlap_evidence])

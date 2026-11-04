@@ -105,12 +105,12 @@ def merge_datasets(batches, destination, *, speaker='target', language='JA', tar
                 with zipfile.ZipFile(reviewed) as incoming:
                     report = json.loads(incoming.read('dataset_report.json'))
                     sources.append({'batch_id': batch.name, 'selected': report['total_sentences'],
-                                    'skipped_quality': list(report['skipped_quality']), 'skipped_partial': report['skipped_partial']})
+                                    'skipped_quality': list(report['skipped_quality']),
+                                    'skipped_partial': report['skipped_partial'],
+                                    'skipped_empty_text': report['skipped_empty_text']})
                     skipped_quality.extend({'batch_id': batch.name, 'ordinal': ordinal}
                                            for ordinal in report['skipped_quality'])
                     for clip in report['clips']:
-                        if not clip['valid_text']:
-                            continue
                         source = root / 'source.wav'
                         source.write_bytes(incoming.read(clip['path']))
                         identity, _ = _audio_identity(source, clip['duration_seconds'])
@@ -140,11 +140,16 @@ def merge_datasets(batches, destination, *, speaker='target', language='JA', tar
                         archive.write(mastered, name)
                         archive.writestr(str(Path(name).with_suffix('.txt')).replace('\\', '/'), clip['text'])
             if not records:
-                raise ValueError('没有可导出的已复核、带文本片段')
+                raise ValueError('没有可导出的已复核音频片段')
             stats = write_training_manifests(archive, records, speaker)
-            archive.writestr('train.list', ''.join(f"{r['path']}|{speaker}|{r['language']}|{r['text']}\n" for r in records))
+            archive.writestr('train.list', ''.join(
+                f"{r['path']}|{speaker}|{r['language']}|{r['text']}\n"
+                for r in records if r['valid_text']))
+            skipped_empty_text = [{'batch_id': r['batch_id'], 'ordinal': r['ordinal']}
+                                  for r in records if not r['valid_text']]
             report = _dataset_report(records, {'duplicate_clips': duplicates, 'duplicate_ordinals': duplicates,
-                'skipped_empty_text': [], 'skipped_quality': skipped_quality, 'skipped_partial': []}, True, min_quality_grade)
+                'skipped_empty_text': skipped_empty_text, 'skipped_quality': skipped_quality,
+                'skipped_partial': []}, True, min_quality_grade)
             report.update(batches=sources, target_lufs=target_lufs, true_peak_dbtp=true_peak,
                           lufs_min=min(r['loudness']['output_lufs'] for r in records),
                           lufs_max=max(r['loudness']['output_lufs'] for r in records),
@@ -153,5 +158,6 @@ def merge_datasets(batches, destination, *, speaker='target', language='JA', tar
             archive.writestr('dataset_report.md', _report_markdown(report))
         save_file(package, Path(destination))
     return {**stats, 'batch_count': len(batches), 'duplicate_count': len(duplicates),
-            'skipped_quality': skipped_quality,
+            'audio_count': len(records), 'total_audio_duration_seconds': report['total_duration_seconds'],
+            'skipped_empty_text': skipped_empty_text, 'skipped_quality': skipped_quality,
             'loudness_target_misses': report['loudness_target_misses']}

@@ -91,11 +91,10 @@ class DesktopCorpusTools:
                 messagebox.showerror('读取失败', str(exc), parent=dialog); return
             speaker, language = self.review.export_speaker.get(), self.review.export_language.get()
             quality = {'Gold': 'Gold', 'Silver': 'Silver'}.get(self.review.quality_var.get())
-            restore = self.review.restore_hf_var.get()
             dialog.destroy(); self.review.current_status_var.set('正在合并、去重并统一响度…')
             payload = {'batches': [str(path.resolve()) for path in selected], 'destination': destination,
                        'options': dict(speaker=speaker, language=language, target_lufs=target, true_peak=ceiling,
-                                       min_quality_grade=quality, restore_high_frequencies=restore)}
+                                       min_quality_grade=quality)}
             import sys
             operation = invoke if getattr(sys, 'frozen', False) else execute
             self.work(lambda: operation('merge', payload),

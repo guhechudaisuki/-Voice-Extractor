@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import math
 import sys
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -3085,6 +3086,81 @@ class LocalSpeakerTurnSplitter:
             and primary_drop >= minimum_similarity_drop * 0.25
         )
         return low_cross_similarity and corroborated_drop
+
+    def confirm_boundary_proposals(
+        self, waveform: torch.Tensor, span: TimeSpan, proposals: Iterable[float],
+        *, context_seconds: float = 1.2, minimum_context_seconds: float = .35,
+        primary_threshold: float = .68, secondary_threshold: float = .52,
+        minimum_similarity_drop: float = .06, silence_db: float = -60.,
+    ) -> list[float]:
+        """Confirm proposed cuts using both models and within-side baselines.
+
+        Neighbouring proposals bound each context, so a brief intervening
+        speaker is never averaged together with speech beyond the next cut.
+        An invalid or silent context supplies no evidence for a hard boundary.
+        """
+        if not (0 < minimum_context_seconds <= context_seconds):
+            raise ValueError("Invalid boundary confirmation context")
+        points = sorted({float(point) for point in proposals
+                         if math.isfinite(float(point))
+                         and span.start + minimum_context_seconds <= float(point)
+                         <= span.end - minimum_context_seconds})
+        if not points:
+            return []
+        wave = waveform.detach().reshape(-1)
+        edges = [span.start, *points, span.end]
+        plans = []
+        for index, point in enumerate(points, 1):
+            left = max(edges[index - 1], point - context_seconds)
+            right = min(edges[index + 1], point + context_seconds)
+            if min(point - left, right - point) < minimum_context_seconds - 1e-9:
+                continue
+            a, b, c = [round(value * self.SAMPLE_RATE) for value in (left, point, right)]
+            if not 0 <= a < b < c <= wave.numel():
+                continue
+            middle_left, middle_right = (a + b) // 2, (b + c) // 2
+            ranges = ((a, b), (b, c), (a, middle_left), (middle_left, b),
+                      (b, middle_right), (middle_right, c))
+            if any(end <= start or not bool(torch.isfinite(wave[start:end]).all())
+                   or self._rms_db(wave[start:end]) <= silence_db for start, end in ranges):
+                continue
+            plans.append((point, ranges))
+        if not plans:
+            return []
+
+        def similarities(encoder, active):
+            ranges = list(dict.fromkeys(pair for _, pairs in active for pair in pairs))
+            # The encoders' cached batches also reuse these views later in the run.
+            embeddings = torch.as_tensor(encoder._embeddings_from_waveforms(
+                [wave[start:end] for start, end in ranges])).float().cpu()
+            if embeddings.ndim != 2 or len(embeddings) != len(ranges):
+                raise ValueError("One embedding is required for each boundary context")
+            valid = torch.isfinite(embeddings).all(dim=1) & (embeddings.norm(dim=1) > 1e-8)
+            embeddings = F.normalize(embeddings, dim=1)
+            cache = {key: (embedding if ok else None)
+                     for key, embedding, ok in zip(ranges, embeddings, valid)}
+            scores = {}
+            for point, pairs in active:
+                rows = [cache[pair] for pair in pairs]
+                if any(row is None for row in rows):
+                    continue
+                cross = float(rows[0] @ rows[1])
+                baseline = min(float(rows[2] @ rows[3]), float(rows[4] @ rows[5]))
+                scores[point] = cross, baseline - cross
+            return scores
+
+        primary = similarities(self.primary, plans)
+        candidates = [(point, pairs) for point, pairs in plans if point in primary
+                      and primary[point][0] <= primary_threshold
+                      and primary[point][1] >= minimum_similarity_drop * .25]
+        if not candidates:
+            return []
+        secondary = similarities(self._ensure_secondary(), candidates)
+        return [point for point, _ in candidates if point in secondary
+                and self._is_confirmed_change(
+                    primary[point][0], secondary[point][0],
+                    primary[point][1], secondary[point][1],
+                    primary_threshold, secondary_threshold, minimum_similarity_drop)]
 
     @staticmethod
     def _collapse_candidates(

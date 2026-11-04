@@ -252,6 +252,19 @@ class ClusterAnalyzer:
             rejected.extend(demoted)
         return len(demoted)
 
+    def wespeaker_island_evidence(self, start: float, end: float):
+        """Require independent utterance support before extending its islands.
+
+        Original candidate flags and coarse scores cannot exempt newly added
+        audio. Missing or non-finite evidence leaves the old proposal intact.
+        """
+        score = self.wespeaker_score(start, end)
+        floor = getattr(self, 'quaternary_floor', None)
+        score = float(score) if score is not None and np.isfinite(score) else None
+        floor = float(floor) if floor is not None and np.isfinite(floor) else None
+        return {'accepted': score is not None and floor is not None and score >= floor,
+                'score': score, 'floor': floor, 'method': 'wespeaker_continuous_parent'}
+
     def _file_embedding(self, path):
         key = cache_key(file_digest(path), 0, 0, self.model_hash)
         return self.cache.get_or_compute(key, lambda: tuple(

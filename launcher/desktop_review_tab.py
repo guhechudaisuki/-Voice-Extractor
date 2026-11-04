@@ -44,7 +44,6 @@ class DesktopReviewTab:
         self.reviews: dict[str, dict] = {}
         self.filter_var = tk.StringVar(value="全部可审片段")
         self.gpt_list_var = tk.BooleanVar(value=True)
-        self.restore_hf_var = tk.BooleanVar(value=False)
         self.quality_var = tk.StringVar(value='全部质量')
         self.blind_mode_var = tk.BooleanVar(value=True)
         self.auto_next_var = tk.BooleanVar(value=True)
@@ -87,14 +86,13 @@ class DesktopReviewTab:
         filter_row.grid(row=2, column=0, sticky="ew", pady=(0, 6))
         self.filter_combo = ttk.Combobox(
             filter_row, state="readonly", textvariable=self.filter_var, width=32,
-            values=("全部可审片段", "✅ 主输出 Tier A（高确信）",
-                    "⚡ 边缘待捡漏 Tier B", "🚫 已撤下片段", "高信息量"))
+            values=("全部可审片段", "高信息量"))
         self.filter_combo.pack(side="left", fill="x", expand=True)
         self.filter_combo.bind("<<ComboboxSelected>>", lambda _e: self._render_tree())
         ttk.Button(filter_row, text="一键信任主输出", width=14,
                    command=self.trust_main_output).pack(side="right")
-        ttk.Button(filter_row, text="⚡ 采纳高分边缘句",
-                   command=self.trust_borderline).pack(side="right")
+        self.borderline_button = ttk.Button(filter_row, text="采纳高分候选",
+                                            command=self.trust_borderline)
 
         progress_row = ttk.Frame(left_card, style="Card.TFrame")
         progress_row.grid(row=3, column=0, sticky="ew", pady=(0, 6))
@@ -271,7 +269,6 @@ class DesktopReviewTab:
         ttk.Label(speaker_row, text='未知语言回退值').pack(side='left')
         ttk.Entry(speaker_row, textvariable=self.export_language, width=6).pack(side='left', padx=6)
         ttk.Checkbutton(raw_row, text='附带 GPT-SoVITS train.list', variable=self.gpt_list_var).pack(side='left', padx=12)
-        ttk.Checkbutton(bottom_bar,text='Gold 高频细节回填（需原轨）',variable=self.restore_hf_var).pack(anchor='w')
         ttk.Combobox(bottom_bar, textvariable=self.quality_var, state="readonly",
                      values=("全部质量", "Silver", "Gold"), width=16).pack(anchor="w", pady=4)
         self.export_button = ttk.Button(bottom_bar, text="导出 ZIP", command=self.export_verified_zip)
@@ -392,6 +389,20 @@ class DesktopReviewTab:
             manifest = {'sentences': [{'accepted': True, 'audio_file': seg['filename'], 'start': 0,
                                       'end': seg['duration'], 'text': seg['stt_text']} for seg in self.segments]}
         self.manifest = manifest
+        views = {self._segment_view(seg) for seg in self.segments}
+        filters = ["全部可审片段", "高信息量"]
+        if len(views) > 1 and "A" in views:
+            filters.append("主输出")
+        if "B" in views:
+            filters.append("已保存候选")
+            self.borderline_button.pack(side="right")
+        else:
+            self.borderline_button.pack_forget()
+        if "removed" in views:
+            filters.append("已撤下片段")
+        self.filter_combo.configure(values=filters)
+        if self.filter_var.get() not in filters:
+            self.filter_var.set("全部可审片段")
         self.current_index = -1
         self.include_material_var.set(False)
         self._render_tree()
@@ -413,9 +424,7 @@ class DesktopReviewTab:
             "skip": "⊘ 跳过",
         }
         view = self.filter_var.get()
-        view_filter = {"✅ 主输出 Tier A（高确信）": "A",
-                       "⚡ 边缘待捡漏 Tier B": "B",
-                       "🚫 已撤下片段": "removed"}.get(view)
+        view_filter = {"主输出": "A", "已保存候选": "B", "已撤下片段": "removed"}.get(view)
         indexed = list(enumerate(self.segments))
         if view == '高信息量':
             indexed.sort(key=lambda item: information_rank(item[1].get('row',{})),reverse=True)
@@ -478,7 +487,7 @@ class DesktopReviewTab:
             }
         self._render_tree()
         self.save_review(show_prompt=False)
-        self.current_status_var.set(f'已信任 {len(pending)} 段主输出；请切到「⚡ 边缘待捡漏 Tier B」继续捡漏')
+        self.current_status_var.set(f'已将 {len(pending)} 段输出标为目标匹配')
 
     def trust_borderline(self):
         pending = [seg for seg in self.segments
@@ -816,7 +825,6 @@ class DesktopReviewTab:
         include_gpt_list = self.gpt_list_var.get() and not include_material
         min_quality = self.quality_var.get() if self.quality_var.get() != "全部质量" else None
         speaker, language = self.export_speaker.get(), self.export_language.get()
-        restore_hf = self.restore_hf_var.get()
         self.export_busy = True
         self.export_button.configure(state='disabled')
         self.current_status_var.set('正在打包标注与音频…' if include_material else '正在导出合格音频…')
@@ -824,7 +832,6 @@ class DesktopReviewTab:
             try:
                 stats = {}
                 count = export_review_zip(batch, manifest, reviews, Path(destination), include_material,
-                    restore_high_frequencies=restore_hf,
                                           gpt_sovits_list=include_gpt_list, min_quality_grade=min_quality,
                                           speaker=speaker, language=language,
                                           stats=stats)

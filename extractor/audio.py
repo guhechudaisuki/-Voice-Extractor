@@ -16,6 +16,7 @@ import torchaudio
 
 from .config import FFMPEG, FFPROBE, UVR_MODEL, UVR_ROOT
 from .types import TimeSpan
+from .stem_stitching import write_stitched_stem
 
 
 def _run(command: list[str]) -> subprocess.CompletedProcess[str]:
@@ -156,6 +157,9 @@ def extract_audio_range(source: Path, destination: Path, start: float, end: floa
 
 def pad_for_separator(path: Path, minimum_seconds: float = 6.0) -> float:
     """Pad very short files so UVR's multi-band inverse STFT has valid edges."""
+    info = sf.info(str(path))
+    if info.frames >= int(round(minimum_seconds * info.samplerate)):
+        return info.frames / info.samplerate
     data, sr = sf.read(str(path), always_2d=True, dtype="float32")
     original_duration = len(data) / sr
     minimum_frames = int(round(minimum_seconds * sr))
@@ -167,6 +171,9 @@ def pad_for_separator(path: Path, minimum_seconds: float = 6.0) -> float:
 
 
 def trim_audio_in_place(path: Path, duration: float) -> Path:
+    info = sf.info(str(path))
+    if info.subtype == 'PCM_16' and 0 < info.frames <= int(round(duration * info.samplerate)):
+        return path
     data, sr = sf.read(str(path), always_2d=True, dtype="float32")
     frames = max(1, min(len(data), int(round(duration * sr))))
     sf.write(str(path), data[:frames], sr, subtype="PCM_16")
@@ -383,93 +390,57 @@ class UVR5Separator:
                 shutil.rmtree(chunk_root, ignore_errors=True)
                 chunk_root.mkdir(parents=True, exist_ok=True)
                 active_chunk_roots.append(chunk_root)
-                pieces: list[tuple[float, np.ndarray, int]] = []
-                for chunk_index in range(chunk_count):
-                    start = chunk_index * step
-                    end = min(duration, start + chunk_seconds)
-                    if end <= start:
-                        continue
-                    label = f"文件 {item_index}/{len(items)}，块 {chunk_index + 1}/{chunk_count}"
-                    base_progress = completed_chunks / max(1, total_chunks)
-                    progress(base_progress, f"UVR 分离：{label}，正在准备")
-                    source_chunk = chunk_root / f"input_{chunk_index:04d}.wav"
-                    extract_audio_range(source, source_chunk, start, end)
-                    actual_duration = pad_for_separator(source_chunk, minimum_seconds=6.0)
-                    progress(
-                        (completed_chunks + 0.05) / max(1, total_chunks),
-                        f"UVR 分离：{label}，已解码，开始运行模型",
-                    )
-                    generated = chunk_root / f"vocal_{source_chunk.name}_10.wav"
-                    pre._path_audio_(
-                        str(source_chunk),
-                        ins_root=None,
-                        vocal_root=str(chunk_root),
-                        format="wav",
-                        is_hp3=False,
-                    )
-                    progress(
-                        (completed_chunks + 0.90) / max(1, total_chunks),
-                        f"UVR 分离：{label}，模型完成，正在整理",
-                    )
-                    if not generated.exists():
-                        raise RuntimeError(f"UVR5 未生成预期文件：{generated}")
-                    stem_data, stem_rate = sf.read(str(generated), always_2d=True, dtype="float32")
-                    if not np.isfinite(stem_data).all():
-                        raise RuntimeError(f"UVR5 输出包含 NaN/Inf：{source.name}")
-                    expected_frames = max(1, int(round(actual_duration * stem_rate)))
-                    stem_data = np.nan_to_num(stem_data[:expected_frames])
-                    if len(stem_data) < expected_frames:
-                        stem_data = np.pad(stem_data, ((0, expected_frames - len(stem_data)), (0, 0)))
-                    pieces.append((start, stem_data, stem_rate))
-                    completed_chunks += 1
-                    progress(
-                        completed_chunks / max(1, total_chunks),
-                        f"UVR 分离：{label}，处理完成",
-                    )
+                def separated_chunks():
+                    nonlocal completed_chunks
+                    for chunk_index in range(chunk_count):
+                        start = chunk_index * step
+                        end = min(duration, start + chunk_seconds)
+                        if end <= start:
+                            continue
+                        label = f"文件 {item_index}/{len(items)}，块 {chunk_index + 1}/{chunk_count}"
+                        base_progress = completed_chunks / max(1, total_chunks)
+                        progress(base_progress, f"UVR 分离：{label}，正在准备")
+                        source_chunk = chunk_root / f"input_{chunk_index:04d}.wav"
+                        extract_audio_range(source, source_chunk, start, end)
+                        actual_duration = pad_for_separator(source_chunk, minimum_seconds=6.0)
+                        progress(
+                            (completed_chunks + 0.05) / max(1, total_chunks),
+                            f"UVR 分离：{label}，已解码，开始运行模型",
+                        )
+                        generated = chunk_root / f"vocal_{source_chunk.name}_10.wav"
+                        pre._path_audio_(
+                            str(source_chunk),
+                            ins_root=None,
+                            vocal_root=str(chunk_root),
+                            format="wav",
+                            is_hp3=False,
+                        )
+                        progress(
+                            (completed_chunks + 0.90) / max(1, total_chunks),
+                            f"UVR 分离：{label}，模型完成，正在整理",
+                        )
+                        if not generated.exists():
+                            raise RuntimeError(f"UVR5 未生成预期文件：{generated}")
+                        stem_data, stem_rate = sf.read(str(generated), always_2d=True, dtype="float32")
+                        if not np.isfinite(stem_data).all():
+                            raise RuntimeError(f"UVR5 输出包含 NaN/Inf：{source.name}")
+                        expected_frames = max(1, int(round(actual_duration * stem_rate)))
+                        stem_data = np.nan_to_num(stem_data[:expected_frames])
+                        if len(stem_data) < expected_frames:
+                            stem_data = np.pad(stem_data, ((0, expected_frames - len(stem_data)), (0, 0)))
+                        source_chunk.unlink(missing_ok=True)
+                        generated.unlink(missing_ok=True)
+                        completed_chunks += 1
+                        progress(
+                            completed_chunks / max(1, total_chunks),
+                            f"UVR 分离：{label}，处理完成",
+                        )
 
-                if not pieces:
-                    raise RuntimeError(f"UVR5 未产生有效分块：{source.name}")
-                sample_rate = pieces[0][2]
-                total_frames = max(1, int(round(duration * sample_rate)))
-                channels = pieces[0][1].shape[1]
-                mixed = np.zeros((total_frames, channels), dtype=np.float64)
-                weights = np.zeros((total_frames, 1), dtype=np.float64)
-                placements: list[tuple[int, int, np.ndarray]] = []
-                for start, piece, piece_rate in pieces:
-                    if piece_rate != sample_rate:
-                        raise RuntimeError("UVR5 分块采样率不一致")
-                    if piece.shape[1] != channels:
-                        raise RuntimeError("UVR5 分块声道数不一致")
-                    begin = max(0, int(round(start * sample_rate)))
-                    finish = min(total_frames, begin + len(piece))
-                    if finish <= begin:
-                        continue
-                    length = finish - begin
-                    placements.append((begin, finish, piece[:length]))
+                        yield start, stem_data, stem_rate
 
-                for piece_index, (begin, finish, piece) in enumerate(placements):
-                    length = finish - begin
-                    blend = np.ones((length, 1), dtype=np.float64)
-                    if piece_index > 0:
-                        previous_finish = placements[piece_index - 1][1]
-                        fade_frames = min(length, max(0, previous_finish - begin))
-                        if fade_frames:
-                            blend[:fade_frames, 0] *= (
-                                np.arange(1, fade_frames + 1, dtype=np.float64) / (fade_frames + 1)
-                            )
-                    if piece_index + 1 < len(placements):
-                        next_begin = placements[piece_index + 1][0]
-                        fade_frames = min(length, max(0, finish - next_begin))
-                        if fade_frames:
-                            blend[-fade_frames:, 0] *= (
-                                np.arange(fade_frames, 0, -1, dtype=np.float64) / (fade_frames + 1)
-                            )
-                    mixed[begin:finish] += piece * blend
-                    weights[begin:finish] += blend
-                if np.any(weights <= 0.0):
-                    raise RuntimeError("UVR5 分块拼接出现未覆盖的音频区间")
-                mixed = (mixed / weights).astype(np.float32)
-                sf.write(str(output), mixed, sample_rate, subtype="PCM_16")
+                write_stitched_stem(
+                    separated_chunks(), output, duration,
+                    [index * step for index in range(chunk_count)])
                 shutil.rmtree(chunk_root, ignore_errors=True)
                 active_chunk_roots.remove(chunk_root)
                 results.append(output)
