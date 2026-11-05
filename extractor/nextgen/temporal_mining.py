@@ -49,6 +49,7 @@ class TemporalMiner:
         self.anime = getattr(analyzer, "_temporal_anime", {})
         analyzer._temporal_embeddings, analyzer._temporal_anime = self.embeddings, self.anime
         self.window_scores, self.cohort_scores = {}, {}
+        self.quality_cache = {}
         self.scoring_profiles = {}
         self.uncached_turns = []
         self.whole_turn_fallbacks = []
@@ -209,7 +210,7 @@ class TemporalMiner:
                     for role, centroid in getattr(self.analyzer, "tertiary_negatives", ())}
             exclusion = self.manifold.exclusion(
                 scores, negatives, getattr(self.analyzer, "exclusion_audit", None),
-                independent_margins)
+                independent_margins, observations=observations)
             geometry = (self.manifold.geometry(p, s, start, end, self.scene_exclusion, observations)
                         if scene else None)
             dialogue = (self.dialogue.evaluate(p, s, start, end, self.scene_exclusion)
@@ -227,8 +228,28 @@ class TemporalMiner:
                 self.competitors, self._independent_rivals(start,end)) if not independent}
             prosody = (self.analyzer.prosody(start,end) if self.manifold.prosody_reference is not None
                        and end-start >= .8 else None)
+            physical = None
+            wave = getattr(self.analyzer, 'waveform', None)
+            if wave is not None:
+                from .quality_fusion import measure_quality
+                if (start,end) not in self.quality_cache:
+                    self.quality_cache[start,end] = measure_quality(wave,start,end,
+                        getattr(self.analyzer,'raw_waveform',None),len(self.competitors))
+                physical = self.quality_cache[start,end]
+            raw_evidence = None
+            if physical is not None and physical.get('high_band_loss',0.)>.15:
+                raw = self.analyzer.embed_raw(start,end)
+                if raw is not None:
+                    raw_scores,raw_negatives = self.analyzer.scores(*raw)
+                    raw_exclusion = self.manifold.exclusion(raw_scores,raw_negatives,
+                        getattr(self.analyzer,'exclusion_audit',None))
+                    if raw_exclusion['passed'] and not raw_exclusion['conflict']:
+                        raw_evidence = min((score-self.manifold.floors[c])/self.manifold.scales[c]
+                            for c,score in zip(('primary','secondary'),raw_scores))
             evidence = self.manifold.evaluate(observations, (cm_p, cm_s), exclusion,
                 geometry, dialogue, physiology, vectors, excluded_cluster_ids=excluded_clusters, prosody=prosody,
+                physical_quality=physical,
+                raw_channel_evidence=raw_evidence,
                 vocal_geometry=(self.analyzer.vocal_geometry_evidence(start,end)
                     if end-start >= .8 and hasattr(self.analyzer,'references') else None))
             margins_ok = exclusion["strict_passed"]
@@ -280,11 +301,43 @@ class TemporalMiner:
                     rs = self.competitor_secondary[mask] @ vectors['secondary']
                     tp = float(np.max(self.target_primary @ vectors['primary']))
                     ts = float(np.max(self.target_secondary @ vectors['secondary']))
-                    rival_supported = bool(np.any((rp > p_floor) & (rs > s_floor)
-                        & (rp-tp > self.margin) & (rs-ts > self.margin)))
-                excluded_supported = any(np_ > p_floor and ns > s_floor
-                    and np_-p_score > self.margin and ns-s_score > self.margin
-                    for _,np_,ns in negatives)
+                    supported = ((rp > p_floor) & (rs > s_floor)
+                        & (rp-tp > self.margin) & (rs-ts > self.margin))
+                    # Keep the actual rival and absolute support auditable. A
+                    # negative target/cohort margin alone cannot explain an
+                    # "other" label or distinguish a shared phoneme from it.
+                    rows[-1]['rival_evidence'] = [
+                        {'cluster_id': cluster.cluster_id, 'primary': float(a),
+                         'secondary': float(b), 'target_primary': tp,
+                         'target_secondary': ts, 'supported': bool(ok)}
+                        for cluster, a, b, ok in zip(
+                            [c for c, keep in zip(self.competitors, mask) if keep],
+                            rp, rs, supported) if ok]
+                    rivals = rows[-1]['rival_evidence']
+                    if rivals:
+                        # Existing episode calibrators already hold independent
+                        # per-rival prototypes. No extra inference or persisted
+                        # adaptation is needed to distinguish competing labels.
+                        for channel in ('tertiary', 'anime_char', 'anime_va'):
+                            vector = vectors.get(channel)
+                            calibrator = self.manifold.calibrators.get(channel)
+                            target_score = observations.get(channel)
+                            if vector is None or calibrator is None or target_score is None:
+                                continue
+                            ids = self.manifold.cohort_cluster_ids.get(channel, ())
+                            scores_by_id = dict(zip(ids, calibrator.cohorts @ self.unit(vector)))
+                            for rival in rivals:
+                                if rival['cluster_id'] in scores_by_id:
+                                    rival.setdefault('independent_channels', {})[channel] = {
+                                        'score': float(scores_by_id[rival['cluster_id']]),
+                                        'target_score': float(target_score)}
+                    from .micro_rivals import specific_rival_evidence
+                    resolution = specific_rival_evidence(rivals, self.manifold.floors, self.margin)
+                    rows[-1]['rival_resolution'] = resolution
+                    rival_supported = resolution['supported']
+                # Use the same positive-impostor definition for micro labels
+                # and whole-sentence vetoes, including independent WavLM support.
+                excluded_supported = exclusion['conflict']
                 negative = bool(rival_supported or excluded_supported
                                 or evidence.get('same_va', {}).get('conflict'))
                 energy_method = getattr(self.analyzer, 'relative_window_energy', None)
@@ -329,7 +382,30 @@ class TemporalMiner:
 
     def _scan(self, turn):
         # Cache state affects cost only, never which acoustic windows are examined.
-        rows = []
+        rows = [dict(row, scale='whole') for row in
+                self._check([(turn.start, turn.end)], self.profile)]
+        if (turn.start, turn.end) in getattr(self.analyzer, 'whole_dual_verified_spans', ()):
+            for row in rows:
+                row['formal_whole_verified'] = True
+                row['accepted'] = True
+        if turn.index in self.raw_rescued and self.analyzer._rescue_eligible(turn):
+            # A raw-rescue index is only a proposal. Recheck that exact aligned
+            # interval, retain measured dry scores, and scan its local purity.
+            # The actual export continues to use only the separated stem.
+            raw = self.analyzer.embed_raw(turn.start, turn.end)
+            if raw is not None:
+                scores, _ = self.analyzer.scores(*raw)
+                passed = bool(scores[0] >= self.profile.primary_reference_floor + .04
+                    and scores[1] >= self.profile.secondary_reference_floor + .02
+                    and not self.analyzer._rescue_competitor_wins(
+                        turn, self.candidates, *raw, scores, self.turns))
+                for row in rows:
+                    row['raw_identity_audit'] = {
+                        'span': [turn.start, turn.end], 'passed': passed,
+                        'primary': float(scores[0]), 'secondary': float(scores[1]),
+                        'method': 'exact_aligned_raw_dual',
+                        'exclusion_checked': True, 'competitors_checked': True}
+                    row['accepted'] = bool(row['accepted'] or passed)
         levels = pyramid_spans(turn.start, turn.end)
         prefetch = getattr(self.analyzer, 'prefetch', None)
         if prefetch is not None:
@@ -354,6 +430,7 @@ class TemporalMiner:
         combined = []
         used = False
         for original, candidate in zip(rows, expanded):
+            candidate['scale'] = original.get('scale', candidate.get('scale'))
             if not original["accepted"] and supported(candidate):
                 combined.append({**candidate, "reference": label})
                 used = True
@@ -405,10 +482,40 @@ class TemporalMiner:
                 and (evidence.get("cohort_evidence") or 0.) > 0.)
 
     def _certify(self, turn, rows, *, scene=False):
+        key = str(turn.index)
+        from ..sentence_policy import whole_sentence_evidence
+        whole = whole_sentence_evidence(rows, turn.start, turn.end,
+            blocked=self.blocked,
+            change_points=getattr(self.analyzer, 'confirmed_change_points', ()))
+        if whole is not None:
+            clean = [[turn.start, turn.end]]
+            self.core_certificates[key] = clean
+            from .cluster_runtime import SHORT_TURN_SECONDS, _short_dialogue_path
+            if turn.duration <= SHORT_TURN_SECONDS:
+                # Keep specific pre-existing certificate provenance without
+                # running the crop/demotion machinery before whole protection.
+                coarse = [r for r in rows if r.get('scale') not in ('whole', 'micro')]
+                t_score = whole.get('tertiary_score')
+                t_strong = t_score is not None and t_score >= self.profile.tertiary_reference_floor + .03
+                path = _short_dialogue_path(turn.duration,
+                    whole['primary'] - self.certificate_profile.primary_reference_floor,
+                    whole['secondary'] - self.profile.secondary_reference_floor,
+                    coarse or [whole], t_strong,
+                    whole['cm_p'] if whole.get('cm_p') is not None else float('inf'),
+                    scene_distance=self._scene_distance(turn.start, turn.end) if scene else None)
+                if path:
+                    self.short_certificates[key] = path
+                else:
+                    self.short_certificates.setdefault(key, 'whole_sentence_multiview')
+            return clean, rows
+        whole_rows = [r for r in rows if r.get('scale') == 'whole']
+        clean, parts = self._certify_parts(turn, [r for r in rows if r.get('scale') != 'whole'], scene=scene)
+        return clean, [*whole_rows, *parts]
+
+    def _certify_parts(self, turn, rows, *, scene=False):
         from .cluster_runtime import (MIN_CLEAN_SUBSPAN, SHORT_TURN_SECONDS,
                                       WEAK_SECONDARY_SLACK, WINDOW_COHORT_PRIMARY,
                                       _clean_core_certified, _short_dialogue_path)
-
         key = str(turn.index)
         if any(row.get("scale") == "micro" for row in rows):
             # Preserve independently certified mesoscopic speech when a short
@@ -508,6 +615,7 @@ class TemporalMiner:
             for row in self.local.get(str(turn.index), ()):
                 start, end = row["span"]
                 if (not row["accepted"] or row.get("smoothed") or row.get("reference")
+                        or row.get('raw_identity_audit')
                         or row.get("scale") == "micro"
                         or row.get("scene_supported")
                         or row.get("identity_evidence", {}).get("physiology_compensation")
@@ -553,6 +661,8 @@ class TemporalMiner:
                            a.end - a.start, a.primary, a.secondary, a.confidence) for a in anchors]
 
     def run(self):
+        from .temporal_prefetch import prefetch_temporal_windows
+        prefetch_temporal_windows(self)
         for turn in self.turns:
             key = str(turn.index)
             if not self._eligible(turn):
@@ -563,9 +673,6 @@ class TemporalMiner:
                 self.clean[key] = self.previous[0].diagnostics.get("turn_clean_spans", {}).get(key, [])
                 self.membership[turn.index] = bool(self.clean[key])
                 self.supports[key] = self.previous[0].diagnostics.get("bootstrap_supports", {}).get(key, ())
-                continue
-            if turn.index in self.raw_rescued and self.candidates.membership[turn.index]:
-                self.clean[key], self.local[key] = [[turn.start, turn.end]], []
                 continue
             rows = self._scan(turn)
             independent = independent_vectors(self.bank, self.analyzer.source_hash, turn.start, turn.end)
@@ -590,6 +697,7 @@ class TemporalMiner:
             contextual = self._check([r["span"] for r in rows], self.profile, scene=True)
             combined = []
             for original, candidate in zip(rows, contextual):
+                candidate['scale'] = original.get('scale', candidate.get('scale'))
                 if original["accepted"]:
                     combined.append(original)
                     continue

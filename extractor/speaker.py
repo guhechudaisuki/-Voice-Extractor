@@ -13,6 +13,8 @@ import torchaudio
 
 from .config import CAMPLUS_MODEL, SV_CODE, SV_MODEL, WAVLM_SV_MODEL, WESPEAKER_MODEL
 from .audio import load_mono
+from .model_pool import pooled_encoder
+from .feature_bus import shared_fbank, shared_fbank_centered
 from .types import TimeSpan
 
 
@@ -244,12 +246,12 @@ class SpeakerVerifier:
                 batch_indexes = indexes[offset : offset + max(1, batch_size)]
                 features = torch.stack(
                     [
-                        self.kaldi.fbank(
-                            prepared[index].unsqueeze(0),
+                        shared_fbank(prepared[index], lambda wave: self.kaldi.fbank(
+                            wave.unsqueeze(0),
                             num_mel_bins=80,
                             sample_frequency=16000,
                             dither=0,
-                        )
+                        ), 'eres-kaldi-80-v1')
                         for index in batch_indexes
                     ]
                 )
@@ -447,12 +449,12 @@ class CAMPlusVerifier:
                 batch_indexes = indexes[offset : offset + max(1, batch_size)]
                 features = []
                 for index in batch_indexes:
-                    feature = torchaudio.compliance.kaldi.fbank(
-                        prepared[index].unsqueeze(0),
+                    feature = shared_fbank_centered(prepared[index], lambda wave: torchaudio.compliance.kaldi.fbank(
+                        wave.unsqueeze(0),
                         num_mel_bins=80,
                         sample_frequency=16000,
-                    )
-                    features.append(feature - feature.mean(dim=0, keepdim=True))
+                    ), 'torchaudio-kaldi-80-v1')
+                    features.append(feature)
                 with torch.inference_mode():
                     embeddings = self.model(torch.stack(features).to(self.device))
                     embeddings = F.normalize(embeddings.float(), p=2, dim=1).cpu()
@@ -1039,7 +1041,7 @@ class DualSpeakerVerifier:
         self.role_key = role_key
         self.cache_enabled = cache_enabled
         self.status = status or (lambda _message: None)
-        self.primary = self._cache_model(SpeakerVerifier(device))
+        self.primary = self._cache_model(pooled_encoder(SpeakerVerifier, device, SV_MODEL))
         self.anime_encoders = None
         self.secondary: CAMPlusVerifier | None = None
         self.secondary_profile: CAMPlusProfile | None = None
@@ -1068,7 +1070,12 @@ class DualSpeakerVerifier:
             encoders = []
             try:
                 for variant in ("char", "va"):
-                    encoders.append(self._cache_model(AnimeSpeakerOnnx(ASSET_ROOT / "models", variant, device=self.device)))
+                    from .model_pool import MODEL_POOL, resource_key
+                    key = resource_key('anime-' + variant, ASSET_ROOT / 'models' / _MODEL_FILES[variant])
+                    encoders.append(self._cache_model(MODEL_POOL.get(
+                        (key, self.device),
+                        lambda v=variant: AnimeSpeakerOnnx(ASSET_ROOT / 'models', v, device=self.device),
+                        device=self.device)))
             except Exception:
                 for encoder in encoders:
                     encoder.close()
@@ -1403,7 +1410,7 @@ class DualSpeakerVerifier:
     def _ensure_secondary(self, profile: SpeakerMatchProfile) -> CAMPlusProfile:
         if self.secondary is None:
             self.status("边界候选出现：正在加载 CAM++ 二次声纹模型")
-            self.secondary = self.boundary_secondary or self._cache_model(CAMPlusVerifier(self.device))
+            self.secondary = self.boundary_secondary or self._cache_model(pooled_encoder(CAMPlusVerifier, self.device, CAMPLUS_MODEL))
             self.boundary_secondary = self.secondary
             # Reuse the primary model's retained source indexes. Filtering the
             # two models independently can pair different clips and makes an
@@ -1419,7 +1426,7 @@ class DualSpeakerVerifier:
     def _ensure_tertiary(self, profile: SpeakerMatchProfile) -> WavLMProfile:
         if self.tertiary is None:
             self.status("检测到双模型歧义：正在加载 WavLM 第三声纹模型")
-            self.tertiary = self._cache_model(WavLMSpeakerVerifier(self.device, role_key=getattr(self, 'role_key', None)))
+            self.tertiary = self._cache_model(pooled_encoder(WavLMSpeakerVerifier, self.device, WAVLM_SV_MODEL))
             self.tertiary_profile = self.tertiary.build_profile(
                 profile.reference_paths,
                 reference_indexes=profile.primary.reference_indexes,
@@ -1440,7 +1447,7 @@ class DualSpeakerVerifier:
     ) -> tuple[WeSpeakerVerifier, WeSpeakerProfile]:
         if self.quaternary is None:
             self.status("正在加载 WeSpeaker 第四声纹裁决模型")
-            self.quaternary = self._cache_model(WeSpeakerVerifier(self.device))
+            self.quaternary = self._cache_model(pooled_encoder(WeSpeakerVerifier, self.device, WESPEAKER_MODEL))
             self.quaternary_profile = self.quaternary.build_profile(
                 profile.reference_paths,
                 reference_indexes=profile.primary.reference_indexes,
@@ -2732,7 +2739,7 @@ class DualSpeakerVerifier:
     def _boundary_secondary_factory(self) -> CAMPlusVerifier:
         if self.boundary_secondary is None:
             self.status("检测到疑似换人：正在加载 CAM++ 边界模型")
-            self.boundary_secondary = self.secondary or self._cache_model(CAMPlusVerifier(self.device))
+            self.boundary_secondary = self.secondary or self._cache_model(pooled_encoder(CAMPlusVerifier, self.device, CAMPLUS_MODEL))
             self.status("CAM++ 边界模型已就绪")
         return self.boundary_secondary
 
@@ -2805,7 +2812,8 @@ class TargetSpeakerSpanLocator:
             raise ValueError("目标声纹滑窗参数无效")
         progress = progress or (lambda _value, _message: None)
         self.tertiary_target_spans = []
-        waveform = load_mono(audio_path, self.SAMPLE_RATE)
+        waveform = (audio_path if isinstance(audio_path, torch.Tensor)
+                    else load_mono(audio_path, self.SAMPLE_RATE))
         duration = waveform.numel() / self.SAMPLE_RATE
         normalized = self._normalize_spans(spans, duration)
 
@@ -3231,7 +3239,8 @@ class LocalSpeakerTurnSplitter:
         if minimum_separation_seconds < 0.0:
             raise ValueError("换人边界最小间隔不能小于 0 秒")
         progress = progress or (lambda _value, _message: None)
-        waveform = load_mono(audio_path, self.SAMPLE_RATE)
+        waveform = (audio_path if isinstance(audio_path, torch.Tensor)
+                    else load_mono(audio_path, self.SAMPLE_RATE))
         duration = waveform.numel() / self.SAMPLE_RATE
         normalized = self._normalize_spans(spans, duration)
         context = max(1, int(round(context_seconds * self.SAMPLE_RATE)))

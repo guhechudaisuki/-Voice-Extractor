@@ -307,10 +307,11 @@ def reviewable(batch_dir: Path, manifest: dict) -> list[tuple[int, dict, Path, s
         diagnostics = row.get("diagnostics") or {}
         if not isinstance(diagnostics, dict):
             diagnostics = {}
-        # Retain review access to explicitly saved diagnostic clips and old
-        # batches that already contain low-confidence or cluster-veto audio.
+        # Saved remaining speech is available for manual review; review access
+        # does not grant a positive training label. Retain old diagnostic clips.
         if not (row.get("accepted") or diagnostics.get("cluster_removed")
-                or diagnostics.get("cluster_tier") == "B"):
+                or diagnostics.get("cluster_tier") == "B"
+                or diagnostics.get("remaining_sentence_export") is True):
             continue
         relative = str(row.get("audio_file") or "").replace("\\", "/")
         if not relative:

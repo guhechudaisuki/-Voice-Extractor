@@ -194,6 +194,11 @@ class ClusterAnalyzer:
                                           for group in self.negative_groups)}
 
     def close(self):
+        miner = getattr(self,'_temporal_miner',None)
+        if miner is not None:
+            miner.manifold.clear_whitening()
+            miner.quality_cache.clear()
+        self._temporal_miner = None
         if self.owns_encoders:
             for encoder in self.encoders:
                 encoder.close()
@@ -480,7 +485,7 @@ class ClusterAnalyzer:
                 if (value := prosody_signature(load_mono(p,16000))) is not None]
         return self._reference_prosody
 
-    def prefetch(self, spans):
+    def prefetch(self, spans, *, raw_spans=(), tertiary_filter=None):
         """Batch new pyramid windows without changing the per-window cache keys."""
         if not getattr(self, 'encoders', None) or not hasattr(self.cache, 'get_many'):
             return
@@ -488,25 +493,92 @@ class ClusterAnalyzer:
         if self.waveform is None:
             self.waveform = load_mono(self.stem, 16000)
         spans = list(dict.fromkeys(canonical_interval(a,b) for a,b in spans))
-        keys = [cache_key(self.source_hash,a,b,self.model_hash) for a,b in spans]
-        cached = self.cache.get_many(keys)
-        missing = [(key,a,b) for key,(a,b) in zip(keys,spans) if key not in cached]
-        for first in range(0,len(missing),24):
-            batch=missing[first:first+24]
-            waves=[self.waveform[round(a*16000):round(b*16000)] for _,a,b in batch]
-            values=[encoder._embeddings_from_waveforms(waves,batch_size=24).detach().cpu().numpy()
-                    for encoder in self.encoders]
-            self.cache.put_many([(key,(values[0][i],values[1][i])) for i,(key,_,_) in enumerate(batch)])
+        requests = [(self.cache, self.source_hash, self.waveform, spans)]
+        if self.raw_cache is not None and self.raw_waveform is not None and raw_spans:
+            raw_spans = list(dict.fromkeys(canonical_interval(a,b) for a,b in raw_spans))
+            # Invalid raw intervals retain the scalar path's existing disable/fallback.
+            raw_spans = [(a,b) for a,b in raw_spans
+                         if self.raw_waveform[round(a*16000):round(b*16000)].numel() >= 5600]
+            requests.append((self.raw_cache, self.raw_hash, self.raw_waveform, raw_spans))
+        pending = []
+        for cache, source_hash, waveform, intervals in requests:
+            keys = [cache_key(source_hash,a,b,self.model_hash) for a,b in intervals]
+            found = cache.get_many(keys)
+            missing = [(key,waveform[round(a*16000):round(b*16000)])
+                       for key,(a,b) in zip(keys,intervals) if key not in found]
+            pending.append((cache, missing, []))
+        # Finish one engine's dry AND raw requests before changing engines.
+        for channel_index, encoder in enumerate(self.encoders):
+            for cache, missing, channels in pending:
+                try:
+                    channels.append(self._prefetch_vectors(encoder, missing,
+                        progress=self._prefetch_progress(f'双通道 {channel_index+1}', len(missing))))
+                except (OSError, RuntimeError, ValueError):
+                    if cache is self.cache:
+                        raise
+                    channels.append(None)  # Scalar raw inference remains authoritative.
+        for cache, missing, channels in pending:
+            if all(channel is not None for channel in channels):
+                cache.put_many([(key,tuple(channel[key] for channel in channels))
+                                for key,_ in missing])
         if self.anime_encoders and self.anime_cache is not None:
             from .pyramid_batching import anime_batch
             anime_keys = [cache_key(self.source_hash,a,b,self.anime_hash) for a,b in spans]
             found = self.anime_cache.get_many(anime_keys)
             missing = [(key,a,b) for key,(a,b) in zip(anime_keys,spans) if key not in found]
+            missing.sort(key=lambda item: round((item[2]-item[1])*16000))
+            progress = self._prefetch_progress('动漫声纹', len(missing))
             for first in range(0,len(missing),24):
                 batch = missing[first:first+24]
                 waves = [self.waveform[round(a*16000):round(b*16000)] for _,a,b in batch]
                 pairs = anime_batch(self.anime_encoders,waves)
                 self.anime_cache.put_many([(key,pair) for (key,_,_),pair in zip(batch,pairs) if pair is not None])
+                if progress is not None:
+                    progress(first+len(batch))
+
+        if tertiary_filter is not None and self.tertiary is not None:
+            intervals = [(a,b) for a,b in spans if tertiary_filter(a,b)]
+            keys = [cache_key(self.source_hash,a,b,self.tertiary_hash) for a,b in intervals]
+            found = self.tertiary_cache.get_many(keys)
+            missing = [(key,self.waveform[round(a*16000):round(b*16000)])
+                       for key,(a,b) in zip(keys,intervals) if key not in found]
+            vectors = self._prefetch_vectors(self.tertiary, missing, batch_size=16,
+                progress=self._prefetch_progress('WavLM', len(missing)))
+            self.tertiary_cache.put_many([(key,(vector,vector)) for key,vector in vectors.items()])
+
+    @staticmethod
+    def _prefetch_vectors(encoder, missing, batch_size=24, progress=None):
+        """Bound waveform allocations and preserve the scalar padding contract."""
+        groups = {}
+        for key, wave in missing:
+            groups.setdefault(max(8000, wave.numel()), []).append((key,wave))
+        output = {}
+        completed = 0
+        for group in groups.values():
+            for first in range(0,len(group),batch_size):
+                batch = group[first:first+batch_size]
+                vectors = encoder._embeddings_from_waveforms(
+                    [wave for _,wave in batch],batch_size=batch_size).detach().cpu().numpy()
+                if len(vectors) != len(batch):
+                    raise ValueError('Incomplete prefetched embedding batch')
+                output.update((key,vector) for (key,_),vector in zip(batch,vectors))
+                completed += len(batch)
+                if progress is not None:
+                    progress(completed)
+        return output
+
+    def _prefetch_progress(self, channel, total):
+        callback = getattr(self, 'progress', None)
+        if callback is None or total < 128:
+            return None
+        last = 0
+        callback(f'全集精确窗口预计算：{channel} 0/{total}')
+        def report(completed):
+            nonlocal last
+            if completed-last >= 240 or completed == total:
+                callback(f'全集精确窗口预计算：{channel} {completed}/{total}')
+                last = completed
+        return report
 
     def embed3(self, start, end):
         """第三通道（WavLM）嵌入；独立内容寻址缓存，强化后自动重算。"""
@@ -815,7 +887,42 @@ class ClusterAnalyzer:
         """Verify local speech, then revisit uncertain windows with clean episode evidence."""
         from .temporal_mining import TemporalMiner
 
-        return TemporalMiner(self, turns, candidates, margin, bank, previous).run()
+        miner = TemporalMiner(self, turns, candidates, margin, bank, previous)
+        self._temporal_miner = miner
+        try:
+            return miner.run()
+        except BaseException:
+            miner.manifold.clear_whitening()
+            miner.quality_cache.clear()
+            raise
+
+    def certify_exact_interval(self, start, end):
+        """Score a proposal's own full audio, never its parent's pooled score."""
+        miner = getattr(self, '_temporal_miner', None)
+        if miner is None:
+            return {'span':[start,end], 'passed':False, 'reason':'no_episode_evidence'}
+        from ..sentence_policy import positive_conflict, whole_sentence_evidence
+        rows = miner._check([(start,end)], miner.profile)
+        whole = rows[0] if rows else {}
+        local = [row for group in miner.local.values() for row in group
+                 if min(end,row['span'][1]) > max(start,row['span'][0])]
+        blocked = any(min(end,b)>max(start,a) for a,b in miner.blocked)
+        # The new interval gets its own reference, cohort, WavLM/anime and
+        # exclusion evaluation. Existing local windows only supply vetoes.
+        conflict = positive_conflict([whole,*local],start,end,
+            getattr(self,'confirmed_change_points',()))
+        # An episode-register evaluation already measured on precisely this
+        # full range is valid evidence too. It is not a trajectory-only label
+        # or a parent's score, and cannot authorize any changed child bounds.
+        fresh_passed = bool(whole.get('span') == [start,end] and whole.get('accepted')
+            and whole.get('exclusion_margins_passed') and (whole.get('cohort_passed')
+                or whole.get('identity_evidence', {}).get('accepted') is True))
+        measured = whole_sentence_evidence(local, start, end)
+        if not fresh_passed and measured is not None:
+            whole = measured
+        passed = bool((fresh_passed or measured is not None) and not blocked and not conflict)
+        return {'span':[start,end], 'passed':passed, 'method':'exact_multichannel_audio',
+                'whole_evidence':whole, 'positive_conflict':conflict, 'blocked':blocked}
 
     def provenance(self):
         code = [Path(__file__), Path(__file__).with_name("identity_cluster.py"),

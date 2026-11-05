@@ -359,7 +359,7 @@ def split_overlong_sentences(
 
     No inferred character-time proportions are accepted. Corrected text which
     cannot be mapped exactly to the original fragments is retained for review.
-    Children retain all identity scores and independent copies of diagnostics.
+    Children carry their own timing metadata and require new identity scoring.
     """
     if sample_rate <= 0 or min_part_seconds <= 0 or max_seconds < 2 * min_part_seconds:
         raise ValueError("Invalid long-sentence split limits")
@@ -436,6 +436,26 @@ def split_overlong_sentences(
                     whisper = candidate.whisper_text or text
                     child.whisper_text = whisper[whisper_offsets[a]:whisper_offsets[b]]
                     child.audio_file = child.text_file = child.video_file = ""
+                    for field in ('speaker_score', 'window_min_score', 'window_p20_score',
+                                  'speaker_vote_ratio', 'window_vote_ratio'):
+                        setattr(child, field, 0.)
+                    for key in ('acoustic_identity_audit', 'ledger_candidate_key', 'review_navigation'):
+                        child.diagnostics.pop(key, None)
+                    child.diagnostics['exact_audio_verified'] = False
+                    for key in ('word_timestamps', 'stt_fragments', 'transcription_fragments'):
+                        entries = child.diagnostics.get(key)
+                        if isinstance(entries, list):
+                            child.diagnostics[key] = [entry for entry in entries
+                                if isinstance(entry, dict)
+                                and isinstance(entry.get('start'), (int, float))
+                                and isinstance(entry.get('end'), (int, float))
+                                and begin <= entry['start'] < entry['end'] <= finish]
+                            if any(isinstance(entry, dict)
+                                   and isinstance(entry.get('start'), (int, float))
+                                   and isinstance(entry.get('end'), (int, float))
+                                   and min(finish, entry['end']) > max(begin, entry['start'])
+                                   and entry not in child.diagnostics[key] for entry in entries):
+                                child.diagnostics['split_timing_incomplete'] = True
                     child.diagnostics.pop("acoustic_qc", None)
                     child.diagnostics.pop("overlong_unsplit", None)
                     child.diagnostics.pop("overlong_unsplit_reason", None)

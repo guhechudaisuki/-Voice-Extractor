@@ -60,6 +60,7 @@ def main() -> int:
             silence_max_seconds=float(options_data.get("silence_max_seconds", 0.85)),
             use_overlap_detector=bool(options_data.get("use_overlap_detector", True)),
             use_singing_detector=bool(options_data.get("use_singing_detector", True)),
+            branch_validation=bool(options_data.get("branch_validation", False)),
             export_all_sentences=bool(options_data.get("export_all_sentences", False)),
             export_video_clips=bool(options_data.get("export_video_clips", False)),
             export_sample_rate=int(options_data.get('export_sample_rate', 16000)),
@@ -115,6 +116,8 @@ def main() -> int:
             transcript_path=str(batch.transcript_path),
             accepted_count=len(batch.accepted),
             rejected_count=len(batch.rejected),
+            remaining_count=sum(bool(sentence.diagnostics.get("remaining_sentence_export")
+                                     and sentence.audio_file) for sentence in batch.rejected),
             rows=rows,
         )
         return 0

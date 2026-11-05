@@ -137,6 +137,8 @@ def merge_datasets(batches, destination, *, speaker='target', language='JA', tar
                                         'source_pcm_sha256': identity, 'loudness': audit,
                                         'quality_grade': qc.get('quality_grade', 'Unknown'),
                                         'acoustic_qc': {k: qc.get(k) for k in ('snr_db', 'clipping_ratio', 'effective_speech_seconds')}})
+                        from launcher.corpus_curation import acoustic_dimensions
+                        records[-1]['curation_features'] = acoustic_dimensions(mastered,clip['text'],clip['language'])
                         archive.write(mastered, name)
                         archive.writestr(str(Path(name).with_suffix('.txt')).replace('\\', '/'), clip['text'])
             if not records:
@@ -154,6 +156,8 @@ def merge_datasets(batches, destination, *, speaker='target', language='JA', tar
                           lufs_min=min(r['loudness']['output_lufs'] for r in records),
                           lufs_max=max(r['loudness']['output_lufs'] for r in records),
                           loudness_target_misses=[r['path'] for r in records if not r['loudness']['target_reached']])
+            from launcher.corpus_curation import write_curation
+            report['curation'] = write_curation(archive,records,speaker)
             archive.writestr('dataset_report.json', json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False))
             archive.writestr('dataset_report.md', _report_markdown(report))
         save_file(package, Path(destination))

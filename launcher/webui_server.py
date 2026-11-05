@@ -103,6 +103,8 @@ def load_settings() -> dict:
         "use_overlap_detector": True,
         "use_singing_detector": True,
         "export_video_clips": False,
+        "branch_validation": False,
+        "export_all_sentences": False,
     }
     if SETTINGS_PATH.exists():
         try:
@@ -131,6 +133,8 @@ class SettingsPayload(BaseModel):
     use_overlap_detector: Optional[bool] = None
     use_singing_detector: Optional[bool] = None
     export_video_clips: Optional[bool] = None
+    branch_validation: Optional[bool] = None
+    export_all_sentences: Optional[bool] = None
 
 
 class ItemReview(BaseModel):
@@ -364,6 +368,8 @@ def get_batch_details(batch_id: str):
         diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
         start = float(row.get("start") or 0.0)
         end = float(row.get("end") or 0.0)
+        cluster_id = (diagnostics.get('review_navigation') or {}).get('cluster_id')
+        cluster_scope = relative.split('/')[0]
         segments.append({
             "ordinal": ordinal,
             "filename": Path(relative).name,
@@ -373,6 +379,9 @@ def get_batch_details(batch_id: str):
             "start": round(start, 3),
             "end": round(end, 3),
             "duration": round(max(0.0, end - start), 3),
+            "exact_start": start,
+            "exact_end": end,
+            "exact_duration": max(0.0, end - start),
             "accepted": bool(row.get("accepted")),
             "cluster_removed": bool(diagnostics.get("cluster_removed")),
             "cluster_tier": diagnostics.get("cluster_tier") or "",
@@ -384,6 +393,16 @@ def get_batch_details(batch_id: str):
             "identity_signature": [(diagnostics.get('fusion_evidence') or {}).get(name) for name in
                 ('primary', 'secondary', 'tertiary', 'anime_char_score', 'anime_va_score')],
             "cluster_ids": diagnostics.get('cluster_ids', []),
+            "all_sentence_export": bool(diagnostics.get('all_sentence_export')),
+            "remaining_sentence_export": bool(diagnostics.get('remaining_sentence_export')),
+            "review_only": bool(diagnostics.get('review_only')),
+            "multiview_embeddings": (diagnostics.get('review_navigation') or {}).get('embeddings',{}),
+            "speaker_cluster_id": (diagnostics.get('review_navigation') or {}).get('cluster_id'),
+            "speaker_cluster_key": json.dumps([cluster_scope, cluster_id], ensure_ascii=False)
+                if cluster_id is not None else None,
+            "speaker_cluster_label": f'{cluster_scope} · 声线簇 {cluster_id}',
+            "reference_scores": (diagnostics.get('review_navigation') or {}).get('reference_scores',{}),
+            "word_timestamps": diagnostics.get('word_timestamps',[]),
             "high_confidence_borderline": high_confidence_borderline(row),
             "acoustic_qc": diagnostics.get("acoustic_qc") or {},
             "reject_reason": str(row.get("reject_reason") or ""),
@@ -420,6 +439,13 @@ def live_recalibrate(batch_id: str):
     with _review_lock:
         segments = get_batch_details(batch_id)['segments']
     return recalibrate(segments)
+
+
+@app.get('/api/batches/{batch_id}/star_map')
+def star_map(batch_id: str):
+    from launcher.review_graph import star_projection
+    segments = [s for s in get_batch_details(batch_id)['segments'] if s.get('all_sentence_export')]
+    return {'scope':'review_navigation_only','points':star_projection(segments)}
 
 
 _rescore_jobs = {}

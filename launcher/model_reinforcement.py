@@ -47,6 +47,8 @@ def rebind_classifier_references(items, progress, *, classifier_path: Path | Non
     from extractor.audio import load_mono
     from extractor.local_identity_classifier import (window_starts, score_window,
                                                      reference_conditioned_classifier)
+    from extractor.set_relational import SetRelationalScorer
+    from launcher.rank_calibration import fit_temperature
     path = Path(classifier_path) if classifier_path else Path(CLASSIFIER_V2_MODEL)
     replay = {sample_fingerprint(entry['item']): entry for entry in replay_entries
               if entry.get('calibration_queries') is not None}
@@ -78,7 +80,7 @@ def rebind_classifier_references(items, progress, *, classifier_path: Path | Non
                 projection = encoder.feature_extractor
                 queries = torch.nn.functional.normalize(projection(entry['calibration_queries'].to(device)), dim=-1)
                 references = torch.nn.functional.normalize(projection(entry['calibration_references'].to(device)), dim=-1)
-                values = ((queries @ references.T).topk(min(2, len(references)), dim=-1).values.mean(-1) - .8) * 20.
+                values = SetRelationalScorer()(queries, references)
             if not torch.isfinite(values).all():
                 raise ValueError('回放分类器得分无效，原模型未修改')
             return values.cpu().tolist()
@@ -86,7 +88,8 @@ def rebind_classifier_references(items, progress, *, classifier_path: Path | Non
             key = tuple(role_hashes(item))
             if key not in models_by_reference:
                 classifier = reference_conditioned_classifier(encoder, processor, device,
-                    [Path(p) for p in item['reference_paths']])
+                    [Path(p) for p in item['reference_paths']],
+                    calibration={'scale':1., 'bias':0.}, relational=True)
                 models_by_reference[key] = (encoder, processor, classifier, 0., device)
             score = lambda wave: score_window(models_by_reference[key], wave)
         else:
@@ -104,16 +107,26 @@ def rebind_classifier_references(items, progress, *, classifier_path: Path | Non
             values.append(value)
         return values
 
-    positive_limits = [value - .1 * _sample_weight(item) for item in positives for value in scores(item)]
-    negative_limits = [float(np.mean(values)) + .1 * _sample_weight(item)
-                       for item in negatives if (values := scores(item))]
+    positive_rows = [(item,scores(item)) for item in positives]
+    negative_rows = [(item,scores(item)) for item in negatives]
+    raw = [v for _,values in positive_rows+negative_rows for v in values]
+    labels = [1 for _,values in positive_rows for v in values] + [0 for _,values in negative_rows for v in values]
+    if not raw or set(labels) != {0,1}:
+        progress('全局分类器校准跳过：正/负例窗口证据不足')
+        return None
+    calibration = fit_temperature(raw, labels)
+    transform = lambda value: value*calibration['scale']+calibration['bias']
+    positive_limits = [transform(v) - .1*_sample_weight(item) for item,values in positive_rows for v in values]
+    negative_limits = [float(np.mean([transform(v) for v in values])) + .1*_sample_weight(item)
+                       for item,values in negative_rows if values]
     if not positive_limits or not negative_limits:
         progress('全局分类器校准跳过：正/负例窗口证据不足')
         return None
     reject = float(np.quantile(positive_limits, .05))
     rescue = float(np.quantile(negative_limits, .95))
     separated = rescue < reject - .2
-    payload = dict(schema=2, scope='universal', scoring='reference_cosine_v1',
+    payload = dict(schema=2, scope='universal', scoring='set_relational_v2',
+        calibration=calibration,
         threshold=rescue, calibration_status='reinforced',
         veto_status='active' if separated else 'disabled',
         window_seconds=.5, stride_seconds=.25,
@@ -121,6 +134,9 @@ def rebind_classifier_references(items, progress, *, classifier_path: Path | Non
         sample_weighting={'partial_negative': PARTIAL_NEGATIVE_WEIGHT,
                           'partial_positive': PARTIAL_POSITIVE_WEIGHT,
                           'positive_clips': len(positives), 'negative_clips': len(negatives)})
+    projection_path = Path(model_path) if model_path else active_speaker_path(WAVLM_SV_MODEL)
+    if projection_path.is_file():
+        payload['projection_sha256'] = file_sha256(projection_path)
     if separated:
         payload['reject_threshold'] = reject
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -393,112 +409,29 @@ def _train_current(paths, destination, progress, current, *, items=None):
         return report
     report['replayed_training_clips'] = old_train
     replay_weight = min(1., new_train/max(1,old_train))
-    pairs = []
-    for key,item,group in zip(chosen,selected,groups):
+    from launcher.relational_training import train_projection
+    samples = []
+    for key, item, group in zip(chosen, selected, groups):
         entry = bank['entries'][key]
-        # A clip with more reference files must not receive more total gradient
-        # mass than an equally weighted clip from another extraction batch.
-        weight = (_sample_weight(item) * (1. if key in pending or group in held_out else replay_weight)
-                  / len(entry['references']))
-        for reference in entry['references']:
-            pairs.append((entry['query'],reference,int(item['review']['label']=='correct'),group,weight))
-    # Replay owns frozen features; only the existing projection receives gradients.
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    train_idx = [i for i, pair in enumerate(pairs) if pair[3] not in held_out]
-    test_idx = [i for i, pair in enumerate(pairs) if pair[3] in held_out]
-    def batch(indexes):
-        queries = torch.stack([pairs[i][0] for i in indexes]).to(device)
-        references = torch.stack([pairs[i][1] for i in indexes]).to(device)
-        labels = torch.tensor([pairs[i][2] for i in indexes], dtype=torch.float32, device=device)
-        weights = torch.tensor([pairs[i][4] for i in indexes], dtype=torch.float32, device=device)
-        return queries, references, labels, weights
-    def embeddings(head, query, reference):
-        return F.normalize(head(query), dim=-1), F.normalize(head(reference), dim=-1)
-    def evaluate(indexes, *, collect_scores=False):
-        total_loss, total_weight, correct = 0., 0., 0
-        all_scores, all_labels = [], []
-        with torch.no_grad():
-            for offset in range(0, len(indexes), BATCH_SIZE):
-                portion = indexes[offset:offset+BATCH_SIZE]
-                query, reference, labels, weights = batch(portion)
-                q, r = embeddings(projection, query, reference)
-                scores = (q * r).sum(-1)
-                all_scores.extend(scores.cpu().tolist())
-                all_labels.extend(labels.cpu().tolist())
-                losses = F.binary_cross_entropy_with_logits((scores - .8) * 20, labels, reduction='none')
-                total_loss += float((losses * weights).sum())
-                total_weight += float(weights.sum())
-                correct += int(((scores >= .8) == labels.bool()).sum())
-        metrics = {**classification_metrics(all_scores, all_labels), 'pairs': len(indexes), 'sources': len({pairs[i][3] for i in indexes}),
-                'positive': sum(pairs[i][2] for i in indexes), 'negative': sum(1-pairs[i][2] for i in indexes),
-                'loss': total_loss / total_weight if total_weight else None,
-                'accuracy_at_cosine_080': correct / len(indexes) if indexes else None}
-        if collect_scores:
-            metrics['_scores'] = all_scores
-        return metrics
-    initial_loss = evaluate(train_idx)['loss']
-    baseline = evaluate(test_idx, collect_scores=True)
-    baseline_scores = baseline.pop('_scores')
-    test_labels = [pairs[i][2] for i in test_idx]
-    baseline['sample_guard'] = paired_decision_audit(baseline_scores, baseline_scores, test_labels)
-    best_state, best_metrics, best_epoch, stale = None, baseline, 0, 0
-    optimizer = torch.optim.Adam(projection.parameters(), lr=1e-5)
-    generator = torch.Generator().manual_seed(20260930)
-    for epoch in range(EPOCHS):
-        order = [train_idx[i] for i in torch.randperm(len(train_idx), generator=generator).tolist()]
-        for offset in range(0, len(order), BATCH_SIZE):
-            query, reference, labels, weights = batch(order[offset:offset+BATCH_SIZE])
-            optimizer.zero_grad()
-            q, r = embeddings(projection, query, reference)
-            with torch.no_grad():
-                old_q, old_r = embeddings(original, query, reference)
-            # Positive pairs must clear an additional cosine margin.
-            cosine = (q * r).sum(-1)
-            margin = 0.08 * labels
-            logits = ((cosine - margin) - .8) * 20
-            # Detach hardness so lowering a sample's weight cannot lower loss.
-            error_probability = (logits.detach().sigmoid() - labels).abs()
-            weights = weights * (1.0 + error_probability)
-            losses = F.binary_cross_entropy_with_logits(logits, labels, reduction='none')
-            loss = (losses * weights).sum() / weights.sum()
-            loss = loss + .1 * ((q-old_q).square().mean() + (r-old_r).square().mean())
-            # Anchor the projection to its initial weights on small datasets.
-            l2_sp = sum(
-                (param - original_param).square().sum()
-                for param, original_param in zip(projection.parameters(), original.parameters()))
-            loss = loss + .05 * l2_sp
-            if not torch.isfinite(loss):
-                raise ValueError('训练损失无效，原模型未修改')
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(projection.parameters(), 1.)
-            optimizer.step()
-        measured = evaluate(test_idx, collect_scores=True)
-        measured['sample_guard'] = paired_decision_audit(
-            measured.pop('_scores'), baseline_scores, test_labels)
-        if non_regressing(measured, baseline) and measured['loss'] < best_metrics['loss'] - 1e-7:
-            best_state = {k: v.detach().cpu().clone() for k, v in projection.state_dict().items()}
-            best_metrics, best_epoch, stale = measured, epoch + 1, 0
-        else:
-            stale += 1
-        progress(f"训练 {epoch + 1}/{EPOCHS}，留出损失 {measured['loss']:.5f}，最佳轮次 {best_epoch}")
-        if stale >= EARLY_STOPPING_PATIENCE:
-            break
-    report['validation_gate'] = {'passed': best_state is not None, 'baseline': baseline,
-                                  'best': best_metrics, 'best_epoch': best_epoch, 'epochs_run': epoch + 1}
+        references = entry.get('calibration_references')
+        if references is None or not len(references):
+            references = torch.stack(list(entry['references']))
+        weight = _sample_weight(item) * (1. if key in pending or group in held_out else replay_weight)
+        samples.append((entry['query'], references, int(item['review']['label']=='correct'), group, weight))
+    best_state, initial_loss, validation, metrics = train_projection(
+        projection, original, samples, held_out, epochs=EPOCHS, patience=EARLY_STOPPING_PATIENCE,
+        batch_size=BATCH_SIZE, progress=progress, device=device)
+    report['validation_gate'] = validation
     if best_state is None:
         _calibrate_global_classifier(directory, bank, current_items, group_by_key,
                             held_out, report, progress)
         report.update(status='rejected_holdout', initial_loss=initial_loss,
                       training_clips=sum(g not in held_out for g in groups),
-                      held_out_clips=sum(g in held_out for g in groups),
-                      metrics={'training': evaluate(train_idx), 'held_out_sources': evaluate(test_idx)})
+                      held_out_clips=sum(g in held_out for g in groups), metrics=metrics)
         report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
         write_meta(directory,bank,report)
         progress(completion_message(report))
         return report
-    projection.load_state_dict(best_state)
-    metrics = {'training': evaluate(train_idx), 'held_out_sources': evaluate(test_idx)}
     if not all(torch.isfinite(value).all() for value in projection.state_dict().values()):
         raise ValueError('模型权重无效，原模型未修改')
     held_out_clips = sum(group in held_out for group in groups)

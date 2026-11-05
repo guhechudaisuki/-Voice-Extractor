@@ -46,6 +46,8 @@ def score_window(models: tuple, wave: torch.Tensor) -> float:
     encoder, processor, classifier, _threshold, device = models
     if wave.numel() < 8000:
         wave = torch.nn.functional.pad(wave, (0, 8000 - wave.numel()))
+    if getattr(encoder, '_local_identity_engine', False):
+        return encoder.score(classifier,wave)
     return float(classifier(pooled_features(encoder, processor, device, wave)).item())
 
 
@@ -55,21 +57,28 @@ class ReferenceConditionedClassifier(torch.nn.Module):
     No speaker ID or reference hash is baked into the checkpoint. Calibration
     thresholds operate on the shared projected query/reference cosine scale.
     """
-    def __init__(self, projection, reference_vectors):
+    def __init__(self, projection, reference_vectors, *, calibration=None, relational=False):
         super().__init__()
         self.projection = projection
-        self.register_buffer('references', torch.nn.functional.normalize(reference_vectors, dim=-1))
+        self.register_buffer('references', torch.nn.functional.normalize(reference_vectors, dim=-1), persistent=False)
+        self.calibration = calibration
+        self.relational = relational
 
     def forward(self, pooled):
         width = pooled.shape[-1] // 3
         stats = torch.cat((pooled[..., :width], pooled[..., -width:]), dim=-1)
         query = torch.nn.functional.normalize(self.projection(stats), dim=-1)
-        scores = self.references @ query
-        return (scores.topk(min(2, len(scores))).values.mean() - .8) * 20.
+        from .set_relational import SetRelationalScorer, calibrated_logits
+        if self.relational:
+            score = SetRelationalScorer()(query, self.references)
+        else:
+            scores = query @ self.references.T
+            score = scores.topk(min(2, len(self.references)), dim=-1).values.mean(-1)
+        return calibrated_logits(score, self.calibration)
 
 
 @torch.no_grad()
-def reference_conditioned_classifier(encoder, processor, device, paths):
+def reference_conditioned_classifier(encoder, processor, device, paths, *, calibration=None, relational=False):
     from .audio import load_mono
     vectors = []
     for path in paths:
@@ -82,7 +91,8 @@ def reference_conditioned_classifier(encoder, processor, device, paths):
             vectors.append(encoder.feature_extractor(torch.cat((pooled[:width], pooled[-width:]))))
     if not vectors:
         raise ValueError('参考音频没有可用的声纹特征')
-    return ReferenceConditionedClassifier(encoder.feature_extractor, torch.stack(vectors)).to(device).eval()
+    return ReferenceConditionedClassifier(encoder.feature_extractor, torch.stack(vectors),
+        calibration=calibration, relational=relational).to(device).eval()
 
 
 def negative_window_evidence(windows: list[dict]) -> float | None:

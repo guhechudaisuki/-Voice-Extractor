@@ -167,8 +167,14 @@ async function loadBatch(batchId) {
     const data = await response.json();
     if (app.batchId !== batchId) return;
 
-    app.segments = (data.segments || []).filter(
-      (seg) => seg.accepted || seg.cluster_removed || seg.cluster_tier === "B");
+    // Keep legacy API display fields, but all word/trim arithmetic uses the
+    // original analysis coordinates. Round only human-readable time labels.
+    app.segments = (data.segments || []).map(seg => ({...seg,
+      start: seg.exact_start ?? seg.start, end: seg.exact_end ?? seg.end,
+      duration: seg.exact_duration ?? seg.duration})).filter(
+      (seg) => seg.accepted || seg.remaining_sentence_export || seg.cluster_removed || seg.cluster_tier === "B");
+    $('openStarMap').hidden = !app.segments.some(s => s.all_sentence_export);
+    $('trustMainBtn').hidden = app.segments.some(s => s.all_sentence_export);
     app.reviews = {};
     (data.segments || []).forEach((seg) => {
       if (seg.review && seg.review.label) app.reviews[seg.ordinal] = seg.review;
@@ -460,11 +466,12 @@ $("filters").addEventListener("click", (event) => {
 
 function visibleSegments() {
   const rows = app.segments.filter((seg) => {
-    // Tier 视图：主输出 / 边缘捡漏 / 已撤下
+    // 主输出、其余单句、已保存候选与撤下片段分别复核。
     if (app.filter === "tierA") return seg.accepted;
+    if (app.filter === "remaining") return seg.remaining_sentence_export;
     if (app.filter === "tierB") return !seg.accepted && seg.cluster_tier === "B";
-    if (app.filter === "removed") return !seg.accepted && seg.cluster_tier !== "B";
-    if (!seg.accepted && seg.cluster_tier !== "B" && !["cluster", "active"].includes(app.filter)) return false;
+    if (app.filter === "removed") return !seg.accepted && !seg.remaining_sentence_export && seg.cluster_tier !== "B";
+    if (!seg.accepted && !seg.remaining_sentence_export && seg.cluster_tier !== "B" && !["cluster", "active"].includes(app.filter)) return false;
     const done = Boolean(app.reviews[seg.ordinal]);
     if (app.filter === "unreviewed" || app.filter === "active") return !done;
     if (app.filter === "done") return done;
@@ -480,6 +487,8 @@ function visibleSegments() {
 }
 
 function activeLearningOrder(rows) {
+  if (rows.some(s => Number.isFinite(s.acquisition_rank)))
+    return [...rows].sort((a,b) => (a.acquisition_rank ?? Infinity)-(b.acquisition_rank ?? Infinity));
   // Greedy information + farthest-signature sampling for a diverse first 15.
   const remaining = [...rows], selected = [];
   const distance = (a, b) => {
@@ -531,7 +540,7 @@ function renderList() {
       `<span class="seg-no">${String(seg.ordinal).padStart(3, "0")}</span>` +
       `<span class="seg-body">` +
         `<span class="seg-text">${escapeHtml(seg.stt_text) || escapeHtml(seg.filename)}</span>` +
-        `<span class="seg-sub">${fmtTime(seg.start)}–${fmtTime(seg.end)}s · ${seg.duration.toFixed(2)}s${seg.accepted ? "" : " · 已撤下"}</span>` +
+        `<span class="seg-sub">${fmtTime(seg.start)}–${fmtTime(seg.end)}s · ${seg.duration.toFixed(2)}s${seg.accepted ? "" : seg.remaining_sentence_export ? " · 其余单句待复核" : " · 已撤下"}</span>` +
       `</span>` + (!app.blind ? qualityBadge(seg) : "") + clusterTag + tag;
 
     node.addEventListener("click", () => {
@@ -769,12 +778,19 @@ function prefillTrimProposal() {
   }
   const useful = ranges.filter(([a,b]) => b-a >= .1);
   if (!useful.length || useful.reduce((s,[a,b]) => s+b-a,0) >= seg.duration-.1) return;
-  $('trimRanges').value = useful.map(([a,b]) => `${a.toFixed(3)}-${b.toFixed(3)}`).join('; ');
-  $('trimStart').value = useful[0][0].toFixed(3); $('trimEnd').value = useful[0][1].toFixed(3);
+  $('trimRanges').value = useful.map(pair => pair.join('-')).join('; ');
+  $('trimStart').value = useful[0][0]; $('trimEnd').value = useful[0][1];
   app.trimSuggested = true;
 }
 
 function snapTrimTime(value, seg) {
+  const words = (seg.word_timestamps || []).filter(w => w.timing_estimated === false &&
+    Number.isFinite(w.start) && Number.isFinite(w.end));
+  const wordEdges = words.flatMap(w => [w.start-seg.start,w.end-seg.start]);
+  const wordEdge = wordEdges.sort((a,b) => Math.abs(a-value)-Math.abs(b-value))[0];
+  // Preserve the authentic timestamp exactly. Moving it inward to a waveform
+  // zero crossing could turn a complete retained word into a partial word.
+  if (wordEdge != null && Math.abs(wordEdge-value)<.06) return clamp(wordEdge,0,seg.duration);
   const boundaries = (app.identityHeatmap?.frames || []).filter((f,i,a) => i &&
     Number.isFinite(f.evidence) && Number.isFinite(a[i-1].evidence) &&
     Math.sign(f.evidence) !== Math.sign(a[i-1].evidence)).map(f => f.offset);
@@ -813,8 +829,8 @@ trimCanvas.addEventListener('pointermove',event => {
   const value = snapTrimTime((event.clientX-rect.left)/rect.width*seg.duration,seg);
   const pair = drag.ranges[drag.index];
   pair[drag.edge] = drag.edge ? clamp(value,pair[0]+.01,seg.duration) : clamp(value,0,pair[1]-.01);
-  $('trimRanges').value = drag.ranges.map(p => p.map(v => v.toFixed(3)).join('-')).join('; ');
-  $('trimStart').value = pair[0].toFixed(3); $('trimEnd').value = pair[1].toFixed(3);
+  $('trimRanges').value = drag.ranges.map(p => p.join('-')).join('; ');
+  $('trimStart').value = pair[0]; $('trimEnd').value = pair[1];
   drawWave(app.peaks || []);
 });
 for (const type of ['pointerup','pointercancel']) trimCanvas.addEventListener(type,event => {
@@ -902,7 +918,7 @@ document.querySelectorAll(".pad").forEach((pad) => {
 function readTrimIntervals(seg) {
   const text = $("trimRanges").value.trim();
   const intervals = text ? text.split(/[;；]+/).map(part => {
-    const match = part.trim().match(/^(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)$/);
+    const match = part.trim().match(/^(\d+(?:\.\d+)?(?:e[+-]?\d+)?)\s*-\s*(\d+(?:\.\d+)?(?:e[+-]?\d+)?)$/i);
     if (!match) throw new Error("请填写区间，例如 0.5-1.2; 2.8-3.4");
     return [Number(match[1]), Number(match[2])];
   }) : [[parseFloat($("trimStart").value), parseFloat($("trimEnd").value)]];
@@ -972,15 +988,15 @@ function reflectReview(ordinal) {
     const partialInput = $("partialText");
     if (partialInput) partialInput.value = review.partial_text || "";
     $("trimRanges").value = (review.partial_intervals || []).map(pair => pair.join("-")).join("; ");
-    $("trimStart").value = (review.partial_intervals?.[0]?.[0] ?? review.partial_start ?? 0).toFixed(2);
-    $("trimEnd").value = (review.partial_intervals?.[0]?.[1] ?? review.partial_end ?? seg.duration).toFixed(2);
+    $("trimStart").value = review.partial_intervals?.[0]?.[0] ?? review.partial_start ?? 0;
+    $("trimEnd").value = review.partial_intervals?.[0]?.[1] ?? review.partial_end ?? seg.duration;
   } else {
     $("trimBox").hidden = true;
     $("partialText").value = "";
     $("trimRanges").value = "";
     if (seg) {
       $("trimStart").value = "0.00";
-      $("trimEnd").value = seg.duration.toFixed(2);
+      $("trimEnd").value = seg.duration;
     }
   }
 
@@ -990,7 +1006,7 @@ function reflectReview(ordinal) {
 $("trimFromPlayhead").addEventListener("click", () => {
   const seg = currentSegment();
   if (!seg) return;
-  $("trimStart").value = clamp(audio.currentTime, 0, seg.duration).toFixed(2);
+  $("trimStart").value = clamp(audio.currentTime, 0, seg.duration);
   syncTrimNumbers();
 });
 
@@ -1007,8 +1023,8 @@ $("trimRanges").addEventListener("input", () => {
   try {
     const ranges = readTrimIntervals(currentSegment());
     app.trimRangeIndex = 0;
-    $("trimStart").value = ranges[0][0].toFixed(2);
-    $("trimEnd").value = ranges[0][1].toFixed(2);
+    $("trimStart").value = ranges[0][0];
+    $("trimEnd").value = ranges[0][1];
     drawWave(app.peaks || []);
   } catch (_) { /* Keep incomplete text editable. */ }
 });
@@ -1064,10 +1080,12 @@ $("undoBtn").addEventListener("click", () => {
 function refreshMeta() {
   const clusterSummary = $("clusterSummary");
   const acceptedCount = app.segments.filter((seg) => seg.accepted).length;
-  const removedCount = app.segments.length - acceptedCount;
+  const remainingCount = app.segments.filter((seg) => seg.remaining_sentence_export).length;
+  const removedCount = app.segments.length - acceptedCount - remainingCount;
   const hasBorderline = app.segments.some((seg) => !seg.accepted && seg.cluster_tier === "B");
-  const hasRemoved = app.segments.some((seg) => !seg.accepted && seg.cluster_tier !== "B");
-  for (const [filter, available] of [["tierA", acceptedCount > 0 && removedCount > 0],
+  const hasRemoved = app.segments.some((seg) => !seg.accepted && !seg.remaining_sentence_export && seg.cluster_tier !== "B");
+  for (const [filter, available] of [["tierA", acceptedCount > 0 && removedCount + remainingCount > 0],
+                                   ["remaining", remainingCount > 0],
                                    ["tierB", hasBorderline], ["removed", hasRemoved]]) {
     document.querySelector(`[data-filter="${filter}"]`).hidden = !available;
     if (!available && app.filter === filter) app.filter = "all";
@@ -1078,6 +1096,7 @@ function refreshMeta() {
   $("trustBorderlineBtn").hidden = !hasBorderline;
   $("batchMeta").innerHTML =
     `<span><b>${acceptedCount}</b> 输出</span>` +
+    (remainingCount ? `<span>· ${remainingCount} 其余单句待复核</span>` : "") +
     (removedCount ? `<span>· ${removedCount} 撤下可试听</span>` : "") +
     `<span>·</span>` +
     `<span><b>${Object.keys(app.reviews).length}</b> 已标</span>`;
@@ -1165,7 +1184,7 @@ $("exportBtn").addEventListener("click", async () => {
 /* 批量采纳未标注的主输出。 */
 $("trustMainBtn").addEventListener("click", async () => {
   if (!app.batchId) return;
-  const pending = app.segments.filter((seg) => seg.accepted && !app.reviews[seg.ordinal]);
+  const pending = app.segments.filter((seg) => seg.accepted && !seg.all_sentence_export && !app.reviews[seg.ordinal]);
   if (!pending.length) { toast("没有待标注的 Tier A 主输出片段", "err"); return; }
   if (!window.confirm(`将把 ${pending.length} 段未标注的 Tier A 主输出全部标为“目标匹配”，继续？`)) return;
   app.history.push(JSON.stringify(app.reviews));
@@ -1294,13 +1313,17 @@ refreshRollbackAvailability();
 
 $('liveRecalibrate').addEventListener('click',async () => {
   if (!app.batchId) return;
+  if (!await save(false)) return;
+  const batchId = app.batchId;
   try {
     const response = await fetch(`/api/batches/${encodeURIComponent(app.batchId)}/live_recalibrate`,{method:'POST'});
     const data = await response.json();
+    if (app.batchId !== batchId) return;
     if (!response.ok) throw new Error(data.detail || '重排失败');
     if (data.status !== 'recalibrated') return toast(data.message,'err');
     const scores = new Map(data.scores.map(s => [s.ordinal,s]));
     app.segments.forEach(s => { s.live_information = scores.get(s.ordinal)?.information;
+      s.acquisition_rank = scores.get(s.ordinal)?.acquisition_rank;
       s.live_probability = scores.get(s.ordinal)?.probability; });
     document.querySelector('[data-filter="active"]').click();
     toast(`已根据 ${data.labels} 条标注刷新待审顺序`,'ok');
@@ -1489,6 +1512,8 @@ $("runBtn").addEventListener("click", async () => {
           use_overlap_detector: $("useOverlap").checked,
           use_singing_detector: $("useSinging").checked,
           export_video_clips: $("useVideo").checked,
+          branch_validation: $("useBranchValidation").checked,
+          export_all_sentences: $("exportAllSentences").checked,
           cluster_bootstrap: $("useBootstrap").checked,
           cluster_identity_mode: "enforce",
           export_sample_rate: Number($('exportSampleRate').value),
@@ -1550,8 +1575,12 @@ function appendTerm(event) {
     line.textContent = "错误：" + (event.message || "未知错误");
   } else if (event.type === "complete") {
     line.classList.add("ok");
+    const remaining = Number(event.remaining_count) || 0;
+    const discarded = Math.max(0, event.rejected_count - remaining);
     line.textContent =
-      `完成：保留 ${event.accepted_count} 段，舍弃 ${event.rejected_count} 段 → ${event.batch_id}`;
+      `完成：保留 ${event.accepted_count} 段` +
+      (remaining ? `，另存 ${remaining} 段其余单句待复核` : "") +
+      `，舍弃 ${discarded} 段 → ${event.batch_id}`;
     $("progressPct").textContent = "100%";
     $("progressBar").style.width = "100%";
   } else {
@@ -1565,16 +1594,21 @@ function appendTerm(event) {
 
 /* ── 设置 ───────────────────────────────────────────────── */
 
-async function loadSettings() {
+async function loadSettings(restoreExtraction = false) {
   try {
     const response = await fetch("/api/settings");
     const settings = await response.json();
     $("portInput").value = settings.webui_port || 7860;
     $("blindDefault").checked = Boolean(settings.blind_mode);
     $("autoNextDefault").checked = settings.auto_next_on_rate !== false;
-    if (settings.speaker_threshold != null) {
-      $("threshold").value = settings.speaker_threshold;
-      $("thresholdVal").textContent = Number(settings.speaker_threshold).toFixed(2);
+    // Opening Settings must retain the current extraction choices for saving.
+    if (restoreExtraction) {
+      $("useBranchValidation").checked = settings.branch_validation === true;
+      $("exportAllSentences").checked = settings.export_all_sentences === true;
+      if (settings.speaker_threshold != null) {
+        $("threshold").value = settings.speaker_threshold;
+        $("thresholdVal").textContent = Number(settings.speaker_threshold).toFixed(2);
+      }
     }
   } catch (error) {
     toast("读取设置失败：" + error.message, "err");
@@ -1591,6 +1625,8 @@ $("saveSettingsBtn").addEventListener("click", async () => {
         blind_mode: $("blindDefault").checked,
         auto_next_on_rate: $("autoNextDefault").checked,
         speaker_threshold: parseFloat($("threshold").value),
+        branch_validation: $("useBranchValidation").checked,
+        export_all_sentences: $("exportAllSentences").checked,
       }),
     });
     if (!response.ok) throw new Error("HTTP " + response.status);
@@ -1668,6 +1704,6 @@ async function loadVersion() {
 
 applyBlind();
 loadBatches();
-loadSettings();
+loadSettings(true);
 loadVersion();
 resumeTraining();

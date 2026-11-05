@@ -16,6 +16,7 @@ import torch.nn.functional as F
 from .audio import load_mono
 from .config import OVERLAP_MODEL, PANNS_LABELS, PANNS_MODEL, VENDOR_ROOT
 from .types import TimeSpan
+from .model_pool import is_memory_error
 
 
 def _merge_spans(spans: list[TimeSpan], gap: float = 0.08) -> list[TimeSpan]:
@@ -65,14 +66,58 @@ class OverlapDetector:
     SAMPLE_RATE = 16000
     WINDOW_SAMPLES = 160000
 
-    def __init__(self) -> None:
+    def __init__(self, device: str = 'cuda', batch_size: int = 16) -> None:
+        self.device = device
+        self.batch_size = max(1, int(batch_size))
         options = ort.SessionOptions()
         options.intra_op_num_threads = max(1, min(4, (torch.get_num_threads() or 1)))
-        self.session = ort.InferenceSession(
-            str(OVERLAP_MODEL),
-            sess_options=options,
-            providers=["CPUExecutionProvider"],
-        )
+        self.options = options
+        providers = ['CPUExecutionProvider']
+        if device == 'cuda' and 'CUDAExecutionProvider' in ort.get_available_providers():
+            providers.insert(0, 'CUDAExecutionProvider')
+        try:
+            self.session = ort.InferenceSession(str(OVERLAP_MODEL), sess_options=options, providers=providers)
+        except Exception:
+            if providers == ['CPUExecutionProvider']:
+                raise
+            self._cpu_session()
+        self.device = ('cuda' if 'CUDAExecutionProvider' in self.session.get_providers() else 'cpu')
+        # Some distributed pyannote graphs have a fixed batch dimension.
+        shape = self.session.get_inputs()[0].shape
+        if isinstance(shape[0], int):
+            self.batch_size = 1
+
+    def _cpu_session(self):
+        self.session = ort.InferenceSession(str(OVERLAP_MODEL), sess_options=self.options,
+                                           providers=['CPUExecutionProvider'])
+        self.device = 'cpu'
+
+    def _infer_windows(self, waveform, plans):
+        offset = 0
+        while offset < len(plans):
+            batch = plans[offset:offset + self.batch_size]
+            waves, ratios = [], []
+            for start, end in batch:
+                part = waveform[round(start * self.SAMPLE_RATE):round(end * self.SAMPLE_RATE)]
+                ratios.append(min(1., len(part) / self.WINDOW_SAMPLES))
+                waves.append(np.pad(part[:self.WINDOW_SAMPLES],
+                                    (0, max(0, self.WINDOW_SAMPLES - len(part)))))
+            try:
+                values = self.session.run(None, {'x': np.stack(waves)[:, None].astype(np.float32)})[0]
+            except Exception as error:
+                if self.device != 'cuda' or not is_memory_error(error):
+                    raise
+                values = None
+            if values is None:
+                if self.batch_size > 1:
+                    self.batch_size = max(1, self.batch_size // 2)
+                else:
+                    self._cpu_session()
+                continue
+            for plan, output, ratio in zip(batch, values, ratios):
+                probabilities = self._softmax(output)
+                yield plan, probabilities[:max(1, round(len(probabilities) * ratio))]
+            offset += len(batch)
 
     @staticmethod
     def _softmax(value: np.ndarray) -> np.ndarray:
@@ -88,22 +133,18 @@ class OverlapDetector:
         duration_samples = len(waveform)
         hop = self.WINDOW_SAMPLES // 2
         scores: list[np.ndarray] = []
+        plans = []
         for start in range(0, max(1, duration_samples), hop):
-            actual = waveform[start : start + self.WINDOW_SAMPLES]
-            valid_ratio = min(1.0, len(actual) / self.WINDOW_SAMPLES)
-            if len(actual) < self.WINDOW_SAMPLES:
-                actual = np.pad(actual, (0, self.WINDOW_SAMPLES - len(actual)))
-            output = self.session.run(None, {"x": actual[None, None].astype(np.float32)})[0][0]
-            probabilities = self._softmax(output)
-            valid_frames = max(1, int(round(len(probabilities) * valid_ratio)))
-            probabilities = probabilities[:valid_frames]
+            plans.append((start / self.SAMPLE_RATE,
+                          min(duration_samples, start + self.WINDOW_SAMPLES) / self.SAMPLE_RATE))
+            if start + self.WINDOW_SAMPLES >= duration_samples:
+                break
+        for _, probabilities in self._infer_windows(waveform, plans):
             speech_probability = 1.0 - probabilities[:, 0]
             overlap_probability = probabilities[:, 4:7].sum(axis=1)
             active = speech_probability >= 0.20
             if active.any():
                 scores.append(overlap_probability[active])
-            if start + self.WINDOW_SAMPLES >= duration_samples:
-                break
 
         if not scores:
             return OverlapDecision(False, 0.0, 0.0, 0.0)
@@ -144,17 +185,8 @@ class OverlapDetector:
         frame_shift = 270 / self.SAMPLE_RATE
         frame_offset = 991 / (2 * self.SAMPLE_RATE)
         progress(0.0, f"多人重叠扫描 0/{len(plans)}")
-        for plan_index, (start, end) in enumerate(plans, start=1):
-            begin_sample = int(round(start * self.SAMPLE_RATE))
-            end_sample = int(round(end * self.SAMPLE_RATE))
-            actual = waveform[begin_sample:end_sample]
-            valid_ratio = min(1.0, len(actual) / self.WINDOW_SAMPLES)
-            if len(actual) < self.WINDOW_SAMPLES:
-                actual = np.pad(actual, (0, self.WINDOW_SAMPLES - len(actual)))
-            output = self.session.run(None, {"x": actual[None, None].astype(np.float32)})[0][0]
-            probabilities = self._softmax(output)
-            valid_frames = max(1, int(round(len(probabilities) * valid_ratio)))
-            values = probabilities[:valid_frames, 4:7].sum(axis=1)
+        for plan_index, ((start, end), probabilities) in enumerate(self._infer_windows(waveform, plans), 1):
+            values = probabilities[:, 4:7].sum(axis=1)
             active = values >= threshold
             run_start: int | None = None
             for frame_index in range(len(active) + 1):
@@ -228,8 +260,11 @@ class Cnn10(nn.Module):
         self.fc_audioset = nn.Linear(512, classes_num)
 
     def forward(self, waveform: torch.Tensor) -> torch.Tensor:
-        value = self.spectrogram_extractor(waveform)
-        value = self.logmel_extractor(value)
+        # Squared STFT magnitudes overflow FP16 before the logarithm. Keep the
+        # acoustic frontend in FP32; convolutional inference can use autocast.
+        with torch.autocast('cuda', enabled=False):
+            value = self.spectrogram_extractor(waveform.float())
+            value = self.logmel_extractor(value)
         value = value.transpose(1, 3)
         value = self.bn0(value)
         value = value.transpose(1, 3)
@@ -281,7 +316,35 @@ class SingingDetector:
         model = Cnn10(len(self.labels))
         checkpoint = torch.load(PANNS_MODEL, map_location="cpu", weights_only=False)
         model.load_state_dict(checkpoint["model"])
-        self.model = model.eval().to(self.device)
+        self.model = model.eval()
+        try:
+            self.model.to(self.device)
+        except RuntimeError as error:
+            if not is_memory_error(error):
+                raise
+            self.device = torch.device('cpu')
+            self.model.to(self.device)
+
+    def _scores(self, batch):
+        try:
+            with torch.inference_mode(), torch.autocast('cuda', enabled=self.device.type == 'cuda'):
+                scores = self.model(batch.to(self.device)).float().cpu()
+            if not bool(torch.isfinite(scores).all()):
+                with torch.inference_mode(), torch.autocast('cuda', enabled=False):
+                    scores = self.model(batch.float().to(self.device)).float().cpu()
+                if not bool(torch.isfinite(scores).all()):
+                    raise ValueError('Nonfinite singing evidence; refusing to classify audio')
+            return scores
+        except RuntimeError as error:
+            if self.device.type != 'cuda' or not is_memory_error(error):
+                raise
+        if len(batch) > 1:
+            middle = len(batch) // 2
+            return torch.cat((self._scores(batch[:middle]), self._scores(batch[middle:])))
+        self.model.cpu().float()
+        self.device = torch.device('cpu')
+        torch.cuda.empty_cache()
+        return self._scores(batch)
 
     def close(self) -> None:
         if hasattr(self, "model"):
@@ -297,8 +360,7 @@ class SingingDetector:
         minimum = 32000
         if waveform.numel() < minimum:
             waveform = F.pad(waveform, (0, minimum - waveform.numel()))
-        with torch.inference_mode():
-            scores = self.model(waveform.unsqueeze(0).to(self.device))[0].float().cpu()
+        scores = self._scores(waveform.unsqueeze(0))[0]
         singing = float(scores[self.singing_indices].max())
         speech = float(scores[self.speech_indices].max())
         top = torch.topk(scores, k=6)
@@ -377,8 +439,7 @@ class SingingDetector:
                 part = waveform[round(start * 32000):round(end * 32000)]
                 part = F.pad(part, (0, max(0, target_samples - part.numel())))
                 parts.append(part[:target_samples])
-            with torch.inference_mode():
-                scores = self.model(torch.stack(parts).to(self.device)).float().cpu()
+            scores = self._scores(torch.stack(parts))
             for (start, end), values in zip(batch_plans, scores):
                 singing = float(values[self.singing_indices].max())
                 speech = float(values[self.speech_indices].max())

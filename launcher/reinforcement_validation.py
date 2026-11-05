@@ -18,10 +18,10 @@ def holdout_sources(groups, labels, verified):
     return set()
 
 
-def classification_metrics(scores, labels):
+def classification_metrics(scores, labels, threshold=.8):
     import numpy as np
     scores, labels = np.asarray(scores), np.asarray(labels, dtype=bool)
-    predicted = scores >= .8
+    predicted = scores >= threshold
     tp, fp = int((predicted & labels).sum()), int((predicted & ~labels).sum())
     fn, tn = int((~predicted & labels).sum()), int((~predicted & ~labels).sum())
     # Rank-based AUC, including ties, without a quadratic pairwise matrix.

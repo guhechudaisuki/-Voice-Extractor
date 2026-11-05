@@ -1,38 +1,32 @@
-"""Batch-local review ordering. Probabilities never change extraction decisions."""
+"""Task-local graph propagation changes navigation, never labels or exports."""
 import numpy as np
+from .review_graph import feature_matrix, affinity_graph, diverse_order
 
 
 def recalibrate(segments):
-    def features(seg):
-        values = [seg.get('score'),seg.get('calibrated_fusion_score'),
-                  *(seg.get('identity_signature') or [None]*5)]
-        values = (values+[None]*7)[:7]
-        return [float(v) if isinstance(v,(int,float)) and np.isfinite(v) else 0. for v in values]
-    labeled = [s for s in segments if s.get('review',{}).get('label') in {'correct','wrong'}]
-    labels = np.array([s['review']['label']=='correct' for s in labeled],dtype=float)
+    labeled = [i for i,s in enumerate(segments) if s.get('review',{}).get('label') in {'correct','wrong'}]
+    labels = np.array([segments[i]['review']['label']=='correct' for i in labeled],dtype=float)
     if len(labels)<10 or min(labels.sum(),len(labels)-labels.sum())<3:
-        return {'status':'insufficient_labels','message':'至少标注 10 条，含 3 条目标和 3 条非目标；部分错人不作为整句训练标签','scores':[]}
-    x = np.asarray([features(s) for s in labeled])
-    center,scale = np.mean(x,axis=0),np.maximum(np.std(x,axis=0),.05)
-    x = np.column_stack((np.ones(len(x)),np.clip((x-center)/scale,-10,10)))
-    weights = np.zeros(x.shape[1])
-    # L2 regularized Platt fusion, bounded deterministic Newton updates.
-    penalty = np.diag([.01]+[2.]*(x.shape[1]-1))
-    for _ in range(30):
-        p = 1/(1+np.exp(-np.clip(x@weights,-30,30)))
-        gradient = x.T@(p-labels)+penalty@weights
-        hessian = x.T@((p*(1-p))[:,None]*x)+penalty
-        delta = np.linalg.solve(hessian,gradient)
-        weights -= np.clip(delta,-1,1)
-        if np.linalg.norm(delta)<1e-6:
+        return {'status':'insufficient_labels','message':'至少标注 10 条，含 3 条目标和 3 条非目标；部分错人不作为整句标签','scores':[]}
+    x = feature_matrix(segments)
+    graph = affinity_graph(x)
+    probabilities = np.full(len(segments),.5)
+    probabilities[labeled] = labels
+    for _ in range(80):
+        updated = .95*(graph@probabilities)+.05*.5
+        isolated = np.asarray(graph.sum(1)).ravel() == 0
+        updated[isolated] = .5
+        updated[labeled] = labels
+        delta = np.max(np.abs(updated-probabilities))
+        probabilities = updated
+        if delta<1e-6:
             break
-    scores=[]
-    for seg in segments:
-        if seg.get('review',{}).get('label') or (seg.get('accepted') and seg.get('cluster_tier')!='B'):
-            continue
-        vector=np.r_[1.,np.clip((np.asarray(features(seg))-center)/scale,-10,10)]
-        p=float(1/(1+np.exp(-np.clip(vector@weights,-30,30))))
-        scores.append({'ordinal':seg['ordinal'],'probability':p,
-                       'information':float(4*p*(1-p))})
+    eligible = [i for i,s in enumerate(segments) if not s.get('review',{}).get('label')
+        and (s.get('all_sentence_export') or not s.get('accepted') or s.get('cluster_tier')=='B')]
+    uncertainty = 4*probabilities[eligible]*(1-probabilities[eligible])
+    order = diverse_order(x[eligible],uncertainty)
+    scores = [{'ordinal':segments[eligible[i]]['ordinal'],'probability':float(probabilities[eligible[i]]),
+               'information':float(uncertainty[i]),'acquisition_rank':rank}
+              for rank,i in enumerate(order)]
     return {'status':'recalibrated','labels':len(labels),'scope':'batch_review_order_only',
-            'scores':sorted(scores,key=lambda s:(-s['information'],-s['probability'],s['ordinal']))}
+            'method':'multiview_knn_label_propagation_dpp','scores':scores}

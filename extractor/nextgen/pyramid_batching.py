@@ -26,8 +26,8 @@ def anime_batch(encoders, waveforms, batch_size=8):
         for indexes in groups.values():
             for start in range(0,len(indexes),batch_size):
                 batch = indexes[start:start+batch_size]
-                vectors = np.asarray(encoder.session.run(None,{
-                    'features':np.stack([features[i] for i in batch])})[0],dtype=np.float32)
+                vectors = np.asarray(encoder.run_features(
+                    np.stack([features[i] for i in batch])),dtype=np.float32)
                 if vectors.shape != (len(batch),192) or not np.isfinite(vectors).all():
                     raise ValueError('Invalid batched anime embeddings')
                 norms = np.linalg.norm(vectors,axis=1,keepdims=True)

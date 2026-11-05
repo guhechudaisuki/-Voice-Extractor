@@ -1,5 +1,4 @@
 """Finalize genuine word timings before splitting, with acoustic fences intact."""
-from .audio import write_clip
 from .word_boundaries import real_words, snap_boundaries
 from .acoustic_qc import split_overlong_sentences
 
@@ -10,27 +9,29 @@ def finalize_transcripts(candidates, waveform, fragments, *, stem, clips_dir,
     chinese = {}
     for index, candidate in enumerate(candidates):
         if candidate.language == 'zh':
-            path = clips_dir / f'zh_stt_{index:04d}.wav'
-            write_clip(stem, path, candidate.start, candidate.end, sample_rate=16000)
-            chinese[path] = candidate
+            chinese[index] = candidate
     if chinese:
-        try:
-            refined = vad_tools.transcribe_files(list(chinese), progress=progress)
-            for path, candidate in chinese.items():
-                candidate.text = refined.get(path) or candidate.whisper_text
-                words = real_words(getattr(vad_tools, 'word_timestamps', {}).get(path, []))
-                if words:
-                    candidate.diagnostics['word_timestamps'] = [dict(word,
-                        start=word['start'] + candidate.start, end=word['end'] + candidate.start)
-                        for word in words if 0 <= word['start'] < word['end'] <= candidate.duration + .001]
-        finally:
-            for path in chinese:
-                path.unlink(missing_ok=True)
+        refined = vad_tools.transcribe_waveforms({index:
+            waveform[round(c.start * 16000):round(c.end * 16000)].detach().cpu().numpy()
+            for index, c in chinese.items()}, progress=progress)
+        for path, candidate in chinese.items():
+            candidate.text = refined.get(path) or candidate.whisper_text
+            words = real_words(getattr(vad_tools, 'word_timestamps', {}).get(path, []))
+            if words:
+                candidate.diagnostics['word_timestamps'] = [dict(word,
+                    start=word['start'] + candidate.start, end=word['end'] + candidate.start)
+                    for word in words if 0 <= word['start'] < word['end'] <= candidate.duration + .001]
     # Energy valleys propose cuts first; word protection is the final authority
     # within the independently certified identity interval, never outside it.
     refine_crops(candidates, waveform, blocked)
     barriers = [(span.start, span.end) for span in blocked]
     for candidate in candidates:
+        protection = candidate.diagnostics.get('whole_sentence_protection') or {}
+        if (protection.get('passed') is True
+                and protection.get('span') == [candidate.start,candidate.end]):
+            # Word timestamps may be incomplete at soft consonants. They cannot
+            # shorten a homogeneous sentence already certified on its full audio.
+            continue
         allowed = candidate.diagnostics.get('word_boundary_allowed_span', [candidate.start, candidate.end])
         lower, upper = allowed
         trimmed = candidate.diagnostics.get('stt_trimmed_span')

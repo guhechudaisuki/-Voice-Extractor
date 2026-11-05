@@ -5,7 +5,6 @@ from pathlib import Path
 import hashlib
 import json
 import math
-import re
 import tempfile
 import unicodedata
 import wave
@@ -45,41 +44,13 @@ def _partial_clip_text(row: dict, review: dict, keep: tuple[float, float]) -> st
     abs_end = float(row.get("start") or 0) + float(keep[1])
     full = (_list_text(str(review['revised_text'])) if review.get('revised_text') is not None
             else training_text(row, review))
-    normalized = re.sub(r'\s+', '', full)
-    positions = [i for i, char in enumerate(full) if not char.isspace()]
+    from extractor.timed_text import complete_timing, slice_timed_text
     diagnostics = row.get("diagnostics") or {}
     for key in ("word_timestamps", "stt_fragments"):
-        entries = diagnostics.get(key)
-        if not isinstance(entries, list) or not entries:
-            continue
-        fragments = []
-        for entry in entries:
-            if not isinstance(entry, dict):
-                break
-            text = str(entry.get("text") or "").strip()
-            start, end = _finite(entry.get('start')), _finite(entry.get('end'))
-            if (not text or start is None or end is None or end <= start
-                    or entry.get('timing_estimated')
-                    or (entry.get('diagnostics') or {}).get('timing_estimated')):
-                break
-            fragments.append((start, end, re.sub(r'\s+', '', text)))
-        if len(fragments) != len(entries):
-            continue
-        fragments.sort()
-        if (''.join(text for _, _, text in fragments) != normalized
-                or any(a[1] > b[0] + 1e-6 for a, b in zip(fragments, fragments[1:]))):
-            continue
-        selected, cursor = [], 0
-        for start, end, text in fragments:
-            if min(abs_end, end) > max(abs_start, start) + 1e-9:
-                if start < abs_start - 1e-6 or end > abs_end + 1e-6:
-                    # Even one sliced word makes the full crop's label unsafe.
-                    return ''
-                selected.append((cursor, cursor + len(text)))
-            cursor += len(text)
-        if selected:
-            begin, finish = selected[0][0], selected[-1][1]
-            return _list_text(full[positions[begin]:positions[finish] if finish < len(positions) else len(full)])
+        fragments = complete_timing(full, diagnostics.get(key),
+                                    (float(row.get('start') or 0), float(row.get('end') or 0)))
+        if fragments:
+            return _list_text(slice_timed_text(full, fragments, (abs_start, abs_end)))
     return ''
 
 
@@ -297,6 +268,11 @@ def export_review_zip(batch: Path, manifest: dict, reviews: dict, destination: P
                             'word_boundary_refinement':word_audit if cropped else None,
                             'high_frequency_restoration':hf_audit,
                             'acoustic_qc': {key: _finite(qc.get(key)) for key in ('snr_db', 'clipping_ratio', 'effective_speech_seconds')}})
+                        from launcher.corpus_curation import acoustic_dimensions
+                        records[-1]['curation_features'] = acoustic_dimensions(prepared,text,language_code)
+                        from launcher.golden_prompts import provenance
+                        scope = str(batch.resolve()) + '/' + source_relative.split('/')[0]
+                        records[-1].update(provenance(row,keep,scope,source_relative))
                         archive.write(prepared, relative)
                         text_entry = str(Path(relative).with_suffix('.txt')).replace('\\', '/')
                         archive.writestr(text_entry, text)
@@ -305,6 +281,8 @@ def export_review_zip(batch: Path, manifest: dict, reviews: dict, destination: P
                     lines = [f"{record['path']}|{speaker}|{record['language']}|{record['text']}" for record in records if record['valid_text']]
                     archive.writestr('train.list', '\n'.join(lines) + ('\n' if lines else ''))
                 report = _dataset_report(records, skipped, gpt_sovits_list, min_quality_grade)
+                from launcher.corpus_curation import write_curation
+                report['curation'] = write_curation(archive,records,speaker)
                 archive.writestr('dataset_report.json', json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False))
                 archive.writestr('dataset_report.md', _report_markdown(report))
         save_file(archive_path, destination)

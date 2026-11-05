@@ -48,8 +48,10 @@ def main() -> int:
     parser.add_argument(
         "--all-sentences",
         action="store_true",
-        help="输出去除歌声/多人后的全部静音单句，跳过目标声纹筛选",
+        help="追加导出最终目标结果之外的全部干净单人单句，单独保存供复核",
     )
+    parser.add_argument("--branch-validation", action="store_true",
+                        help="合流时追加声纹与边界检验；默认直接合并已选时间轴导出")
     parser.add_argument(
         "--video-segments",
         action="store_true",
@@ -76,6 +78,7 @@ def main() -> int:
             use_overlap_detector=not args.no_overlap,
             use_singing_detector=not args.no_singing,
             export_all_sentences=args.all_sentences,
+            branch_validation=args.branch_validation,
             export_video_clips=args.video_segments,
             export_sample_rate=args.export_sample_rate,
         )

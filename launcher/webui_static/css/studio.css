@@ -46,6 +46,18 @@
   --ui: "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
 }
 
+.word-bricks { display:flex; flex-wrap:wrap; gap:6px; padding:12px 0; }
+.word-bricks[hidden] { display:none; }
+.word-note { flex-basis:100%; color:var(--ink-2); font-size:12px; }
+.word-brick { color:var(--ink); background:var(--panel-2); border:1px solid var(--line); padding:7px 10px; border-radius:4px; cursor:pointer; }
+.word-brick.is-selected { border-color:var(--bad); background:rgba(255,107,129,.16); }
+.word-brick:focus-visible, .star-dialog canvas:focus-visible { outline:2px solid var(--cyan); outline-offset:3px; }
+.star-dialog { width:min(1050px,95vw); max-height:95vh; margin:auto; padding:24px; color:var(--ink); background:var(--panel-solid); border:1px solid var(--line); border-radius:12px; }
+.star-dialog h2 { font:600 22px var(--ui); margin-bottom:8px; }
+.star-dialog p { color:var(--ink-2); font:13px var(--ui); margin:10px 0; }
+.star-dialog canvas { width:100%; background:var(--bg-2); touch-action:none; border:1px solid var(--line); }
+.star-toolbar { display:flex; flex-wrap:wrap; gap:8px; }
+
 * { box-sizing: border-box; margin: 0; padding: 0; }
 
 html, body { height: 100%; }
@@ -615,7 +627,9 @@ input[type="checkbox"] { width: 15px; height: 15px; accent-color: var(--cyan); c
 }
 [hidden] { display: none !important; }
 .trim-title { font-size: 12px; color: var(--warn); }
-.trim-row { display: flex; align-items: center; gap: 8px; }
+.trim-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.trim-row .field.num { flex-shrink: 0; }
+.trim-row .mini-btn { white-space: nowrap; }
 .trim-dash { color: var(--ink-3); }
 
 .rail-foot {
@@ -853,6 +867,7 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 .training-panel #rollbackRole { flex: 1 1 220px; width: auto; min-width: 0; }
 
 /* Corpus tools share Studio's existing surfaces and focus treatment. */
+.retained-preview { margin-top: 8px; padding: 8px; border-left: 2px solid #80b9d6; color: #c5d5e3; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; }
 .wave3-dialog { width: min(760px, 90vw); max-height: 85vh; overflow: auto; padding: 20px; color: var(--text, #e8e8f0); background: #171922; border: 1px solid #424554; border-radius: 14px; }
 .wave3-dialog::backdrop { background: #0009; }
 .wave3-file-list { max-height: 50vh; overflow: auto; margin: 16px 0; }

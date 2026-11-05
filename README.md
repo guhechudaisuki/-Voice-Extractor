@@ -42,7 +42,7 @@ python launcher/app_entry.py --ui webui
 
 1. 添加目标人物的参考音频，尽量选择少配乐、无重叠、人物明确的片段。
 2. 添加待处理文件，按需绑定字幕和排除人物参考，选择结果保存位置。
-3. 开始提取。正常模式只转写、导出通过目标人物筛选的片段，不额外导出低置信候选或聚类排除音频。“输出全部单句”开启后跳过目标人物筛选，导出各人物的单人讲话；两种模式均保留去歌声、重叠过滤和干声导出。
+3. 选择导出方式。默认将声学和字幕两路已选时间轴合并、去重后导出；开启“分流检验”时追加声纹与边界检验。“输出全部单句”另外导出最终目标结果之外的全部干净单人单句，单独保存供人工复核，剩余句子不按目标声纹删减。各模式均使用分离干声，保留歌声与重叠过滤。
 4. 在复核工作台逐条试听导出结果；局部混入他人声音的片段可标记区间。
 5. 按质量等级导出数据集，需要时勾选 GPT-SoVITS 清单或附带训练原料。
 
@@ -74,6 +74,7 @@ python launcher/app_entry.py --ui webui
 
 - `audio/`：WAV 句段。
 - `text/`：与音频同名的转写文本。
+- `remaining_audio/`、`remaining_text/`、`remaining_manifest.json`：开启“输出全部单句”后另外保存的剩余单句，和最终目标范围不重叠；人工确认后才可进入训练导出。
 - `video/`：启用视频片段输出时生成。
 - `manifest.json`、`manifest.csv`：时间、文本、分数与处理信息。
 - `transcript.srt`：带时间轴的文本。
@@ -90,7 +91,7 @@ python extract_cli.py `
   --video-segments
 ```
 
-增加 `--all-sentences` 可输出清理后的全部单句供人工筛选。字幕按目标文件绑定，例如 `--subtitle input-01.mp4 input-01.ass`；多个目标可重复指定。排除人物使用 `--exclude-role reference-other.wav`，同一参数后的参考属于同一人物。
+增加 `--all-sentences` 可追加输出最终目标结果之外的全部干净单句供人工筛选；`--branch-validation` 开启合流追加检验，默认关闭。字幕按目标文件绑定，例如 `--subtitle input-01.mp4 input-01.ass`；多个目标可重复指定。排除人物使用 `--exclude-role reference-other.wav`，同一参数后的参考属于同一人物。
 
 ## 模型与资源
 

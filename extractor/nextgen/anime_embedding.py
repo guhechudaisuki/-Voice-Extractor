@@ -96,7 +96,7 @@ class AnimeSpeakerOnnx:
 
     def _encode(self, waveform):
         features = speechbrain_compatible_fbank(waveform)
-        result = self.session.run(None, {"features": features.numpy()[None]})[0]
+        result = self.run_features(features.numpy()[None])
         vector = np.asarray(result, dtype=np.float32).reshape(-1)
         if vector.shape != (192,) or not np.isfinite(vector).all():
             raise ValueError("Anime speaker ONNX returned an invalid embedding")
@@ -104,6 +104,10 @@ class AnimeSpeakerOnnx:
         if norm <= 1e-8:
             raise ValueError("Anime speaker ONNX returned a zero embedding")
         return vector / norm
+
+    def run_features(self, features: np.ndarray) -> np.ndarray:
+        """Keep batched session calls inside the owning model-pool lease."""
+        return self.session.run(None, {"features": features})[0]
 
     def close(self) -> None:
         self.session = None

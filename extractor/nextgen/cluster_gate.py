@@ -92,14 +92,21 @@ def _calibrate_candidate(candidate, turns, result, local):
     def sigmoid(value, floor, scale):
         return 1 / (1 + math.exp(-max(-30., min(30., (value-floor)/scale))))
     components = []
-    for value, floor, scale, weight in (
-        (primary, floors.get("primary", .58), .06, .30),
-        (secondary, floors.get("secondary", .51), .06, .25),
-        (tertiary, result.diagnostics.get("tertiary_floor", .75), .04, .20),
-        (anime_char, floors.get("anime_char", .45), .07, .20),
-        (anime_va, floors.get("anime_va", .45), .07, .20)):
+    from .quality_fusion import quality_weights
+    quality = {'duration':candidate.duration, 'competitors':max(0,len(result.clusters)-1)}
+    for name in ('snr_db','voiced_fraction','high_band_loss','same_va_conflict'):
+        value = average([(r.get('identity_evidence',{}).get('physical_quality',{}).get(name),w) for r,w in rows])
+        if value is not None:
+            quality[name] = value
+    weights = quality_weights(quality)
+    for channel, value, floor, scale in (
+        ('primary', primary, floors.get("primary", .58), .06),
+        ('secondary', secondary, floors.get("secondary", .51), .06),
+        ('tertiary', tertiary, result.diagnostics.get("tertiary_floor", .75), .04),
+        ('anime_char', anime_char, floors.get("anime_char", .45), .07),
+        ('anime_va', anime_va, floors.get("anime_va", .45), .07)):
         if finite(value):
-            components.append((sigmoid(value, floor, scale), weight))
+            components.append((sigmoid(value, floor, scale), weights[channel]))
     cohort = result.diagnostics.get("turn_cohort_z") or {}
     for name, weight in (("cohort_z_primary", .15), ("cohort_z_secondary", .10)):
         z = average([((lookup(cohort, t.index) or {}).get(name), w) for t,w in overlaps])
@@ -113,6 +120,7 @@ def _calibrate_candidate(candidate, turns, result, local):
     if episode_llr is not None:
         fusion = sigmoid(episode_llr, 0., 1.)
     candidate.diagnostics["calibrated_fusion_score"] = round(fusion, 6)
+    candidate.diagnostics['quality_gate'] = {'inputs':quality,'weights':weights}
     candidate.diagnostics["fusion_evidence"] = {"primary": primary, "secondary": secondary,
         "tertiary": tertiary, "tertiary_source": tertiary_source,
         "anime_char_score": anime_char, "anime_va_score": anime_va,
@@ -209,11 +217,13 @@ def _synthesis_regions(spans, occupied, minimum, result, trajectory):
                       for x, y in ((left, min(right, a)), (max(left, b), right))
                       if y > x]
         for a, b in pieces:
-            if _meets_export_length(a, b, minimum, result) and trajectory.assess(a, b)["accepted"]:
+            from ..sentence_policy import positive_conflict
+            if (_meets_export_length(a, b, minimum, result) and trajectory.assess(a, b)["accepted"]
+                    and not positive_conflict(trajectory.rows, a, b)):
                 yield a, b
 
 
-def _join_short_remainders(candidates, spans, minimum, trajectory):
+def _join_short_remainders(candidates, spans, minimum, trajectory, change_points=()):
     """Keep a certified sentence's short residual audio attached to its export."""
     for candidate in candidates:
         for start, end in spans:
@@ -229,7 +239,8 @@ def _join_short_remainders(candidates, spans, minimum, trajectory):
                    for other in candidates):
                 continue
             evidence = trajectory.assess(a, b)
-            if evidence["accepted"]:
+            from ..sentence_policy import positive_conflict
+            if evidence["accepted"] and not positive_conflict(trajectory.rows, a, b, change_points):
                 candidate.start, candidate.end = a, b
                 candidate.diagnostics["identity_trajectory"] = evidence
                 candidate.diagnostics["cluster_short_remainder_joined"] = True
@@ -359,12 +370,20 @@ def _positive_fine_review(candidate, evidence):
 
 
 def apply_cluster_gate(accepted, rejected, turns, result, *, mode, min_seconds=1.2,
-                       blocked_spans=(), local=None, island_arbitration=None):
+                       blocked_spans=(), local=None, island_arbitration=None,
+                       keep_rejected=True):
     if mode == "off":
         return {"removed": 0, "promoted": 0, "cropped": 0, "borderline": 0}
     removed, promoted, cropped, borderline = [], [], [], []
     originally_accepted = list(accepted)
     source_pool = [*originally_accepted, *rejected]
+    from ..sentence_policy import whole_sentence_evidence, positive_conflict
+    sentence_rows = [r for group in (local or {}).values() for r in group]
+    whole_evidence = {
+        (c.start, c.end): whole_sentence_evidence(sentence_rows, c.start, c.end,
+            blocked=blocked_spans,
+            change_points=result.diagnostics.get('confirmed_change_points', ()))
+        for c in source_pool}
     hard_source_spans = [(c.start, c.end) for c in source_pool
                          if any(c.diagnostics.get(k) for k in HARD_VETOES)]
     floors = result.diagnostics.get("profile_floors") or {}
@@ -442,6 +461,20 @@ def apply_cluster_gate(accepted, rejected, turns, result, *, mode, min_seconds=1
                    and _meets_export_length(a,b,min_seconds,result)]
     lattice = CandidateLattice(trajectory, merged)
     merged_accepted_spans = lattice.decode(min_seconds, short_spans) if local else merged
+    # A larger proposal must not replace the clean cores it was assembled
+    # from. The lattice may bridge them using coarse support while a localized
+    # impostor later rejects the envelope. Retain each original exact core as
+    # an alternative, still subject to its own evidence and downstream encoder
+    # certification; never inherit a mixed parent's score.
+    core_alternatives = [
+        (a, b) for a, b in accepted_spans
+        if _meets_export_length(a, b, min_seconds, result)
+        and trajectory.assess(a, b)['accepted']
+        and not any(min(b, y) > max(a, x) for x, y in blocked_spans)
+        and not positive_conflict(sentence_rows, a, b,
+            result.diagnostics.get('confirmed_change_points', ()))
+    ]
+    merged_accepted_spans = sorted(set(map(tuple, merged_accepted_spans)) | set(core_alternatives))
     result.diagnostics["trajectory_spans"] = [list(span) for span in merged_accepted_spans]
     result.diagnostics["trajectory_decoding"] = {
         "input_spans": len(mergeable_spans), "output_spans": len(merged_accepted_spans),
@@ -449,6 +482,9 @@ def apply_cluster_gate(accepted, rejected, turns, result, *, mode, min_seconds=1
 
     def make_crop(parent, start, end, reason, *, strict_parent=False):
         """Create a child using the identity evidence inside its own boundaries."""
+        if (whole_evidence.get((parent.start, parent.end)) is not None
+                or positive_conflict(sentence_rows, start, end)):
+            return None
         child = replace(parent, start=start, end=end, accepted=True,
                         reject_reason="", diagnostics=dict(parent.diagnostics))
         child.diagnostics["cluster_parent_span"] = [parent.start, parent.end]
@@ -497,6 +533,18 @@ def apply_cluster_gate(accepted, rejected, turns, result, *, mode, min_seconds=1
             candidate, turns, result, local=local, min_seconds=min_seconds, trajectory=trajectory)
         hard = (any(candidate.diagnostics.get(k) for k in HARD_VETOES) or
                 any(min(candidate.end, b) > max(candidate.start, a) for a, b in blocked_spans))
+        whole = whole_evidence.get((candidate.start, candidate.end))
+        if whole is not None and not hard and not evidence.get('fine_conflict'):
+            allowed, reason, tier = True, 'homogeneous_whole_sentence', 'A'
+            candidate.diagnostics['whole_sentence_protection'] = {
+                'span': [candidate.start, candidate.end],
+                'passed': True, 'method': 'whole_audio_and_no_positive_impostor',
+                'whole_evidence': whole}
+            evidence = {**evidence, 'accepted': True, 'method': 'homogeneous_whole_sentence'}
+            candidate.diagnostics['identity_trajectory'] = evidence
+            candidate.diagnostics['cluster_source_identity_conflict'] = False
+        elif positive_conflict(sentence_rows, candidate.start, candidate.end):
+            allowed, reason, tier = False, 'local_identity_conflict', None
         allowed = allowed and not hard
         if (mode == 'enforce' and not hard and not allowed
                 and not any(min(candidate.end, b) > max(candidate.start, a)
@@ -556,10 +604,10 @@ def apply_cluster_gate(accepted, rejected, turns, result, *, mode, min_seconds=1
             window_min = _window_min(candidate)
             promotable = (
                 allowed and _meets_export_length(candidate.start, candidate.end, min_seconds, result)
-                and candidate.reject_reason == "声纹匹配不足"
+                and candidate.reject_reason in ("声纹匹配不足", "说话回合过短")
                 and (not rescue_marked or window_min is None
                      or window_min >= PROMOTION_RESCUE_WINDOW_FLOOR)
-                and (ratio is None or ratio >= PROMOTION_TURN_PASS_RATIO))
+                and (whole is not None or ratio is None or ratio >= PROMOTION_TURN_PASS_RATIO))
             whole_promoted = False
             if promotable and not any(
                     min(candidate.end, a.end) > max(candidate.start, a.start)
@@ -613,7 +661,8 @@ def apply_cluster_gate(accepted, rejected, turns, result, *, mode, min_seconds=1
                 unique_crops.append(child)
         cropped = unique_crops
         accepted[:] = _deduplicate_tier_a([*kept, *cropped])
-        _join_short_remainders(accepted, merged_accepted_spans, min_seconds, trajectory)
+        _join_short_remainders(accepted, merged_accepted_spans, min_seconds, trajectory,
+            result.diagnostics.get('confirmed_change_points', ()))
         rejected[:] = [c for c in rejected if id(c) not in promoted_ids] + removed
         from ..types import CandidateSentence
         tier_a_spans = [(c.start, c.end) for c in accepted]
@@ -639,7 +688,7 @@ def apply_cluster_gate(accepted, rejected, turns, result, *, mode, min_seconds=1
         if synthesized:
             accepted[:] = _deduplicate_tier_a(accepted)
             accepted.sort(key=lambda c: (c.start, c.end))
-    if mode == 'enforce' and local:
+    if keep_rejected and mode == 'enforce' and local:
         # Preserve review access to audio where independently positive meso
         # evidence disagrees with a resolved micro boundary. Never promote it.
         from ..types import CandidateSentence
@@ -662,16 +711,18 @@ def apply_cluster_gate(accepted, rejected, turns, result, *, mode, min_seconds=1
                     'cluster_mode':mode,'review_only':True}))
     for c in {id(c): c for c in [*accepted, *rejected, *borderline]}.values():
         _calibrate_candidate(c, turns, result, local)
-        if local:
+        if local and (keep_rejected or any(c is a for a in accepted)):
             from .identity_heatmap import heatmap
             c.diagnostics['identity_heatmap'] = heatmap(trajectory, c.start, c.end)
     if mode == "enforce":
-        _refine_tier_b(borderline, accepted)
+        if keep_rejected:
+            _refine_tier_b(borderline, accepted)
         rejected_ids = {id(c) for c in rejected}
         rejected.extend(c for c in borderline if id(c) not in rejected_ids)
         rejected[:] = list({id(c): c for c in rejected}.values())
-        rejected.sort(key=lambda c: (c.diagnostics.get("cluster_tier") == "B",
-                                    c.diagnostics["tier_b_rank_score"]), reverse=True)
+        if keep_rejected:
+            rejected.sort(key=lambda c: (c.diagnostics.get("cluster_tier") == "B",
+                                        c.diagnostics["tier_b_rank_score"]), reverse=True)
     refined_b = sum(c.diagnostics.get("cluster_tier") == "B" for c in rejected)
     return {"removed": len(removed), "promoted": len(promoted),
             "cropped": len(cropped), "borderline": refined_b,
@@ -732,6 +783,8 @@ def _refine_tier_b(borderline, accepted, tier_a_coverage=0.85,
 
 def _deduplicate_tier_a(candidates, min_overlap=0.15):
     """Resolve overlapping exports, preferring complete clean intervals."""
+    from ..sentence_continuity import has_exact_target_certificate
+
     ordered = sorted(
         candidates,
         key=lambda c: (
@@ -750,6 +803,18 @@ def _deduplicate_tier_a(candidates, min_overlap=0.15):
             ov = min(cand.end, existing.end) - max(cand.start, existing.start)
             if ov <= min_overlap:
                 continue
+            # A stronger score on a shorter interior is not new evidence
+            # against the independently certified sentence ends. Preserve the
+            # whole interval, including when it originated in a rescue path.
+            # Partial overlaps still use the existing policy; no union or new
+            # boundary can acquire identity from this deduplication step.
+            if (has_exact_target_certificate(existing)
+                    and existing.start <= cand.start and cand.end <= existing.end):
+                break
+            if (len(conflicts) == 1 and has_exact_target_certificate(cand)
+                    and cand.start <= existing.start and existing.end <= cand.end):
+                selected[i] = cand
+                break
             c_wmin = _window_min(cand) or 0.0
             e_wmin = _window_min(existing) or 0.0
             if (len(conflicts) == 1 and cand.duration < existing.duration

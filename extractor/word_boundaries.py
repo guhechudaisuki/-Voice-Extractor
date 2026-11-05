@@ -8,6 +8,22 @@ def real_words(words):
                    and w['end'] > w['start']),key=lambda w:(w['start'],w['end']))
 
 
+def preserve_word_coverage(original, proposed, words):
+    """Reject inward acoustic snaps that would remove an observed word sound.
+
+    This can only restore the pre-snap endpoints. It grants neither identity
+    outside the original interval nor permission to cross a pollution fence.
+    """
+    start, end = proposed
+    for word in real_words(words):
+        a, b = word['start'], word['end']
+        if start > original[0] and min(start, b) > max(original[0], a):
+            start = original[0]
+        if end < original[1] and min(original[1], b) > max(end, a):
+            end = original[1]
+    return start, end
+
+
 def snap_boundaries(start, end, words, *, allowed, blocked=(), waveform=None,
                     sample_rate=16000, maximum=.08):
     """Expand a sliced word by <=80ms; neither timestamps nor text grant identity."""

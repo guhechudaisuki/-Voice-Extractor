@@ -71,7 +71,7 @@ def audit_exclusion_views(target_views: Mapping, exclusion_views: Mapping) -> di
 
 
 def margin_consensus(gaps: Mapping[str, float], audit: Mapping | None,
-                     required_margin: float) -> dict:
+                     required_margin: float, *, absolute_support: Mapping | None = None) -> dict:
     """Pool reliability-weighted margins without erasing corroborated conflicts.
 
     Discounting a losing view needs two other supporting views. Two views alone
@@ -86,7 +86,14 @@ def margin_consensus(gaps: Mapping[str, float], audit: Mapping | None,
               if total > np.finfo(float).eps else 0.)
     supporting = [name for name, value in values.items() if value >= required_margin]
     opposing = [name for name, value in values.items() if value < required_margin]
-    conflict = sum(value < 0. for value in values.values()) > 1
+    # A relative loss is not a detected impostor. A phoneme can match neither
+    # voice, or lose by an insignificant amount in several noisy views. Require
+    # the same separation used for positive identity; callers with acoustic
+    # scores also require the excluded voice to have absolute reference support.
+    negative_views = [name for name, value in values.items()
+                      if value < -max(0., required_margin)
+                      and (absolute_support is None or absolute_support.get(name, False))]
+    conflict = len(negative_views) > 1
     discounted = bool(opposing and supporting and all(
         weights[name] < min(weights[other] for other in supporting)
         for name in opposing))
@@ -94,4 +101,5 @@ def margin_consensus(gaps: Mapping[str, float], audit: Mapping | None,
                 and (not opposing or (len(supporting) >= 2 and discounted)))
     return {"accepted": accepted, "margin": pooled, "weights": weights,
             "supporting_views": supporting, "discounted": discounted,
+            "opposing_views": negative_views,
             "corroborated_conflict": conflict}

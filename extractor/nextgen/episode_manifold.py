@@ -80,8 +80,10 @@ class EpisodeManifold:
         self.reference_matrices = {}
         self.direction_spread = {}
         self.rival_subspaces = {}
+        self._rival_vectors = {}
         self._subspace_cache = {}
         self.calibrators = {}
+        self.whiteners = {}
         self.cohort_cluster_ids = {}
         self._calibration_cache = {}
         self.same_va_rivals = []
@@ -102,6 +104,7 @@ class EpisodeManifold:
                 else:
                     self.direction_spread[channel] = None
                 rivals = self.competitors[channel]
+                self._rival_vectors[channel] = [[row] for row in rivals] if rivals is not None else []
                 self.rival_subspaces[channel] = [RegisterSubspace([row]) for row in rivals] if rivals is not None else []
             prior = max(1. - floor, self.margin) / math.sqrt(12.)
             scores = []
@@ -113,11 +116,58 @@ class EpisodeManifold:
             scale = self.scales[channel] = _spread(scores, prior)
             signal = max(float(np.median(scores)) - floor, 0.) if scores else prior
             self.reliability[channel] = signal / max(signal + scale, _EPS)
+        self._refresh_geometry()
+
+    def _geometry_vector(self, channel, vectors):
+        whitening = self.whiteners.get(channel)
+        values = np.asarray(vectors,dtype=float)
+        if whitening is not None and len(whitening.basis):
+            return whitening.transform(values)
+        return values/np.maximum(np.linalg.norm(values,axis=-1,keepdims=True),_EPS)
+
+    def _refresh_geometry(self):
+        """One metric for queries, refs, anchors, rival subspaces and radii.
+
+        Original-domain reference scores, floors, direction tests and LLR
+        calibrators are deliberately separate from this relative geometry.
+        """
+        self._subspace_cache.clear()
+        self._geometry_references, self._geometry_anchors = {}, {}
+        self._geometry_competitors, self._geometry_radius = {}, {}
+        for channel in ('primary','secondary'):
+            refs = self._geometry_vector(channel,self.reference_matrices[channel])
+            self._geometry_references[channel] = refs
+            anchors = np.asarray([getattr(a,channel) for a in self.anchors]).reshape(-1,refs.shape[1])
+            matrix = self._geometry_vector(channel,anchors)
+            self._geometry_anchors[channel] = matrix
+            rivals = self.competitors[channel]
+            self._geometry_competitors[channel] = (self._geometry_vector(channel,rivals)
+                                                   if rivals is not None else None)
+            self.rival_subspaces[channel] = [RegisterSubspace(self._geometry_vector(channel,rows))
+                for rows in self._rival_vectors[channel]]
+            if channel not in self.whiteners:
+                self._geometry_radius[channel] = self.radius.get(channel,self.scales[channel])
+                continue
+            distance = np.maximum(0.,1.-matrix@matrix.T)
+            for i,a in enumerate(self.anchors):
+                distance[i,[b.turn==a.turn for b in self.anchors]] = np.inf
+            nearest = distance.min(axis=1) if len(matrix) else np.array([])
+            nearest = nearest[np.isfinite(nearest)]
+            reference_distances = (1.-refs@refs.T)[np.triu_indices(len(refs),k=1)]
+            prior = float(np.median(reference_distances)) if len(reference_distances) else .1
+            self._geometry_radius[channel] = max(float(np.median(nearest)) if len(nearest) else prior,1e-6)
+
+    def clear_whitening(self):
+        for whitening in self.whiteners.values():
+            whitening.clear()
+        self.whiteners.clear()
+        self._refresh_geometry()
 
     def fit(self, anchors):
         self.anchors = tuple(anchors)
         self._subspace_cache.clear()
         if not self.anchors:
+            self._refresh_geometry()
             return
         for channel in ("primary", "secondary"):
             matrix = np.stack([_unit(getattr(anchor, channel)) for anchor in self.anchors])
@@ -143,12 +193,13 @@ class EpisodeManifold:
         gaps = np.diff(times)
         if len(gaps):
             self.scene_scale = float(np.median(gaps[gaps > 0.]))
+        self._refresh_geometry()
 
     def fit_competitors(self, turns, clusters, analyzer=None):
         """Keep each rival's register space separate, using its coherent members."""
         by_index = {turn.index: turn for turn in turns if turn.usable}
         for channel in ("primary", "secondary"):
-            spaces = []
+            spaces, raw_spaces = [], []
             for cluster in clusters:
                 members = [by_index[index] for index in cluster.members
                            if index in by_index and index not in cluster.outliers]
@@ -157,7 +208,9 @@ class EpisodeManifold:
                 center = float(np.median(affinity)) if affinity else 0.
                 vectors = [getattr(turn, channel) for turn, value in zip(members, affinity) if value >= center]
                 spaces.append(RegisterSubspace([centroid, *vectors]))
+                raw_spaces.append([centroid,*vectors])
             self.rival_subspaces[channel] = spaces
+            self._rival_vectors[channel] = raw_spaces
         cohort_vectors = {channel: [] for channel in CHANNELS}
         cohort_ids = {channel: [] for channel in CHANNELS}
         for cluster in clusters:
@@ -184,12 +237,31 @@ class EpisodeManifold:
                         cohort_vectors['anime_char'][-1], cohort_vectors['anime_va'][-1])
         self.cohort_cluster_ids = cohort_ids
         self._calibration_cache.clear()
+        for whitening in self.whiteners.values():
+            whitening.clear()
+        self.whiteners.clear()
+        # TemporalMiner supplies qualified non-target cohorts, after removing
+        # blocked turns and the target family. Limit each speaker's influence.
+        for channel in ('primary','secondary'):
+            observations, groups = [], []
+            for cluster in clusters:
+                members = [by_index[i] for i in cluster.members if i in by_index and i not in cluster.outliers]
+                members = sorted(members,key=lambda t:(t.start,t.end))
+                for index in np.linspace(0,len(members)-1,min(16,len(members))).astype(int):
+                    observations.append(getattr(members[index],channel))
+                    groups.append(cluster.cluster_id)
+            if len(observations)>=8 and len(set(groups))>=2:
+                from .episode_whitening import EpisodeWhitening
+                whitening = EpisodeWhitening(observations,groups)
+                if len(whitening.basis):
+                    self.whiteners[channel] = whitening
         for channel, rivals in cohort_vectors.items():
             refs = getattr(self.profile, channel + "_references", None)
             center = getattr(self.profile, channel + "_centroid", None)
             if center is not None:
                 refs = refs if refs is not None and len(refs) else [center]
                 self.calibrators[channel] = AdaptiveLLR(refs, rivals, self.floors[channel], self.scales[channel])
+        self._refresh_geometry()
 
     def register_same_va(self, cluster_id, character, actor):
         """Detect an acoustic actor/character disagreement, never using text labels."""
@@ -271,8 +343,8 @@ class EpisodeManifold:
     def _target_subspace(self, channel, indexes):
         key = (channel, tuple(indexes))
         if key not in self._subspace_cache:
-            references = self.reference_matrices[channel]
-            anchors = [self.matrices[channel][index] for index in indexes]
+            references = self._geometry_references[channel]
+            anchors = [self._geometry_anchors[channel][index] for index in indexes]
             # Reference pseudo-count is measured in seconds. One short line has
             # a small effect; many independent turns gradually dominate.
             weights = [6. / len(references)] * len(references)
@@ -281,6 +353,9 @@ class EpisodeManifold:
         return self._subspace_cache[key]
 
     def geometry(self, primary, secondary, start, end, exclude_span=None, observations=None):
+        primary = self._geometry_vector('primary',primary)
+        secondary = self._geometry_vector('secondary',secondary)
+        domain = 'episode_whitened' if self.whiteners else 'original'
         left, right = exclude_span or (start, end)
         indexes = [i for i, a in enumerate(self.anchors)
                    if min(right, a.end) <= max(left, a.start)]
@@ -294,14 +369,14 @@ class EpisodeManifold:
                     margins[channel] = (rival-target) / max(rival+target, _EPS)
             return {"margin": float(np.mean(list(margins.values()))) if margins else None,
                     "channel_margins": margins, "context_affinity": 0., "supports": [],
-                    "reference_prior": True}
+                    "reference_prior": True, "geometry_domain":domain}
         distances, rival_distances = {}, {}
         weights = {}
         for channel, vector in (("primary", primary), ("secondary", secondary)):
             probe = _unit(vector)
-            radius = self.radius[channel]
-            distances[channel] = np.maximum(0., 1. - self.matrices[channel][indexes] @ probe) / radius
-            rivals = self.competitors[channel]
+            radius = self._geometry_radius[channel]
+            distances[channel] = np.maximum(0., 1. - self._geometry_anchors[channel][indexes] @ probe) / radius
+            rivals = self._geometry_competitors[channel]
             if rivals is not None and len(rivals):
                 rival_distances[channel] = float(np.maximum(0., 1. - rivals @ probe).min() / radius)
             weights[channel] = self.reliability[channel]
@@ -340,12 +415,13 @@ class EpisodeManifold:
         nearest_gap = min(max(0., a.start - end, start - a.end) for a in selected_anchors)
         context = (math.exp(-nearest_gap / self.scene_scale)
                    if self.scene_scale is not None and self.scene_scale > 0. else 0.)
-        return {"margin": margin, "channel_margins": margins,
+        return {"margin": margin, "channel_margins": margins, "geometry_domain":domain,
                 "distance": target_distance, "context_affinity": context,
                 "subspace_projection": projection,
                 "supports": [[a.start, a.end] for a in selected_anchors]}
 
-    def exclusion(self, scores, negatives, audit=None, independent_margins=None):
+    def exclusion(self, scores, negatives, audit=None, independent_margins=None,
+                  *, observations=None):
         """Discount a dissenting view only with two same-role supporting views."""
         rows = []
         for role, primary, secondary in negatives:
@@ -358,7 +434,16 @@ class EpisodeManifold:
                     differences[channel] = float(value)
             weights = {channel: float(np.clip(purity.get(channel, 1.), 0., 1.))
                        * self.reliability[channel] for channel in differences}
-            consensus = margin_consensus(differences, weights, self.margin)
+            target_scores = dict(observations or {}, primary=float(scores[0]),
+                                 secondary=float(scores[1]))
+            excluded_scores = {channel: float(target_scores[channel] - gap)
+                               for channel, gap in differences.items()
+                               if target_scores.get(channel) is not None
+                               and np.isfinite(target_scores[channel])}
+            absolute_support = {channel: score > self.floors[channel]
+                                for channel, score in excluded_scores.items()}
+            consensus = margin_consensus(differences, weights, self.margin,
+                                         absolute_support=absolute_support)
             total = sum(weights.values())
             net = sum(weights[channel] * (value - self.margin) / self.scales[channel]
                       for channel, value in differences.items()) / max(total, _EPS)
@@ -366,13 +451,16 @@ class EpisodeManifold:
                          "weights": weights,
                          "margins": [differences["primary"], differences["secondary"]],
                          "channel_margins": differences, "consensus": consensus,
+                         "excluded_scores": excluded_scores,
+                         "absolute_support": absolute_support,
                          "strict_passed": strict,
                          "passed": bool(strict or consensus["accepted"]),
                          "consensus_conflict": consensus["corroborated_conflict"]})
         return {"llr": min((row["llr"] for row in rows), default=0.),
                 "strict_passed": all(row["strict_passed"] for row in rows),
                 "passed": all(row["passed"] for row in rows),
-                "conflict": any(row["consensus_conflict"] for row in rows), "roles": rows}
+                "conflict": any(row["consensus_conflict"] for row in rows),
+                "conflict_basis": "positive_excluded_identity", "roles": rows}
 
     def _calibrators_for(self, excluded_cluster_ids):
         key = tuple(sorted(excluded_cluster_ids))
@@ -390,7 +478,8 @@ class EpisodeManifold:
         return self._calibration_cache[key]
 
     def evaluate(self, observations, cohort, exclusion, geometry=None, dialogue=None,
-                 physiology=None, vectors=None, *, excluded_cluster_ids=(), prosody=None, vocal_geometry=None):
+                 physiology=None, vectors=None, *, excluded_cluster_ids=(), prosody=None,
+                 vocal_geometry=None, physical_quality=None, raw_channel_evidence=None):
         evidence = {channel: (float(value) - self.floors[channel]) / self.scales[channel]
                     for channel, value in observations.items()
                     if channel in self.floors and value is not None}
@@ -398,10 +487,21 @@ class EpisodeManifold:
         calibrators = self._calibrators_for(excluded_cluster_ids)
         for channel, calibrator in calibrators.items():
             if channel in evidence and calibrator.available and (vectors or {}).get(channel) is not None:
-                llr = calibrator.evaluate(observations[channel], vectors[channel])
+                vector, score = vectors[channel], observations[channel]
+                llr = calibrator.evaluate(score, vector)
                 evidence[channel] = llr if raw_evidence[channel] > 0. else min(0., llr)
         weights = {channel: self.reliability[channel] for channel in evidence}
+        if raw_channel_evidence is not None and np.isfinite(raw_channel_evidence):
+            # Original-track dual encoders belong to the SAME correlated group;
+            # they cannot manufacture an additional independent identity vote.
+            evidence['raw'] = float(raw_channel_evidence)
+            weights['raw'] = min(self.reliability['primary'],self.reliability['secondary'])
         same_va = self.same_va_evidence(vectors or {}, prosody, excluded_cluster_ids)
+        from .quality_fusion import quality_weights
+        physical = dict(physical_quality or {}, same_va_conflict=same_va['strength'])
+        gates = quality_weights(physical, channels=weights)
+        if physical_quality is not None:
+            weights = {c:w*gates[c]*len(gates) for c,w in weights.items()}
         invariants = [evidence[c] for c in ("anime_va", "tertiary") if c in evidence]
         invariant = float(np.mean(invariants)) if invariants else None
         if invariant is not None and invariant > 0. and evidence.get("primary", 0.) > 0.:
@@ -423,13 +523,15 @@ class EpisodeManifold:
                 weights[channel] /= inflation
                 compensation[channel] = 1. / inflation
         groups, group_weights = [], []
-        for channels in (("primary", "secondary"), ("anime_char",), ("anime_va", "tertiary")):
+        for channels in (("primary", "secondary", "raw"), ("anime_char",), ("anime_va", "tertiary")):
             available = [c for c in channels if c in evidence]
             denominator = sum(weights[c] for c in available)
             if denominator:
                 groups.append(sum(weights[c] * evidence[c] for c in available) / denominator)
                 gain = 1. + same_va['strength']
-                group_weights.append((gain if channels == ('anime_char',) else
+                quality_mass = (sum(gates[c] for c in available)/len(available)*len(gates)
+                                if physical_quality is not None else 1.)
+                group_weights.append(quality_mass*(gain if channels == ('anime_char',) else
                                       1./gain if channels == ('anime_va', 'tertiary') else 1.))
         appearance = float(np.average(groups, weights=group_weights)) if groups else 0.
         uncertainty = float(np.std(groups) / math.sqrt(len(groups))) if groups else 0.
@@ -497,6 +599,7 @@ class EpisodeManifold:
                 "reference_only_consensus": reference_only,
                 "vocal_geometry": vocal_geometry or {}, "vocal_geometry_prior": vocal_prior,
                 "channel_evidence": evidence, "channel_reliability": weights,
+                "physical_quality": physical_quality or {}, "quality_gates": gates,
                 "raw_channel_evidence": raw_evidence,
                 "same_va": same_va, "group_weights": group_weights,
                 "calibration": {c: item.diagnostics() for c, item in calibrators.items()},
@@ -508,6 +611,7 @@ class EpisodeManifold:
 
     def diagnostics(self):
         return {"anchor_count": len(self.anchors), "scales": self.scales,
+                "whitening": {c:w.diagnostics() for c,w in self.whiteners.items()},
                 "same_va_rivals": [{key:value.tolist() if isinstance(value,np.ndarray) else value
                                     for key,value in row.items() if key not in ('character','actor')}
                                    for row in self.same_va_rivals],

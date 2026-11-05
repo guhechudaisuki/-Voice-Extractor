@@ -366,93 +366,38 @@ class UVR5Separator:
         uvr_path = str(UVR_ROOT)
         if uvr_path not in sys.path:
             sys.path.insert(0, uvr_path)
-        from vr import AudioPre
-
-        progress(0.0, "UVR 分离：正在加载模型")
-        pre = AudioPre(
-            agg=10,
-            model_path=str(UVR_MODEL),
-            device=torch.device(self.device),
-            is_half=self.device == "cuda",
-            tta=False,
-        )
+        from .model_pool import MODEL_POOL, resource_key
+        from .uvr_memory import MemoryUVR
+        progress(0.0, "UVR 分离：正在准备常驻模型")
+        engine = MODEL_POOL.get((resource_key('uvr-hp2', UVR_MODEL), self.device),
+            lambda: MemoryUVR(UVR_MODEL, self.device), device=self.device)
         durations = [probe_duration(source) for source, _ in items]
-        total_chunks = sum(self._chunk_count(value, chunk_seconds, overlap_seconds) for value in durations)
-        completed_chunks = 0
-        results: list[Path] = []
-        active_chunk_roots: list[Path] = []
-        try:
-            for item_index, ((source, output), duration) in enumerate(zip(items, durations), start=1):
-                output.parent.mkdir(parents=True, exist_ok=True)
-                chunk_count = self._chunk_count(duration, chunk_seconds, overlap_seconds)
-                step = chunk_seconds if chunk_count == 1 else chunk_seconds - overlap_seconds
-                chunk_root = output.parent / f".chunks_{item_index:03d}"
-                shutil.rmtree(chunk_root, ignore_errors=True)
-                chunk_root.mkdir(parents=True, exist_ok=True)
-                active_chunk_roots.append(chunk_root)
-                def separated_chunks():
-                    nonlocal completed_chunks
-                    for chunk_index in range(chunk_count):
-                        start = chunk_index * step
-                        end = min(duration, start + chunk_seconds)
-                        if end <= start:
-                            continue
-                        label = f"文件 {item_index}/{len(items)}，块 {chunk_index + 1}/{chunk_count}"
-                        base_progress = completed_chunks / max(1, total_chunks)
-                        progress(base_progress, f"UVR 分离：{label}，正在准备")
-                        source_chunk = chunk_root / f"input_{chunk_index:04d}.wav"
-                        extract_audio_range(source, source_chunk, start, end)
-                        actual_duration = pad_for_separator(source_chunk, minimum_seconds=6.0)
-                        progress(
-                            (completed_chunks + 0.05) / max(1, total_chunks),
-                            f"UVR 分离：{label}，已解码，开始运行模型",
-                        )
-                        generated = chunk_root / f"vocal_{source_chunk.name}_10.wav"
-                        pre._path_audio_(
-                            str(source_chunk),
-                            ins_root=None,
-                            vocal_root=str(chunk_root),
-                            format="wav",
-                            is_hp3=False,
-                        )
-                        progress(
-                            (completed_chunks + 0.90) / max(1, total_chunks),
-                            f"UVR 分离：{label}，模型完成，正在整理",
-                        )
-                        if not generated.exists():
-                            raise RuntimeError(f"UVR5 未生成预期文件：{generated}")
-                        stem_data, stem_rate = sf.read(str(generated), always_2d=True, dtype="float32")
-                        if not np.isfinite(stem_data).all():
-                            raise RuntimeError(f"UVR5 输出包含 NaN/Inf：{source.name}")
-                        expected_frames = max(1, int(round(actual_duration * stem_rate)))
-                        stem_data = np.nan_to_num(stem_data[:expected_frames])
-                        if len(stem_data) < expected_frames:
-                            stem_data = np.pad(stem_data, ((0, expected_frames - len(stem_data)), (0, 0)))
-                        source_chunk.unlink(missing_ok=True)
-                        generated.unlink(missing_ok=True)
-                        completed_chunks += 1
-                        progress(
-                            completed_chunks / max(1, total_chunks),
-                            f"UVR 分离：{label}，处理完成",
-                        )
-
-                        yield start, stem_data, stem_rate
-
-                write_stitched_stem(
-                    separated_chunks(), output, duration,
-                    [index * step for index in range(chunk_count)])
-                shutil.rmtree(chunk_root, ignore_errors=True)
-                active_chunk_roots.remove(chunk_root)
-                results.append(output)
-                progress(
-                    completed_chunks / max(1, total_chunks),
-                    f"UVR 分离：文件 {item_index}/{len(items)}，分块拼接完成",
-                )
-            return results
-        finally:
-            for chunk_root in active_chunk_roots:
-                shutil.rmtree(chunk_root, ignore_errors=True)
-            del pre
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+        total = sum(self._chunk_count(value, chunk_seconds, overlap_seconds) for value in durations)
+        completed = 0
+        results = []
+        for item_index, ((source, output), duration) in enumerate(zip(items, durations), 1):
+            count = self._chunk_count(duration, chunk_seconds, overlap_seconds)
+            step = chunk_seconds if count == 1 else chunk_seconds - overlap_seconds
+            def chunks():
+                nonlocal completed
+                with sf.SoundFile(str(source)) as stream:
+                    for index in range(count):
+                        start, end = index * step, min(duration, index * step + chunk_seconds)
+                        stream.seek(round(start * stream.samplerate))
+                        samples = stream.read(round(end * stream.samplerate) - round(start * stream.samplerate),
+                                              dtype='float32', always_2d=True)
+                        minimum = 6 * stream.samplerate
+                        if len(samples) < minimum:
+                            samples = np.pad(samples, ((0, minimum - len(samples)), (0, 0)))
+                        progress(completed / total, f"UVR 分离：文件 {item_index}/{len(items)}，块 {index+1}/{count}")
+                        stem, rate = engine.separate(samples, stream.samplerate)
+                        expected = round((end - start) * rate)
+                        stem = stem[:expected]
+                        if len(stem) < expected:
+                            stem = np.pad(stem, ((0, expected - len(stem)), (0, 0)))
+                        completed += 1
+                        progress(completed / total, "UVR 分离：分块完成")
+                        yield start, stem, rate
+            write_stitched_stem(chunks(), output, duration, [i * step for i in range(count)])
+            results.append(output)
+        return results

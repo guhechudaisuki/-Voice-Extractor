@@ -115,141 +115,9 @@ class WhisperSegmenter:
         window_seconds: float = 60.0,
         overlap_seconds: float = 8.0,
     ) -> list[CandidateSentence]:
-        from transformers import pipeline
-
-        ffmpeg_dir = str(FFMPEG.parent)
-        os.environ["PATH"] = ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
-        progress = progress or (lambda _value, _message: None)
-        duration = probe_duration(audio_path)
-        if window_seconds <= 0 or overlap_seconds < 0 or overlap_seconds >= window_seconds:
-            raise ValueError("Whisper 分块参数无效")
-        step = window_seconds if duration <= window_seconds else window_seconds - overlap_seconds
-        # Number of starts needed to cover the tail, including files just over
-        # one window long.
-        count = max(1, int(math.ceil(max(0.0, duration - window_seconds) / step)) + 1)
-        progress(0.0, f"Whisper：正在加载模型（共 {count} 个分块）")
-        dtype = torch.float16 if self.device >= 0 else torch.float32
-        pipe = pipeline(
-            "automatic-speech-recognition",
-            model=str(whisper_snapshot()),
-            device=self.device,
-            torch_dtype=dtype,
-            chunk_length_s=30,
-        )
-        waveform = load_mono(audio_path, 16000)
-
-        results: list[dict[str, Any]] = []
-        try:
-            for index in range(count):
-                start = index * step
-                end = min(duration, start + window_seconds)
-                if end <= start:
-                    continue
-                progress(
-                    index / max(1, count),
-                    f"Whisper 分块 {index + 1}/{count}：开始（{start:.1f}-{end:.1f} 秒）",
-                )
-                result = pipe(
-                    {"raw": waveform[round(start * 16000):round(end * 16000)].numpy(), "sampling_rate": 16000},
-                    return_timestamps="word",
-                    return_language=True,
-                    batch_size=1,
-                    generate_kwargs={"task": "transcribe"},
-                )
-                result["_offset"] = start
-                results.append(result)
-                progress((index + 1) / max(1, count), f"Whisper 分块 {index + 1}/{count}：完成")
-        finally:
-            del pipe
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-        raw_timed_parts: list[tuple[str, float, float, str]] = []
-        for result in results:
-            language = str(result.get("language") or "auto").lower()
-            offset = float(result.get("_offset", 0.0))
-            chunks = result.get("chunks", [])
-            for chunk in chunks:
-                text = chunk.get("text", "")
-                timestamp = chunk.get("timestamp") or (None, None)
-                start, end = timestamp
-                if start is None:
-                    continue
-                start = float(start) + offset
-                if end is None:
-                    end = float(start - offset) + max(0.25, min(1.0, len(text) * 0.18))
-                end = float(end) + offset
-                # Keep each model timestamp intact until all overlapping
-                # windows have been merged; splitting first can turn one
-                # boundary token into non-identical fragments and defeat the
-                # duplicate check.
-                raw_timed_parts.append((text, start, end, language))
-
-        # Assemble sentences only after all windows have been merged.  This
-        # prevents an overlap boundary from producing a duplicate or truncated
-        # sentence.
-        merged_timed_parts: list[tuple[str, float, float, str]] = []
-        for language in sorted({item[3] for item in raw_timed_parts}):
-            merged = _deduplicate_timed_parts(
-                [(text, start, end) for text, start, end, item_language in raw_timed_parts if item_language == language],
-                tolerance=min(1.0, overlap_seconds / 4.0),
-            )
-            merged_timed_parts.extend((*item, language) for item in merged)
-        merged_timed_parts.sort(key=lambda item: (item[1], item[2]))
-        timed_parts: list[tuple[str, float, float, str]] = []
-        for text, start, end, language in merged_timed_parts:
-            timed_parts.extend((*part, language) for part in _split_timed_chunk(text, start, end))
-
-        candidates: list[CandidateSentence] = []
-        buffer: list[str] = []
-        buffer_languages: list[str] = []
-        sentence_start: float | None = None
-        previous_end: float | None = None
-        for text, start, end, part_language in timed_parts:
-            if previous_end is not None and start - previous_end > max_gap and buffer:
-                buffer = []
-                buffer_languages = []
-                sentence_start = None
-            if sentence_start is None:
-                sentence_start = start
-            buffer.append(text)
-            buffer_languages.append(part_language)
-            previous_end = end
-            merged = _clean_text("".join(buffer))
-            if is_complete_text(merged):
-                candidates.append(
-                    CandidateSentence(
-                        start=sentence_start,
-                        end=end,
-                        whisper_text=merged,
-                        language=infer_language(
-                            merged,
-                            max(set(buffer_languages), key=buffer_languages.count),
-                        ),
-                    )
-                )
-                buffer = []
-                buffer_languages = []
-                sentence_start = None
-        if buffer and sentence_start is not None and previous_end is not None:
-            merged = _clean_text("".join(buffer))
-            # A tightly trimmed single utterance often lacks terminal
-            # punctuation from Whisper. Keep it only when it spans nearly the
-            # full input, so arbitrary long-file fragments remain excluded.
-            if merged and sentence_start <= 0.35 and duration - previous_end <= 0.45:
-                candidates.append(
-                    CandidateSentence(
-                        start=sentence_start,
-                        end=previous_end,
-                        whisper_text=merged,
-                        language=infer_language(
-                            merged,
-                            max(set(buffer_languages), key=buffer_languages.count),
-                        ),
-                    )
-                )
-        return candidates
+        return self.transcribe_spans(
+            audio_path, [TimeSpan(0., probe_duration(audio_path))], max_gap=max_gap,
+            progress=progress, window_seconds=window_seconds, overlap_seconds=overlap_seconds)
 
     @staticmethod
     def _normalise_spans(
@@ -349,7 +217,8 @@ class WhisperSegmenter:
                 continue
             if local_end is not None and not math.isfinite(local_end):
                 local_end = None
-            timing_estimated = local_end is None or local_end <= local_start
+            timing_estimated = (bool(chunk.get('timing_estimated'))
+                                or local_end is None or local_end <= local_start)
             start = window_start + max(0.0, local_start)
             if local_end is None:
                 # Whisper occasionally omits the final timestamp.  Estimate a
@@ -536,19 +405,12 @@ class WhisperSegmenter:
             progress(1.0, "Whisper：没有可识别的目标窗口")
             return []
 
-        from transformers import pipeline
+        from .whisper_backend import whisper_backend
 
         ffmpeg_dir = str(FFMPEG.parent)
         os.environ["PATH"] = ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
         progress(0.0, f"Whisper：正在加载模型（{len(normalised_spans)} 个目标段，{len(plan)} 个窗口）")
-        dtype = torch.float16 if self.device >= 0 else torch.float32
-        pipe = pipeline(
-            "automatic-speech-recognition",
-            model=str(whisper_snapshot()),
-            device=self.device,
-            torch_dtype=dtype,
-            chunk_length_s=30,
-        )
+        pipe = whisper_backend(whisper_snapshot(), 'cuda' if self.device >= 0 else 'cpu')
 
         waveform = load_mono(audio_path, 16000)
 
@@ -563,6 +425,9 @@ class WhisperSegmenter:
             for span_index in range(len(normalised_spans))
         }
         try:
+            results = pipe.recognize_many([
+                waveform[round(start * 16000):round(end * 16000)].numpy()
+                for _, _, start, end in plan])
             for plan_index, (span_index, window_index, start, end) in enumerate(plan):
                 span = normalised_spans[span_index]
                 span_window_count = windows_per_span[span_index]
@@ -571,13 +436,7 @@ class WhisperSegmenter:
                     f"Whisper 目标段 {span_index + 1}/{len(normalised_spans)}，"
                     f"窗口 {window_index + 1}/{span_window_count}：开始（{start:.2f}-{end:.2f} 秒）",
                 )
-                result = pipe(
-                    {"raw": waveform[round(start * 16000):round(end * 16000)].numpy(), "sampling_rate": 16000},
-                    return_timestamps="word",
-                    return_language=True,
-                    batch_size=1,
-                    generate_kwargs={"task": "transcribe"},
-                )
+                result = results[plan_index]
                 if not isinstance(result, dict):
                     result = {}
                 parts_by_window[span_index][(window_index, start, end)] = (
@@ -672,10 +531,7 @@ class WhisperSegmenter:
                     f"Whisper：短句静音垫重试 {retry_index + 1}/{len(empty_windows)}",
                 )
         finally:
-            del pipe
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            pipe.close()
 
         candidates: list[CandidateSentence] = []
         for span_index, span in enumerate(normalised_spans):
@@ -707,7 +563,7 @@ class FunASRTools:
         progress: Callable[[float, str], None] | None = None,
         window_seconds: float = 60.0,
     ) -> dict[Path, list[TimeSpan]]:
-        from funasr import AutoModel
+        from .funasr_backend import FunASRBackend
 
         if not audio_paths:
             return {}
@@ -719,13 +575,14 @@ class FunASRTools:
         total_chunks = sum(chunk_counts)
         completed = 0
         progress(0.0, f"VAD：正在加载模型（共 {total_chunks} 个分块）")
-        model = AutoModel(
+        from .model_pool import MODEL_POOL, resource_key
+        model = MODEL_POOL.get((resource_key('fsmn-vad', VAD_MODEL), self.device), lambda: FunASRBackend(
             model=str(VAD_MODEL),
             device=self.device,
             disable_pbar=True,
             disable_update=True,
             check_latest=False,
-        )
+        ), device=self.device)
         output: dict[Path, list[TimeSpan]] = {}
         try:
             for file_index, (audio_path, duration, chunk_count) in enumerate(
@@ -757,36 +614,71 @@ class FunASRTools:
                 output[audio_path] = spans
             return output
         finally:
-            del model
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            model.close()
 
     def transcribe_files(
         self,
         paths: list[Path],
         progress: Callable[[float, str], None] | None = None,
     ) -> dict[Path, str]:
-        from funasr import AutoModel
+        return self.transcribe_waveforms(
+            {path: load_mono(path, 16000).numpy() for path in paths}, progress=progress)
 
-        if not paths:
+    def vad_waveforms(self, waveforms, progress=None, window_seconds=60.):
+        """Task-local 16 kHz arrays, with offsets relative to each supplied clip."""
+        if window_seconds <= 0:
+            raise ValueError('VAD 分块时长必须大于 0 秒')
+        if not waveforms:
             return {}
+        from .funasr_backend import FunASRBackend
+        from .model_pool import MODEL_POOL, resource_key
+        model = MODEL_POOL.get((resource_key('fsmn-vad', VAD_MODEL), self.device), lambda: FunASRBackend(
+            model=str(VAD_MODEL), device=self.device, disable_pbar=True,
+            disable_update=True, check_latest=False), device=self.device)
+        progress = progress or (lambda *_: None)
+        output = {}
+        chunk_size = max(1,round(window_seconds*16000))
+        try:
+            for index,(key,wave) in enumerate(waveforms.items()):
+                array = (wave.detach().float().cpu().numpy() if isinstance(wave,torch.Tensor)
+                         else np.asarray(wave,dtype=np.float32)).reshape(-1)
+                spans = []
+                for offset in range(0,len(array),chunk_size):
+                    chunk = array[offset:offset+chunk_size]
+                    result = model.generate(input=chunk, batch_size_s=60, fs=16000)
+                    for start,end in (result[0].get('value',[]) if result else []):
+                        a,b = max(0.,float(start)/1000.), min(len(chunk)/16000,float(end)/1000.)
+                        if math.isfinite(a) and math.isfinite(b) and b>a:
+                            spans.append(TimeSpan(offset/16000+a,offset/16000+b))
+                output[key] = spans
+                progress((index+1)/len(waveforms),f'字幕窗内 VAD 补检 {index+1}/{len(waveforms)}')
+            return output
+        finally:
+            model.close()
+
+    def transcribe_waveforms(self, waveforms, progress=None):
+        from .funasr_backend import FunASRBackend
+
+        if not waveforms:
+            return {}
+        paths = list(waveforms)
         progress = progress or (lambda _value, _message: None)
         progress(0.0, f"中文 STT：正在加载模型（共 {len(paths)} 句）")
-        model = AutoModel(
+        from .model_pool import MODEL_POOL, resource_key
+        model = MODEL_POOL.get((resource_key('paraformer', PARAFORMER_MODEL, PUNC_MODEL), self.device), lambda: FunASRBackend(
             model=str(PARAFORMER_MODEL),
             punc_model=str(PUNC_MODEL),
             device=self.device,
             disable_pbar=True,
             disable_update=True,
             check_latest=False,
-        )
+        ), device=self.device)
         output: dict[Path, str] = {}
         self.word_timestamps = {}
         try:
             for index, path in enumerate(paths, start=1):
                 progress((index - 1) / len(paths), f"中文 STT {index}/{len(paths)}：开始")
-                result = model.generate(input=str(path), batch_size_s=60, hotword="")
+                result = model.generate(input=waveforms[path], fs=16000, batch_size_s=60, hotword="")
                 output[path] = _clean_text(result[0].get("text", "")) if result else ""
                 payload = result[0] if result else {}
                 stamps = payload.get('timestamp') or []
@@ -802,10 +694,7 @@ class FunASRTools:
                 progress(index / len(paths), f"中文 STT {index}/{len(paths)}：完成")
             return output
         finally:
-            del model
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            model.close()
 
 
 def align_candidates_to_vad(
