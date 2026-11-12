@@ -52,8 +52,8 @@ jobs:
           if not release_url.startswith(prefix):
               raise ValueError('The desktop model URL must belong to this repository')
           tag, filename = release_url[len(prefix):].split('/')
-          if tag != 'model-assets':
-              raise ValueError('Reinforced weights must be published under the model-assets tag')
+          if tag != 'v3.0':
+              raise ValueError('Reinforced weights must be published with the desktop release')
           if filename != 'wavlm_reinforced_pytorch_model.bin':
               raise ValueError('Unexpected release asset name')
           source_url = os.environ['MODEL_SOURCE_URL']
@@ -68,6 +68,6 @@ jobs:
                   output.write(block)
           if digest.hexdigest() != expected:
               raise ValueError('The checkpoint does not match the desktop manifest')
-          subprocess.run(['gh', 'release', 'upload', tag, filename, '--repo', repository], check=True)
+          subprocess.run(['gh', 'release', 'upload', tag, filename, '--repo', repository, '--clobber'], check=True)
           print(f'Published {filename}: SHA256 {expected}')
           PY

@@ -1,4 +1,4 @@
-# Keep source directories; other root directories contain local data.
+# Track source directories and distributable model metadata.
 /*/
 !/.github/
 !/extractor/
@@ -8,12 +8,10 @@
 !/model/
 !/models/
 
-# Local tests, evaluation scripts, and development notes
+# Tests, evaluation outputs, and development notes
 /tests/
 /evaluation/
 /docs/
-/[计]划方案/
-/[我]心危素材/
 /output/
 /cache/
 /temp/

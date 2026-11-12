@@ -36,7 +36,7 @@ python launcher/app_entry.py --ui desktop
 python launcher/app_entry.py --ui webui
 ```
 
-桌面模式使用原生窗口；浏览器模式启动本机服务并打开工作台。源码当前功能与已发布安装包可能不同，请以对应 Release 的说明为准。
+桌面模式使用原生窗口；浏览器模式打开网页工作台。
 
 ## 提取与复核
 
@@ -97,9 +97,9 @@ python extract_cli.py `
 
 安装器在 `resource/model` 和 `resource/models` 下管理模型。主要资源包括 UVR5 人声分离、ERes2NetV2 与 CAM++ 声纹匹配、WavLM 与 WeSpeaker 复核、歌声及重叠检测，以及中文和多语言语音识别模型。
 
-`models/anime_t3/classifier_v2.pt` 保存全局参考条件分类器的校准参数，身份评分使用当前任务参考音频与 WavLM 投影。安装器从 [模型资源发布页](https://github.com/guhechudaisuki/-Voice-Extractor/releases/tag/model-assets) 下载经过多说话人配对训练的 WavLM 权重及角色、声优声纹 ONNX 模型，并校验 SHA-256。WavLM 仅更新说话人投影层，保留预训练骨干；同一模型服务于不同目标参考，无须为每个角色建立独立模型。
+`models/anime_t3/classifier_v2.pt` 保存全局参考条件分类器的校准参数，身份评分使用当前任务参考音频与 WavLM 投影。安装器从 [Voice-Extractor1.0](https://github.com/guhechudaisuki/-Voice-Extractor/releases/tag/v3.0) 下载经过多说话人配对训练的 WavLM 权重及角色、声优声纹 ONNX 模型，并校验 SHA-256。WavLM 仅更新说话人投影层，保留预训练骨干；同一模型服务于不同目标参考，无须为每个角色建立独立模型。
 
-模型强化成功后保留本地权重。训练素材、标注记录及本机配置不进入发布包。模型校验值更新时应同时更新安装配置与发布清单。
+模型强化成功后保存权重，供后续提取使用。模型校验值更新时应同时更新安装配置与发布清单。
 
 全局 WavLM 强化同时检查留出来源上的整体指标和逐条参考配对决策：旧的正确正例不能变成漏判，旧的正确负例不能变成误收。新的正确结果不能抵消另一条旧结果的退化。该检查针对验证样本，不代表对未标注角色和视频的准确率保证；所有角色仍共用一套全局权重、回放池和备份回滚。
 

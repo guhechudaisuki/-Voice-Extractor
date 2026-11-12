@@ -152,7 +152,7 @@ COMPONENTS = (
     ),
     ComponentSpec(
         "wavlm_model",
-        "WavLM 声纹模型（本地同版权重）",
+        "WavLM 声纹模型（强化版）",
         "model/speaker/wavlm-base-plus-sv",
         "direct",
         386,
@@ -167,7 +167,7 @@ COMPONENTS = (
             ),
             DirectFile(
                 "pytorch_model.bin",
-                "https://github.com/guhechudaisuki/-Voice-Extractor/releases/download/model-assets/wavlm_reinforced_pytorch_model.bin",
+                "https://github.com/guhechudaisuki/-Voice-Extractor/releases/download/v3.0/wavlm_reinforced_pytorch_model.bin",
                 "0fde81fc23bdf3944f9167156fab1852025159d4414aa98bb22e58071bb39586",
             ),
         ),
@@ -271,7 +271,7 @@ COMPONENTS = (
         80,
         (DirectFile(
             "anime_speaker_char_ecapa.onnx",
-            "https://github.com/guhechudaisuki/-Voice-Extractor/releases/download/model-assets/anime_speaker_char_ecapa.onnx",
+            "https://github.com/guhechudaisuki/-Voice-Extractor/releases/download/v3.0/anime_speaker_char_ecapa.onnx",
             "d4e0ce7d55501fbb1a71d18ae7d3146d6fbd2d5aee8369d3171a82418f44d3a8",
         ),),
         check_file="anime_speaker_char_ecapa.onnx",
@@ -285,7 +285,7 @@ COMPONENTS = (
         80,
         (DirectFile(
             "anime_speaker_va_ecapa.onnx",
-            "https://github.com/guhechudaisuki/-Voice-Extractor/releases/download/model-assets/anime_speaker_va_ecapa.onnx",
+            "https://github.com/guhechudaisuki/-Voice-Extractor/releases/download/v3.0/anime_speaker_va_ecapa.onnx",
             "9d2d285e55cb5eb4ba09fe703119cfec4ae715ba3ba4df89a97cfec606e3d986",
         ),),
         check_file="anime_speaker_va_ecapa.onnx",
