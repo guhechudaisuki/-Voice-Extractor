@@ -1000,6 +1000,9 @@ def _valid_file(path: Path, expected_hash: str | None = None) -> bool:
         size = path.stat().st_size
     except OSError:
         return False
+    # A verified release file can be a small calibration checkpoint.
+    if expected_hash is not None:
+        return size > 0 and _sha256(path).lower() == expected_hash.lower()
     minimum = 1
     if path.suffix.lower() in {".pth", ".pt", ".ckpt", ".bin", ".safetensors"}:
         minimum = 1024 * 1024
@@ -1009,7 +1012,7 @@ def _valid_file(path: Path, expected_hash: str | None = None) -> bool:
         minimum = 128
     if size < minimum:
         return False
-    return expected_hash is None or _sha256(path).lower() == expected_hash.lower()
+    return True
 
 
 def _component_ready(spec: ComponentSpec, path: Path) -> bool:

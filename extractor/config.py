@@ -45,7 +45,8 @@ GPT_ROOT = (
     _configured_path("VOICE_EXTRACT_GPT_ROOT")
     or _gpt_root(TOOL_ROOT)
 )
-GPT_RUNTIME = GPT_ROOT / "runtime"
+_INSTALL_ROOT = _configured_path("VOICE_EXTRACT_INSTALL_ROOT")
+GPT_RUNTIME = (_INSTALL_ROOT / "resource" / "python") if _INSTALL_ROOT else GPT_ROOT / "runtime"
 FFMPEG = _configured_path("VOICE_EXTRACT_FFMPEG") or GPT_RUNTIME / "ffmpeg.exe"
 FFPROBE = _configured_path("VOICE_EXTRACT_FFPROBE") or GPT_RUNTIME / "ffprobe.exe"
 
